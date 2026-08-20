@@ -4,7 +4,7 @@
 
 DSH Scholar is an AI research workspace for computational research. It keeps project conversations, research materials, code and data, controlled experiment runs, evidence, and TeX manuscripts in one recoverable project. You can start from a new question or continue work that already exists elsewhere.
 
-![DSH Scholar standalone workspace in Chinese](docs/assets/dsh-scholar-home-zh.png)
+![DSH Scholar standalone workspace in English](docs/assets/dsh-scholar-home-en.png)
 
 ## What it provides
 
