@@ -126,6 +126,25 @@ Chat 同时接受普通自然语言和一级 slash command。显式命令是确�
 
 `/run` 只在快照、Protocol、Runner、target 和预算全部 exact-ready 时执行。`/release` 只会创建或打开 Human Release 决策，不允许 Agent 自动发布。
 
+## 实际复现实例：MNIST 手写数字识别
+
+2026-08-20，仓库中的隔离复现脚本在真实本机 Docker 中执行了三个基线 Job 和三个实验方案 Job。六个 Job 均在第一次尝试中成功，六条 Run 记录均已签名。该 fixture 使用固定的 6,000 训练/1,000 测试 MNIST 子集、五轮 CPU 训练，以及预先登记的随机种子 11、23、47。
+
+| 结果 | 数值 |
+|---|---:|
+| 单卷积基线 | 平均测试准确率 92.4% |
+| 双卷积实验方案 | 平均测试准确率 96.8% |
+| 配对效应 | +4.4 个百分点 |
+| 95% 区间 | [1.2, 8.6]，n=3 |
+
+![MNIST 项目中文总览](docs/assets/cnn-mnist-actual-overview-zh.png)
+
+![MNIST 六个成功运行的中文界面](docs/assets/cnn-mnist-actual-runs-zh.png)
+
+![MNIST 已接受证据的中文界面](docs/assets/cnn-mnist-actual-evidence-zh.png)
+
+以上截图来自同一个项目和 revision。精确代码/数据/镜像/Protocol pin、逐 seed 结果、已签名 Job/Run ID 和重新运行命令见[复现凭据](docs/mnist-reproduction.md)。这是确定性产品 fixture，不是完整 MNIST benchmark 或 SOTA 声明。
+
 ## 工作台区域
 
 | 区域 | 用途 |

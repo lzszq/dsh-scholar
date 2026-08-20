@@ -524,8 +524,18 @@ describe('Contract-approved baseline handoff', () => {
       idempotency_key: 'baseline-contract-v1',
       contract_id: setup.contractId,
       code_snapshot_id: snapshot.snapshot_id,
+      seed: 11,
+      data_artifact_ids: [snapshot.archive_artifact_id],
       command: ['node', 'train.js'],
     }
+    expect(thrownKernelCode(() => kernel.startBaselineRun({ ...request, seed: Number.MAX_SAFE_INTEGER + 1 })))
+      .toBe('baseline_seed_invalid')
+    expect(thrownKernelCode(() => kernel.startBaselineRun({
+      ...request,
+      data_artifact_ids: [snapshot.archive_artifact_id, snapshot.archive_artifact_id],
+    }))).toBe('baseline_data_artifact_limit')
+    expect(kernel.listJobs(setup.projectId)).toHaveLength(0)
+
     const started = kernel.startBaselineRun(request)
     expect(started.project.status).toBe('BASELINE_REPRO')
     expect(started.job).toMatchObject({
@@ -534,6 +544,11 @@ describe('Contract-approved baseline handoff', () => {
       status: 'queued',
       contract_id: setup.contractId,
       command: ['node', 'train.js'],
+      data_artifact_ids: [snapshot.archive_artifact_id],
+      payload: expect.objectContaining({
+        seed: 11,
+        data_hash: snapshot.archive_artifact_id,
+      }),
     })
     expect(kernel.listJobs(setup.projectId)).toHaveLength(1)
 
@@ -548,6 +563,7 @@ describe('Contract-approved baseline handoff', () => {
       ...request,
       expected_revision: started.project.revision,
       idempotency_key: 'baseline-contract-v1-seed-2',
+      seed: 2,
       command: ['node', 'train.js', '--seed', '2'],
     })
     expect(additional.project).toMatchObject({
@@ -558,6 +574,7 @@ describe('Contract-approved baseline handoff', () => {
       kind: 'baseline',
       contract_id: setup.contractId,
       command: ['node', 'train.js', '--seed', '2'],
+      payload: expect.objectContaining({ seed: 2 }),
     })
     expect(kernel.listJobs(setup.projectId)).toHaveLength(2)
 

@@ -1240,6 +1240,8 @@ export class ResearchClient {
     idempotency_key: string
     contract_id: string
     code_snapshot_id: string
+    seed?: number
+    data_artifact_ids?: string[]
     command: string[]
     runner_target_id?: string | null
     image_digest?: string

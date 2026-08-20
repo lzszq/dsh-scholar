@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-08-20T08:29:34.247Z",
+  "project_id": "rsp_2z5wxgl42uevqcc5u5thv6hp44",
+  "project_revision": 10,
+  "dataset_sha256": "sha256:f8a1188e445be6a86fd8342c029d62a9e256fcb7b0158739b9da84b4a2b607e5",
+  "result": {
+    "metric": "test_accuracy",
+    "unit": "percent",
+    "baseline_by_seed": { "11": 93.6, "23": 88.3, "47": 95.3 },
+    "treatment_by_seed": { "11": 97.0, "23": 96.9, "47": 96.5 },
+    "baseline_mean": 92.4,
+    "treatment_mean": 96.8,
+    "paired_effect": 4.4,
+    "ci95": [1.2, 8.6],
+    "n": 3
+  },
+  "evidence": {
+    "evidence_id": "evidence_x4toe6rmjkg4ejbs4elpxeeijm",
+    "status": "accepted",
+    "claim_id": "claim_5idptldqxtibkwauinxtreh2wu",
+    "analysis_artifact_id": "sha256:8d1b457d5ffde46d2d80c6094f9c258f13665cc6cafd3e02697612232f67f563"
+  },
+  "runs": [
+    { "kind": "baseline", "seed": 11, "job_id": "job_ju3eqzigk46vd66medkbveeube", "run_id": "run_f5epwipaf3ja2f2s5iiqxqeoce", "attempt_no": 1, "status": "succeeded", "signature_status": "signed" },
+    { "kind": "baseline", "seed": 23, "job_id": "job_fyvsejkc62sw6smjww275ulnz4", "run_id": "run_efez5fpw4ofylxc5tassqczd7m", "attempt_no": 1, "status": "succeeded", "signature_status": "signed" },
+    { "kind": "baseline", "seed": 47, "job_id": "job_hlxihpduhfi3suvr4w57jczcpq", "run_id": "run_rbrzt45tvxhictdfmlvdypr4na", "attempt_no": 1, "status": "succeeded", "signature_status": "signed" },
+    { "kind": "formal", "seed": 11, "job_id": "job_txi54w6gui4nzxhtchqk2jxada", "run_id": "run_a6pgmmpdjagnwwzuzamgg2y6la", "attempt_no": 1, "status": "succeeded", "signature_status": "signed" },
+    { "kind": "formal", "seed": 23, "job_id": "job_l2g34hnrp5m6aexcbg2wn6v4tq", "run_id": "run_lkvkc6seaitg63azuyehixtngu", "attempt_no": 1, "status": "succeeded", "signature_status": "signed" },
+    { "kind": "formal", "seed": 47, "job_id": "job_t7gcj67jmagbh76rliilmecl7y", "run_id": "run_3aiopgbe7bbk3end7n6xqccn3i", "attempt_no": 1, "status": "succeeded", "signature_status": "signed" }
+  ]
+}

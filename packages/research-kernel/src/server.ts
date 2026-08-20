@@ -392,6 +392,8 @@ const baselineRunSchema = z.object({
   idempotency_key: z.string().min(1),
   contract_id: z.string().min(1),
   code_snapshot_id: z.string().min(1),
+  seed: z.number().int().safe().optional(),
+  data_artifact_ids: z.array(z.string().min(1)).max(1).optional(),
   command: z.array(z.string().min(1)).min(1),
   runner_target_id: z.string().min(1).nullable().optional(),
   image_digest: z.string().min(1).optional(),
