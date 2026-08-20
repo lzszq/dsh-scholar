@@ -236,7 +236,7 @@ Manuscript 的 builds/preview-builds 轮询必须分别 single-flight，并以 g
 - Contract Gate 批准只冻结实验约束，不等于已经存在可执行 Job。系统不得把 Contract 中的自然语言 baseline 描述直接当作 shell 命令，也不得伪造“运行中”；
 - `CONTRACT_APPROVED` 且尚无 baseline Job 时，Runs 不能显示通用空白态。它必须显示一项由权威 `baseline_reproduce` NextAction 投影出的“基线运行准备任务”，列明缺少的代码快照、可执行命令或实验环境，并提供进入项目 Chat/Workspace/Settings 的明确入口；
 - 用户在 Chat 中可以自然语言要求“准备/启动基线实验”。系统必须结合当前 approved Contract 逐项引导补齐代码、命令和 Runner 配置；参数不完整时零 Job 写入，不能退化成仅返回 `No jobs` 或要求用户猜 JSON；
-- 参数完整后，baseline Job 提交与 `CONTRACT_APPROVED → BASELINE_REPRO` 必须是同一个 Kernel 原子操作，并绑定 approved Contract、不可变 CodeSnapshot、固定镜像/Runner target、输出契约、提交人和幂等键。失败时 Project 与 Jobs 均不产生半写；
+- 参数完整后，baseline Job 提交与 `CONTRACT_APPROVED → BASELINE_REPRO` 必须是同一个 Kernel 原子操作，并绑定 approved Contract、不可变 CodeSnapshot、固定镜像/Runner target、输出契约、提交人和幂等键。matched-seed 复现还必须允许调用方显式固定整数 `seed` 与至多一个同项目 Data Artifact；二者进入请求幂等 hash、Job payload、`data_artifact_ids` 和签名 RunManifest，不能只藏在 argv。失败时 Project 与 Jobs 均不产生半写；
 - Contract 的 `baseline_run` 是自然语言实验约束，不是 argv，也不能消除 `baseline_command` 缺口。UI/Agent 不得猜测 `python train.py` 等命令；只有用户或受信任工具提交的非空结构化 argv 才算命令已备；
 - Runner 环境只有在 profile/target enabled、非 draining、kind/capability 匹配、SecretRef 可用且远端有未过期的认证 heartbeat 时才算 ready；unknown/offline/stale 必须保留 `runner_environment` 缺口且禁止远端提交，不得自动回退本机；
 - Runs 的计数只统计真实持久化 Job。准备任务要明确标为“待准备”，不混入 queued/running/succeeded 统计；真实 Job 创建后准备任务消失并由 Job 卡片接管。

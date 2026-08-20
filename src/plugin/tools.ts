@@ -1242,13 +1242,15 @@ export function registerResearchTools(ctx: { tools: { register(tool: ReturnType<
 
   ctx.tools.register(researchTool({
     name: 'baseline_prepare',
-    description: 'Atomically start an approved Contract baseline through the canonical baseline-runs endpoint. Requires the current Project revision, approved Contract, immutable CodeSnapshot, non-empty argv, idempotency key and configured Runner environment; the first run advances to BASELINE_REPRO, while additional matched-seed runs stay in that phase and must use the same Contract.',
+    description: 'Atomically start an approved Contract baseline through the canonical baseline-runs endpoint. Requires the current Project revision, approved Contract, immutable CodeSnapshot, non-empty argv, idempotency key and configured Runner environment; an optional seed and project Data Artifact are fixed into the Job and signed RunManifest. The first run advances to BASELINE_REPRO, while additional matched-seed runs stay in that phase and must use the same Contract.',
     parameters: {
       project_id: OPT_STRING,
       expected_revision: { type: 'integer', required: true },
       idempotency_key: { type: 'string', required: true },
       contract_id: { type: 'string', required: true },
       code_snapshot_id: { type: 'string', required: true },
+      seed: { type: 'integer' },
+      data_artifact_id: OPT_STRING,
       command_json: { type: 'string', required: true },
       runner_target_id: OPT_STRING,
       image_digest: OPT_STRING,
@@ -1278,6 +1280,8 @@ export function registerResearchTools(ctx: { tools: { register(tool: ReturnType<
         idempotency_key: args.idempotency_key,
         contract_id: args.contract_id,
         code_snapshot_id: args.code_snapshot_id,
+        ...(args.seed !== undefined ? { seed: args.seed } : {}),
+        ...(args.data_artifact_id !== undefined ? { data_artifact_ids: [args.data_artifact_id] } : {}),
         command: command as string[],
         ...(args.runner_target_id !== undefined ? { runner_target_id: args.runner_target_id } : {}),
         ...(args.image_digest !== undefined ? { image_digest: args.image_digest } : {}),

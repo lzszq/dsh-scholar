@@ -6289,6 +6289,8 @@ export class ResearchKernel {
     idempotency_key: string
     contract_id: string
     code_snapshot_id: string
+    seed?: number
+    data_artifact_ids?: string[]
     command: string[]
     runner_target_id?: string | null
     image_digest?: string
@@ -6299,10 +6301,18 @@ export class ResearchKernel {
     if (command.length === 0 || command.some(part => part === '')) {
       throw new KernelError(422, 'baseline_command_required', 'baseline run requires a non-empty argv array')
     }
+    if (input.seed !== undefined && !Number.isSafeInteger(input.seed)) {
+      throw new KernelError(422, 'baseline_seed_invalid', 'baseline seed must be a safe integer')
+    }
+    if ((input.data_artifact_ids?.length ?? 0) > 1) {
+      throw new KernelError(422, 'baseline_data_artifact_limit', 'baseline run accepts at most one Data Artifact')
+    }
     const requestHash = `sha256:${createHash('sha256').update(JSON.stringify({
       expected_revision: input.expected_revision,
       contract_id: input.contract_id,
       code_snapshot_id: input.code_snapshot_id,
+      seed: input.seed ?? null,
+      data_artifact_ids: input.data_artifact_ids ?? [],
       command,
       runner_target_id: input.runner_target_id ?? null,
       image_digest: input.image_digest ?? null,
@@ -6362,9 +6372,14 @@ export class ResearchKernel {
         payload: {
           message: 'approved contract baseline reproduction',
           baseline_start_request_hash: requestHash,
+          ...(input.seed !== undefined ? { seed: input.seed } : {}),
+          ...(input.data_artifact_ids?.length === 1
+            ? { data_hash: input.data_artifact_ids[0]!.startsWith('sha256:') ? input.data_artifact_ids[0]! : `sha256:${input.data_artifact_ids[0]!}` }
+            : {}),
         },
         contract_id: input.contract_id,
         code_snapshot_id: input.code_snapshot_id,
+        data_artifact_ids: input.data_artifact_ids,
         runner_target_id: targetId,
         image_digest: imageDigest,
         output_contract: outputContract,
