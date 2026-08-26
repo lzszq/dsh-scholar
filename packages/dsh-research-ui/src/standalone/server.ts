@@ -28,8 +28,10 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 import { UiKernelSidecar } from './sidecar.js'
-import { validateConfig, parseCli, generateCliHelp, type CorpusSnapshot, type ExperimentContract, type NoveltyAudit, type ScholarAgentRequest } from '@dsh-scholar/research-schemas'
+import { parseScholarModelId, validateConfig, parseCli, generateCliHelp, type CorpusSnapshot, type ExperimentContract, type NoveltyAudit, type ScholarAgentRequest } from '@dsh-scholar/research-schemas'
 import { requestScholarAgent } from './chat-agent-client.js'
+import { executeStandaloneChatTurn } from './chat-turn-route.js'
+import { scholarModelUsability, type ScholarModelCatalogEntry } from '../shared/model-catalog.js'
 import {
   MAX_BODY_BYTES,
   SlidingWindowRateLimiter,
@@ -236,11 +238,44 @@ export function isProjectTrajectoryTopologyForward(pathname: string): boolean {
   return PROJECT_TRAJECTORY_TOPOLOGY_FORWARD_ROUTES.some(re => re.test(pathname))
 }
 
-/** Models this Scholar surface may route the research agent onto. Mirrors the
- * DSH harness advisory catalog (llm-deepseek): ''/auto = agent default. */
-const MODEL_CATALOG = ['deepseek-v4-flash', 'deepseek-v4-pro']
-
 const MODEL_FILE = 'model.json'
+
+interface LiveScholarModel extends ScholarModelCatalogEntry {
+  id: string
+  provider: string
+  model: string
+  name: string
+}
+
+/** Read the current DSH runtime catalog. No static model fallback is kept:
+ * absent capability metadata is exactly why visual input must fail closed. */
+async function readLiveScholarModels(dataDir: string): Promise<LiveScholarModel[] | null> {
+  try {
+    const reply = await requestScholarAgent(dataDir, { operation: 'list_models' }, 2_000)
+    return reply.operation === 'list_models' ? reply.models : null
+  } catch {
+    return null
+  }
+}
+
+/** Resolve one exact configured provider/model route. Model ids are opaque;
+ * only the first slash separates the provider from the adapter-owned id. */
+async function resolveLiveScholarModel(dataDir: string, qualified: string): Promise<LiveScholarModel | null> {
+  const route = parseScholarModelId(qualified)
+  if (route === null) return null
+  try {
+    const reply = await requestScholarAgent(dataDir, {
+      operation: 'resolve_model',
+      provider: route.provider,
+      model: route.model,
+    }, 2_000)
+    return reply.operation === 'resolve_model' && reply.model.id === qualified
+      ? { ...reply.model, available: true }
+      : null
+  } catch {
+    return null
+  }
+}
 
 /** Current model preference ('' = agent default / no override). */
 function readModelPreference(dataDir: string): string {
@@ -496,10 +531,11 @@ function readBody(req: IncomingMessage): Promise<{ body: string; tooLarge: boole
       }
     }
     req.on('data', (chunk: Buffer) => {
+      if (settled) return // keep draining after the cap so the caller can
+      // receive the explicit 413 instead of a connection-reset error.
       total += chunk.length
       if (!withinBodyLimit(total)) {
         done({ body: '', tooLarge: true })
-        req.destroy()
         return
       }
       chunks.push(chunk)
@@ -1128,8 +1164,9 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
     }
     return false
   }
-  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    try {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    void (async () => {
+      try {
       // CONFIG-01: every BFF response carries the effective-config pin so the
       // running object can be correlated with the config that produced it.
       res.setHeader('x-config-pin', configPin)
@@ -1359,10 +1396,30 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
             return
           }
         }
+        const liveModels = await readLiveScholarModels(options.dataDir)
+        const saved = readModelPreference(options.dataDir)
+        const savedRoute = parseScholarModelId(saved)
+        const models = liveModels === null ? [] : [...liveModels]
+        if (savedRoute !== null) {
+          const resolved = await resolveLiveScholarModel(options.dataDir, saved)
+          const catalogIndex = models.findIndex(candidate => candidate.id === saved)
+          const catalogEntry = catalogIndex < 0 ? undefined : models[catalogIndex]
+          const selected: LiveScholarModel = resolved ?? {
+            id: saved,
+            provider: savedRoute.provider,
+            model: savedRoute.model,
+            name: catalogEntry?.name ?? saved,
+            ...(catalogEntry?.input_modalities === undefined ? {} : { input_modalities: [...catalogEntry.input_modalities] }),
+            available: false,
+          }
+          if (catalogIndex < 0) models.push(selected)
+          else models[catalogIndex] = selected
+        }
         sendJson(res, 200, {
           ok: true,
-          model: readModelPreference(options.dataDir),
-          models: MODEL_CATALOG,
+          model: savedRoute === null ? '' : saved,
+          available: liveModels !== null,
+          models,
         })
         return
       }
@@ -1397,9 +1454,24 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
           sendJson(res, 400, bffError('invalid_json', 'bad request'))
           return
         }
-        if (model !== '' && model !== 'auto' && !MODEL_CATALOG.includes(model)) {
-          sendJson(res, 422, bffError('validation_error', `unknown model '${model}'`))
-          return
+        if (model !== '' && model !== 'auto') {
+          if (await readLiveScholarModels(options.dataDir) === null) {
+            sendJson(res, 503, bffError('model_unavailable', 'DSH model runtime is unavailable'))
+            return
+          }
+          if (parseScholarModelId(model) === null) {
+            sendJson(res, 422, bffError('validation_error', `unknown model '${model}'`))
+            return
+          }
+          const resolved = await resolveLiveScholarModel(options.dataDir, model)
+          if (resolved === null) {
+            sendJson(res, 422, bffError('validation_error', `unknown model '${model}'`))
+            return
+          }
+          if (!scholarModelUsability(resolved).selectable) {
+            sendJson(res, 422, bffError('validation_error', `model '${model}' does not accept Scholar text input`))
+            return
+          }
         }
         try {
           writeModelPreference(options.dataDir, model === 'auto' ? '' : model)
@@ -1432,66 +1504,30 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
           sendJson(res, 413, bffError('payload_too_large', 'payload too large'))
           return
         }
-        let raw: Record<string, unknown>
+        let raw: unknown
         try {
-          const parsed = JSON.parse(read.body) as unknown
-          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid')
-          raw = parsed as Record<string, unknown>
+          raw = JSON.parse(read.body) as unknown
         } catch {
           sendJson(res, 400, bffError('invalid_json', 'bad request'))
           return
         }
-        const projectId = typeof raw.project_id === 'string' ? raw.project_id.trim() : ''
-        const sessionId = typeof raw.session_id === 'string' ? raw.session_id.trim() : ''
-        const text = typeof raw.text === 'string' ? raw.text.trim() : ''
-        const locale: 'zh' | 'en' = raw.locale === 'en' ? 'en' : 'zh'
-        const history = Array.isArray(raw.history) ? raw.history.slice(-12).flatMap(item => {
-          if (item === null || typeof item !== 'object' || Array.isArray(item)) return []
-          const row = item as Record<string, unknown>
-          if ((row.role !== 'user' && row.role !== 'assistant') || typeof row.text !== 'string') return []
-          const itemText = row.text.trim().slice(0, 2_000)
-          return itemText === '' ? [] : [{ role: row.role, text: itemText }]
-        }) : []
-        if (projectId === '' || projectId.length > 256 || sessionId === '' || sessionId.length > 256 || text === '' || text.length > 16_000) {
-          sendJson(res, 422, bffError('validation_error', 'project_id, session_id and text are required'))
-          return
-        }
-        if (options.principal !== null && !(await isProjectMember(projectId))) {
-          sendJson(res, 404, bffError('project_not_found', 'project not found or access denied'))
-          return
-        }
-        const projectionResponse = await fetch(`${endpoint}/v2/projects/${encodeURIComponent(projectId)}/projection`, {
-          headers: { accept: 'application/json', ...upstreamAuthHeaders },
-        }).catch(() => null)
-        if (projectionResponse === null || !projectionResponse.ok) {
-          sendJson(res, 502, bffError('kernel_unreachable', 'research projection unavailable'))
-          return
-        }
-        const projection = await projectionResponse.json() as {
-          project?: Record<string, unknown>
-          next_actions_v2?: Array<Record<string, unknown>>
-        }
+        const controller = new AbortController()
+        const abortTurn = (): void => controller.abort()
+        req.once('aborted', abortTurn)
+        res.once('close', abortTurn)
         try {
-          const reply = await requestScholarAgent(options.dataDir, {
-            operation: 'conversation',
-            session_id: sessionId,
-            text,
-            locale,
-            project: {
-              project_id: projectId,
-              ...(typeof projection.project?.name === 'string' ? { name: projection.project.name } : {}),
-              ...(typeof projection.project?.status === 'string' ? { status: projection.project.status } : {}),
-              ...(typeof projection.project?.brief_status === 'string' ? { brief_status: projection.project.brief_status } : {}),
-              ...(projection.project?.brief !== null && typeof projection.project?.brief === 'object'
-                ? { brief: projection.project.brief as Record<string, unknown> } : {}),
-              next_actions_v2: projection.next_actions_v2 ?? [],
-            },
-            history,
-          } as ScholarAgentRequest)
-          if (reply.operation !== 'conversation') throw new Error('wrong operation')
-          sendJson(res, 200, reply)
-        } catch {
-          sendJson(res, 503, bffError('model_unavailable', 'DSH model runtime is unavailable'))
+          const result = await executeStandaloneChatTurn(raw, {
+            dataDir: options.dataDir,
+            kernelEndpoint: endpoint,
+            upstreamAuthHeaders,
+            enforceMembership: options.principal !== null,
+            isProjectMember,
+            signal: controller.signal,
+          })
+          if (!controller.signal.aborted && !res.destroyed) sendJson(res, result.status, result.payload)
+        } finally {
+          req.removeListener('aborted', abortTurn)
+          res.removeListener('close', abortTurn)
         }
         return
       }
@@ -2403,9 +2439,16 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
       }
 
       sendJson(res, 404, bffError('not_found', 'not found'))
-    } catch {
-      sendJson(res, 502, bffError('kernel_unreachable', 'research kernel unavailable'))
-    }
+      } catch (error) {
+        if (res.headersSent || res.writableEnded || res.destroyed) {
+          if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined)
+          return
+        }
+        sendJson(res, 500, bffError('internal_error', 'research request failed'))
+      }
+    })().catch(error => {
+      if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined)
+    })
   })
 
   try {

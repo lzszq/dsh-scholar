@@ -608,6 +608,7 @@ interface IntakeSessionRow {
   owner_tenant_id: string
   owner_auth_method: string
   owner_session_id: string | null
+  owner_scope_id: string | null
   status: string
   revision: number
   source_label: string
@@ -672,6 +673,8 @@ interface UploadSessionRow {
   committed_offset: number
   status: string
   finalized_sha256: string | null
+  owns_artifact: number
+  owner_scope_id: string | null
   created_by_principal: string
   created_at: string
   updated_at: string
@@ -1190,9 +1193,11 @@ export class ResearchKernel {
       const timer = setInterval(() => {
         try {
           this.ptySweepIdle()
-          // CHUNK-01: GC expired open upload sessions (≥24h) alongside the
-          // PTY sweep — a sweep failure must never take the kernel down.
+          // CHUNK-01: GC expired/open cleanup-ledger upload sessions alongside
+          // the PTY sweep. The staged-file sweep also catches legacy orphan
+          // bytes created before cleanup rows became durable.
           this.cleanupUploadSessions()
+          this.cleanupIntakeStaged()
         } catch {
           // A sweep failure must never take the kernel down.
         }
@@ -2099,7 +2104,10 @@ export class ResearchKernel {
   /**
    * PROJECT-DELETE-01: hide an archived project through an auditable
    * tombstone. This deliberately preserves the aggregate, memberships,
-   * Outbox, artifacts and shared CAS references for retention/GC safety.
+   * Outbox, finalized artifacts and shared CAS references for retention/GC
+   * safety. Open upload sessions are transient rather than retained research
+   * data, so their rows and isolated staging bytes are removed as part of the
+   * authoritative delete operation.
    */
   deleteProject(input: {
     project_id: string
@@ -2145,8 +2153,18 @@ export class ResearchKernel {
     if (Number(active.n) > 0) {
       throw new KernelError(409, 'jobs_running', `project ${row.project_id} still has active jobs`)
     }
+    const openUploads = this.db.prepare(
+      "SELECT upload_id, intake_id FROM upload_sessions WHERE project_id = ? AND status = 'open'",
+    ).all(row.project_id) as unknown as Array<{ upload_id: string; intake_id: string }>
     const deletedAt = nowIso()
-    return withTransaction(this.db, () => {
+    const receipt = withTransaction(this.db, () => {
+      this.db.prepare(`DELETE FROM upload_chunks WHERE upload_id IN (
+        SELECT upload_id FROM upload_sessions WHERE project_id = ? AND status = 'open'
+      )`).run(row.project_id)
+      // Keep an aborted row as a durable filesystem-cleanup ledger. A crash
+      // or transient unlink failure is recovered by the next upload sweep.
+      this.db.prepare("UPDATE upload_sessions SET status = 'aborted', updated_at = ? WHERE project_id = ? AND status = 'open'")
+        .run(deletedAt, row.project_id)
       const result = this.db.prepare(`UPDATE projects
         SET deleted_at = ?, deleted_by = ?, deletion_reason = ?, deletion_request_id = ?,
             revision = revision + 1, updated_at = ?, history = ?
@@ -2176,6 +2194,12 @@ export class ResearchKernel {
       })
       return receipt
     })
+    for (const upload of openUploads) {
+      if (this.removeUploadStageFile(upload.intake_id, upload.upload_id)) {
+        this.db.prepare("DELETE FROM upload_sessions WHERE upload_id = ? AND status = 'aborted'").run(upload.upload_id)
+      }
+    }
+    return receipt
   }
 
   /** Link a DSH session to a project (design RSP-006). */
@@ -3220,7 +3244,11 @@ export class ResearchKernel {
       } catch {
         continue // raced with another cleanup — skip
       }
-      if (now - mtime >= maxAgeMs) {
+      // A zero grace period is an explicit collect-now operation. Some file
+      // systems expose sub-millisecond mtimes while Date.now() is integral,
+      // so a freshly written file can otherwise appear fractionally newer
+      // than `now` and make this recovery path nondeterministic.
+      if (maxAgeMs === 0 || now - mtime >= maxAgeMs) {
         try {
           unlinkSync(full)
           removed += 1
@@ -3285,6 +3313,7 @@ export class ResearchKernel {
    * that belongs to another project — 404 intake_not_found either way.
    */
   assertIntakeInProject(intakeId: string, projectId: string): void {
+    this.getProject(projectId)
     this.getIntakeSessionRow(intakeId, projectId)
   }
 
@@ -3375,59 +3404,81 @@ export class ResearchKernel {
     expires_in_ms?: number
     idempotency_key?: string
     request_hash?: string
+    owner_scope_id?: string
   }): IntakeSession {
     if (input.source_label === undefined || input.source_label.trim() === '') {
       throw new KernelError(422, 'validation_error', 'source_label is required')
     }
-    if (input.project_id !== undefined && input.project_id !== null) {
-      this.getProject(input.project_id) // 404 project_not_found
-    }
-    // Idempotency-Key replay.
-    if (input.idempotency_key !== undefined && input.idempotency_key !== '') {
-      const existing = this.db.prepare('SELECT * FROM intake_sessions WHERE idempotency_key = ?').get(input.idempotency_key) as IntakeSessionRow | undefined
-      if (existing !== undefined) {
-        if (existing.request_hash !== (input.request_hash ?? '')) {
-          throw new KernelError(409, 'idempotency_conflict', `intake idempotency key ${input.idempotency_key} was used with a different request hash`)
-        }
-        return this.intakeSessionFromRow(existing)
+    const begin = (): IntakeSession => {
+      if (input.project_id !== undefined && input.project_id !== null) {
+        this.getProject(input.project_id) // 404 project_not_found
+        this.assertChatScopeOpen(input.project_id, input.owner_scope_id)
       }
+      // Scoped calls keep admission, idempotency replay, active reuse and
+      // insert under the same BEGIN IMMEDIATE as a competing scope close.
+      if (input.idempotency_key !== undefined && input.idempotency_key !== '') {
+        const existing = this.db.prepare('SELECT * FROM intake_sessions WHERE idempotency_key = ?').get(input.idempotency_key) as IntakeSessionRow | undefined
+        if (existing !== undefined) {
+          if (
+            existing.request_hash !== (input.request_hash ?? '')
+            || existing.project_id !== (input.project_id ?? null)
+            || existing.owner_scope_id !== (input.owner_scope_id ?? null)
+          ) {
+            throw new KernelError(409, 'idempotency_conflict', `intake idempotency key ${input.idempotency_key} was used with a different request authority`)
+          }
+          return this.intakeSessionFromRow(existing)
+        }
+      }
+      // One active intake per project (recovery-friendly reuse). Intakes
+      // created by a closed Chat scope are not silently adopted by a later
+      // session; their durable owner remains provenance for recovery/audit.
+      if (input.project_id !== undefined && input.project_id !== null) {
+        const active = this.db.prepare(
+          `SELECT i.* FROM intake_sessions i
+           LEFT JOIN chat_scope_tombstones t
+             ON t.project_id = i.project_id AND t.scope_id = i.owner_scope_id
+           WHERE i.project_id = ?
+             AND i.status IN ('draft','uploading','scanning','needs_input','grilling','proposal_ready','awaiting_human')
+             AND (i.owner_scope_id IS NULL OR t.scope_id IS NULL)
+             AND (? IS NULL OR i.owner_scope_id IS NULL OR i.owner_scope_id = ?)
+           ORDER BY i.created_at LIMIT 1`,
+        ).get(input.project_id, input.owner_scope_id ?? null, input.owner_scope_id ?? null) as IntakeSessionRow | undefined
+        if (active !== undefined) return this.intakeSessionFromRow(active)
+      }
+      const owner: HumanPrincipal = input.owner ?? { principal_id: 'agent', auth_method: 'agent' }
+      const now = nowIso()
+      const intakeId = randomId('intk')
+      const session: IntakeSession = {
+        intake_id: intakeId,
+        project_id: input.project_id ?? null,
+        owner,
+        status: 'draft',
+        revision: 1,
+        source_label: input.source_label.trim(),
+        target_phase: input.target_phase ?? null,
+        expires_at: new Date(Date.now() + (input.expires_in_ms ?? ResearchKernel.INTAKE_DEFAULT_TTL_MS)).toISOString(),
+        scan_summary: {},
+        created_at: now,
+        updated_at: now,
+        audit: [{ at: now, action: 'begin', detail: input.source_label }],
+      }
+      this.db.prepare(
+        `INSERT INTO intake_sessions (intake_id, project_id, owner_principal_id, owner_tenant_id, owner_auth_method, owner_session_id,
+           owner_scope_id, status, revision, source_label, target_phase, expires_at, scan_summary, audit_json, idempotency_key, request_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        session.intake_id, session.project_id,
+        session.owner.principal_id, session.owner.tenant_id ?? '', session.owner.auth_method ?? 'agent', session.owner.session_id ?? null,
+        input.owner_scope_id ?? null,
+        session.status, session.revision, session.source_label, session.target_phase, session.expires_at,
+        JSON.stringify(session.scan_summary), JSON.stringify(session.audit),
+        input.idempotency_key ?? null, input.request_hash ?? '', session.created_at, session.updated_at,
+      )
+      return session
     }
-    // One active intake per project (recovery-friendly reuse).
-    if (input.project_id !== undefined && input.project_id !== null) {
-      const active = this.db.prepare(
-        "SELECT * FROM intake_sessions WHERE project_id = ? AND status IN ('draft','uploading','scanning','needs_input','grilling','proposal_ready','awaiting_human') ORDER BY created_at LIMIT 1",
-      ).get(input.project_id) as IntakeSessionRow | undefined
-      if (active !== undefined) return this.intakeSessionFromRow(active)
-    }
-    const owner: HumanPrincipal = input.owner ?? { principal_id: 'agent', auth_method: 'agent' }
-    const now = nowIso()
-    const intakeId = randomId('intk')
-    const session: IntakeSession = {
-      intake_id: intakeId,
-      project_id: input.project_id ?? null,
-      owner,
-      status: 'draft',
-      revision: 1,
-      source_label: input.source_label.trim(),
-      target_phase: input.target_phase ?? null,
-      expires_at: new Date(Date.now() + (input.expires_in_ms ?? ResearchKernel.INTAKE_DEFAULT_TTL_MS)).toISOString(),
-      scan_summary: {},
-      created_at: now,
-      updated_at: now,
-      audit: [{ at: now, action: 'begin', detail: input.source_label }],
-    }
-    this.db.prepare(
-      `INSERT INTO intake_sessions (intake_id, project_id, owner_principal_id, owner_tenant_id, owner_auth_method, owner_session_id,
-         status, revision, source_label, target_phase, expires_at, scan_summary, audit_json, idempotency_key, request_hash, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      session.intake_id, session.project_id,
-      session.owner.principal_id, session.owner.tenant_id ?? '', session.owner.auth_method ?? 'agent', session.owner.session_id ?? null,
-      session.status, session.revision, session.source_label, session.target_phase, session.expires_at,
-      JSON.stringify(session.scan_summary), JSON.stringify(session.audit),
-      input.idempotency_key ?? null, input.request_hash ?? '', session.created_at, session.updated_at,
-    )
-    return session
+    // Unscoped begin is also used inside createProjectForGrill's transaction;
+    // scoped Chat begin is the only path requiring a new linearization point.
+    return input.owner_scope_id === undefined ? begin() : withTransaction(this.db, begin)
   }
 
   /**
@@ -3444,10 +3495,6 @@ export class ResearchKernel {
     media_type?: string
     content: Uint8Array | string
   }): IntakeArtifact {
-    const row = this.getIntakeSessionRow(intakeId)
-    const session = this.intakeSessionFromRow(row)
-    this.assertIntakeMutable(session)
-    this.assertIntakeNotExpired(session)
     validateUploadFileName(input.file_name)
     const bytes = typeof input.content === 'string' ? Buffer.from(input.content, 'utf8') : Buffer.from(input.content)
     if (bytes.byteLength > ResearchKernel.UPLOAD_MAX_FILE_BYTES) {
@@ -3456,48 +3503,61 @@ export class ResearchKernel {
     }
     const sha256 = createHash('sha256').update(bytes).digest('hex')
     const artifactId = `sha256:${sha256}`
-    const existing = this.db.prepare('SELECT * FROM intake_artifacts WHERE intake_id = ? AND artifact_id = ?')
-      .get(intakeId, artifactId) as IntakeArtifactRow | undefined
-    if (existing !== undefined) {
-      return {
-        intake_id: existing.intake_id,
-        artifact_id: existing.artifact_id,
-        file_name: existing.file_name,
-        media_type: existing.media_type,
-        size_bytes: existing.size_bytes,
-        sha256: existing.sha256,
-        quarantine: existing.quarantine as IntakeArtifact['quarantine'],
-        scan_result: jsonParse(existing.scan_result, {}),
-        created_at: existing.created_at,
+    return withTransaction(this.db, () => {
+      const row = this.getIntakeSessionRow(intakeId)
+      const session = this.intakeSessionFromRow(row)
+      this.assertIntakeMutable(session)
+      this.assertIntakeNotExpired(session)
+      if (row.project_id !== null) this.assertChatScopeOpen(row.project_id, row.owner_scope_id ?? undefined)
+      const existing = this.db.prepare('SELECT * FROM intake_artifacts WHERE intake_id = ? AND artifact_id = ?')
+        .get(intakeId, artifactId) as IntakeArtifactRow | undefined
+      // A direct/multipart stage is an independent live reference. It takes
+      // ownership away from any old upload cleanup ledger before returning or
+      // recreating the same content-addressed path.
+      this.db.prepare(
+        'UPDATE upload_sessions SET owns_artifact = 0 WHERE intake_id = ? AND finalized_sha256 = ? AND owns_artifact = 1',
+      ).run(intakeId, sha256)
+      if (existing !== undefined) {
+        return {
+          intake_id: existing.intake_id,
+          artifact_id: existing.artifact_id,
+          file_name: existing.file_name,
+          media_type: existing.media_type,
+          size_bytes: existing.size_bytes,
+          sha256: existing.sha256,
+          quarantine: existing.quarantine as IntakeArtifact['quarantine'],
+          scan_result: jsonParse(existing.scan_result, {}),
+          created_at: existing.created_at,
+        }
       }
-    }
-    const partPath = this.intakeStagedPath(intakeId, sha256)
-    try {
-      // Per-session intake staging dir: explicit 0700 (0600 stage files),
-      // umask-independent (WORK-01 §5).
-      mkdirMode(join(this.intakeStagedRoot, intakeId), 0o700)
-      writeFileSync(partPath, bytes, { mode: 0o600 })
-      chmodSync(partPath, 0o600)
-    } catch (error) {
-      throw new KernelError(500, 'stage_write_failed', `intake staged write failed: ${(error as Error).message}`)
-    }
-    const now = nowIso()
-    const artifact: IntakeArtifact = {
-      artifact_id: artifactId,
-      intake_id: intakeId,
-      file_name: input.file_name,
-      media_type: input.media_type ?? 'application/octet-stream',
-      size_bytes: bytes.byteLength,
-      sha256,
-      quarantine: 'staged',
-      scan_result: {},
-      created_at: now,
-    }
-    this.db.prepare(
-      'INSERT INTO intake_artifacts (intake_id, artifact_id, file_name, media_type, size_bytes, sha256, quarantine, scan_result, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    ).run(intakeId, artifactId, artifact.file_name, artifact.media_type, artifact.size_bytes, artifact.sha256, artifact.quarantine, '{}', now)
-    this.setIntakeStatus(intakeId, 'uploading', row.status, 'artifact_staged')
-    return artifact
+      const partPath = this.intakeStagedPath(intakeId, sha256)
+      try {
+        // Keep the filesystem generation and the ownership handoff under the
+        // same SQLite writer lock as cleanupUploadSessions.
+        mkdirMode(join(this.intakeStagedRoot, intakeId), 0o700)
+        writeFileSync(partPath, bytes, { mode: 0o600 })
+        chmodSync(partPath, 0o600)
+      } catch (error) {
+        throw new KernelError(500, 'stage_write_failed', `intake staged write failed: ${(error as Error).message}`)
+      }
+      const now = nowIso()
+      const artifact: IntakeArtifact = {
+        artifact_id: artifactId,
+        intake_id: intakeId,
+        file_name: input.file_name,
+        media_type: input.media_type ?? 'application/octet-stream',
+        size_bytes: bytes.byteLength,
+        sha256,
+        quarantine: 'staged',
+        scan_result: {},
+        created_at: now,
+      }
+      this.db.prepare(
+        'INSERT INTO intake_artifacts (intake_id, artifact_id, file_name, media_type, size_bytes, sha256, quarantine, scan_result, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ).run(intakeId, artifactId, artifact.file_name, artifact.media_type, artifact.size_bytes, artifact.sha256, artifact.quarantine, '{}', now)
+      this.setIntakeStatus(intakeId, 'uploading', row.status, 'artifact_staged')
+      return artifact
+    })
   }
 
   private setIntakeStatus(intakeId: string, to: IntakeStatus, from: string, auditAction: string): void {
@@ -4788,6 +4848,7 @@ export class ResearchKernel {
     if (row === undefined) {
       throw new KernelError(404, 'upload_session_not_found', `upload session ${uploadId} not found${intakeId === undefined ? '' : ` in intake ${intakeId}`}`)
     }
+    if (row.project_id !== '') this.getProject(row.project_id)
     return row
   }
 
@@ -4795,9 +4856,139 @@ export class ResearchKernel {
     return uploadStagedPath(this.intakeStagedRoot, intakeId, uploadId)
   }
 
+  private assertChatScopeOpen(projectId: string, scopeId: string | undefined): void {
+    if (scopeId === undefined) return
+    if (scopeId.length < 1 || scopeId.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(scopeId)) {
+      throw new KernelError(422, 'invalid_chat_scope', 'owner_scope_id must be 1-160 safe identifier characters')
+    }
+    const closed = this.db.prepare('SELECT 1 AS found FROM chat_scope_tombstones WHERE project_id = ? AND scope_id = ?')
+      .get(projectId, scopeId) as { found: number } | undefined
+    if (closed !== undefined) {
+      throw new KernelError(409, 'chat_scope_closed', `Chat scope ${scopeId} is closed`)
+    }
+  }
+
+  /** Durable exact-session close linearization point. New Intake/upload work
+   * is rejected after this transaction; already-known stages are compensated
+   * through the same idempotent abort cleanup ledger. */
+  tombstoneChatScope(projectId: string, scopeId: string): { ok: true; aborted_uploads: number } {
+    if (scopeId.length < 1 || scopeId.length > 160 || !/^[A-Za-z0-9._:-]+$/.test(scopeId)) {
+      throw new KernelError(422, 'invalid_chat_scope', 'scope_id must be 1-160 safe identifier characters')
+    }
+    const uploads = withTransaction(this.db, () => {
+      this.getProject(projectId)
+      this.db.prepare(
+        'INSERT OR IGNORE INTO chat_scope_tombstones (project_id, scope_id, closed_at) VALUES (?, ?, ?)',
+      ).run(projectId, scopeId, nowIso())
+      const rows = this.db.prepare(
+        `SELECT u.* FROM upload_sessions u
+         JOIN intake_sessions i ON i.intake_id = u.intake_id
+         WHERE u.project_id = ? AND (u.owner_scope_id = ? OR i.owner_scope_id = ?)
+           AND u.status IN ('open','finalized','aborted')`,
+      ).all(projectId, scopeId, scopeId) as unknown as UploadSessionRow[]
+      for (const row of rows) this.markUploadAbortedInTransaction(row.intake_id, row.upload_id)
+      return rows.map(row => ({ upload_id: row.upload_id, intake_id: row.intake_id }))
+    })
+    // Filesystem cleanup follows commit, but every target is already a
+    // durable aborted ledger. A crash here is recovered by startup sweep.
+    for (const upload of uploads) this.cleanupAbortedUpload(upload.intake_id, upload.upload_id)
+    return { ok: true, aborted_uploads: uploads.length }
+  }
+
+  /** ENOENT is successful idempotent cleanup. Every other unlink failure
+   * leaves the aborted upload row as a retryable cleanup ledger. */
+  private removeUploadStageFile(intakeId: string, uploadId: string): boolean {
+    try {
+      unlinkSync(this.uploadSessionPartPath(intakeId, uploadId))
+      return true
+    } catch (error) {
+      return (error as { code?: string }).code === 'ENOENT'
+    }
+  }
+
+  private removeIntakeStageFile(intakeId: string, sha256: string): boolean {
+    try {
+      unlinkSync(this.intakeStagedPath(intakeId, sha256))
+      return true
+    } catch (error) {
+      return (error as { code?: string }).code === 'ENOENT'
+    }
+  }
+
+  /** Convert one open/finalized upload to a durable cleanup ledger. Caller
+   * must hold BEGIN IMMEDIATE. Repeated calls preserve pending ownership. */
+  private markUploadAbortedInTransaction(intakeId: string, uploadId: string): UploadSessionRow | undefined {
+    const row = this.db.prepare('SELECT * FROM upload_sessions WHERE upload_id = ? AND intake_id = ?')
+      .get(uploadId, intakeId) as UploadSessionRow | undefined
+    if (row === undefined) return undefined
+    this.db.prepare('DELETE FROM upload_chunks WHERE upload_id = ?').run(uploadId)
+    let ownsArtifact = row.owns_artifact
+    if (row.status === 'finalized' && row.owns_artifact === 1 && row.finalized_sha256 !== null) {
+      // Do not transfer to a session whose own scope is already closed.
+      const successor = this.db.prepare(
+        `SELECT u.upload_id FROM upload_sessions u
+         LEFT JOIN chat_scope_tombstones t
+           ON t.project_id = u.project_id AND t.scope_id = u.owner_scope_id
+         WHERE u.intake_id = ? AND u.upload_id != ? AND u.status = 'finalized'
+           AND u.finalized_sha256 = ? AND (u.owner_scope_id IS NULL OR t.scope_id IS NULL)
+         ORDER BY u.created_at LIMIT 1`,
+      ).get(intakeId, uploadId, row.finalized_sha256) as { upload_id: string } | undefined
+      if (successor !== undefined) {
+        this.db.prepare('UPDATE upload_sessions SET owns_artifact = 1 WHERE upload_id = ?').run(successor.upload_id)
+        ownsArtifact = 0
+      } else {
+        const artifact = this.db.prepare(
+          'SELECT quarantine FROM intake_artifacts WHERE intake_id = ? AND sha256 = ?',
+        ).get(intakeId, row.finalized_sha256) as { quarantine: string } | undefined
+        if (artifact?.quarantine === 'staged') {
+          this.db.prepare(
+            "DELETE FROM intake_artifacts WHERE intake_id = ? AND sha256 = ? AND quarantine = 'staged'",
+          ).run(intakeId, row.finalized_sha256)
+          ownsArtifact = 1
+        } else if (artifact !== undefined) {
+          // Scanned/quarantined/accepted material has independent authority.
+          ownsArtifact = 0
+        }
+        // A missing row keeps ownsArtifact=1: the file may still exist after
+        // a prior crash and must remain covered by the cleanup ledger.
+      }
+    } else if (row.status !== 'aborted') {
+      ownsArtifact = 0
+    }
+    this.db.prepare("UPDATE upload_sessions SET status = 'aborted', owns_artifact = ?, updated_at = ? WHERE upload_id = ?")
+      .run(ownsArtifact, nowIso(), uploadId)
+    return { ...row, status: 'aborted', owns_artifact: ownsArtifact }
+  }
+
+  /** Consume one durable aborted ledger under the same writer lock used by
+   * direct staging. A newly recreated same-SHA artifact therefore wins and
+   * cannot be unlinked by an older cleanup generation. */
+  private cleanupAbortedUpload(intakeId: string, uploadId: string): boolean {
+    return withTransaction(this.db, () => {
+      const row = this.db.prepare(
+        "SELECT * FROM upload_sessions WHERE upload_id = ? AND intake_id = ? AND status = 'aborted'",
+      ).get(uploadId, intakeId) as UploadSessionRow | undefined
+      if (row === undefined) return false
+      const partRemoved = this.removeUploadStageFile(intakeId, uploadId)
+      let artifactRemoved = true
+      if (row.owns_artifact === 1 && row.finalized_sha256 !== null) {
+        const liveArtifact = this.db.prepare(
+          'SELECT 1 AS found FROM intake_artifacts WHERE intake_id = ? AND sha256 = ?',
+        ).get(intakeId, row.finalized_sha256) as { found: number } | undefined
+        artifactRemoved = liveArtifact !== undefined
+          ? true
+          : this.removeIntakeStageFile(intakeId, row.finalized_sha256)
+      }
+      if (!partRemoved || !artifactRemoved) return false
+      this.db.prepare("DELETE FROM upload_sessions WHERE upload_id = ? AND status = 'aborted'").run(uploadId)
+      return true
+    })
+  }
+
   /** CHUNK-01: open upload sessions of one intake（断线/刷新后续传查询）。 */
   listUploadSessions(intakeId: string): UploadSessionView[] {
-    this.getIntakeSessionRow(intakeId)
+    const intake = this.getIntakeSessionRow(intakeId)
+    if (intake.project_id !== null) this.getProject(intake.project_id)
     const rows = this.db.prepare('SELECT * FROM upload_sessions WHERE intake_id = ? ORDER BY created_at').all(intakeId) as unknown as UploadSessionRow[]
     return rows.map(row => ({
       upload_id: row.upload_id,
@@ -4822,64 +5013,74 @@ export class ResearchKernel {
    * project、Principal、文件名、media type、expected size/hash、chunk
    * 上限与 expiry（≥24h）。扫描前字节只写入隔离 intake staging。
    */
-  beginUploadSession(intakeId: string, input: UploadSessionBeginInput & { principal_id?: string }): UploadSession {
-    const row = this.getIntakeSessionRow(intakeId)
-    const session = this.intakeSessionFromRow(row)
-    this.assertIntakeMutable(session)
-    this.assertIntakeNotExpired(session)
+  beginUploadSession(intakeId: string, input: UploadSessionBeginInput & { principal_id?: string; owner_scope_id?: string }): UploadSession {
     validateUploadFileName(input.file_name)
     const chunkSize = Math.max(1, Math.min(
       input.chunk_size ?? this.intakeChunkSizeBytes,
       this.intakeChunkSizeBytes,
     ))
-    // 配额预留：开放会话 expected_size + 已 staged artifact 之和 ≤ quota。
-    const openSessions = this.db.prepare(
-      "SELECT expected_size FROM upload_sessions WHERE intake_id = ? AND status = 'open'",
-    ).all(intakeId) as unknown as Array<{ expected_size: number }>
-    const stagedArtifacts = this.db.prepare(
-      "SELECT size_bytes FROM intake_artifacts WHERE intake_id = ? AND quarantine = 'staged'",
-    ).all(intakeId) as unknown as Array<{ size_bytes: number }>
-    const quota = intakeQuotaCheck({
-      quotaBytes: this.intakeQuotaBytes,
-      openSessions,
-      stagedArtifacts,
-      additionalBytes: input.expected_size,
-    })
-    if (quota.exceeded) {
-      throw new KernelError(413, 'upload_quota_exceeded',
-        `intake upload quota exceeded: ${quota.used + input.expected_size} bytes > ${quota.limit} (per-Intake reserved quota)`)
-    }
-    const now = nowIso()
-    const uploadId = randomId('upl')
-    const upload: UploadSession = {
-      upload_id: uploadId,
-      intake_id: intakeId,
-      project_id: row.project_id ?? '',
-      file_name: input.file_name,
-      media_type: input.media_type ?? 'application/octet-stream',
-      expected_size: input.expected_size,
-      expected_sha256: input.expected_sha256 ?? null,
-      chunk_size: chunkSize,
-      committed_offset: 0,
-      status: 'open',
-      finalized_sha256: null,
-      created_by: input.principal_id ?? '',
-      created_at: now,
-      updated_at: now,
-      expires_at: new Date(Date.now() + ResearchKernel.CHUNKED_UPLOAD_SESSION_TTL_MS).toISOString(),
-    }
-    try {
-      mkdirMode(join(this.intakeStagedRoot, intakeId), 0o700)
-    } catch { /* already exists */ }
     return withTransaction(this.db, () => {
+      // Project/intake liveness, scope admission and quota reservation share
+      // one BEGIN IMMEDIATE. Concurrent delete/close/begin operations cannot
+      // all validate stale state and then insert after authority changed.
+      const row = this.getIntakeSessionRow(intakeId)
+      if (row.project_id !== null) this.getProject(row.project_id)
+      const session = this.intakeSessionFromRow(row)
+      this.assertIntakeMutable(session)
+      this.assertIntakeNotExpired(session)
+      const effectiveOwnerScope = input.owner_scope_id ?? row.owner_scope_id ?? undefined
+      if (row.project_id !== null) {
+        this.assertChatScopeOpen(row.project_id, row.owner_scope_id ?? undefined)
+        if (input.owner_scope_id !== undefined && row.owner_scope_id !== null && input.owner_scope_id !== row.owner_scope_id) {
+          throw new KernelError(409, 'chat_scope_mismatch', 'upload owner_scope_id does not match the Chat-owned Intake')
+        }
+      }
+      this.assertChatScopeOpen(row.project_id ?? '', effectiveOwnerScope)
+      const openSessions = this.db.prepare(
+        "SELECT expected_size FROM upload_sessions WHERE intake_id = ? AND status = 'open'",
+      ).all(intakeId) as unknown as Array<{ expected_size: number }>
+      const stagedArtifacts = this.db.prepare(
+        "SELECT size_bytes FROM intake_artifacts WHERE intake_id = ? AND quarantine = 'staged'",
+      ).all(intakeId) as unknown as Array<{ size_bytes: number }>
+      const quota = intakeQuotaCheck({
+        quotaBytes: this.intakeQuotaBytes,
+        openSessions,
+        stagedArtifacts,
+        additionalBytes: input.expected_size,
+      })
+      if (quota.exceeded) {
+        throw new KernelError(413, 'upload_quota_exceeded',
+          `intake upload quota exceeded: ${quota.used + input.expected_size} bytes > ${quota.limit} (per-Intake reserved quota)`)
+      }
+      const now = nowIso()
+      const upload: UploadSession = {
+        upload_id: randomId('upl'),
+        intake_id: intakeId,
+        project_id: row.project_id ?? '',
+        file_name: input.file_name,
+        media_type: input.media_type ?? 'application/octet-stream',
+        expected_size: input.expected_size,
+        expected_sha256: input.expected_sha256 ?? null,
+        chunk_size: chunkSize,
+        committed_offset: 0,
+        status: 'open',
+        finalized_sha256: null,
+        created_by: input.principal_id ?? '',
+        created_at: now,
+        updated_at: now,
+        expires_at: new Date(Date.now() + ResearchKernel.CHUNKED_UPLOAD_SESSION_TTL_MS).toISOString(),
+      }
+      try {
+        mkdirMode(join(this.intakeStagedRoot, intakeId), 0o700)
+      } catch { /* already exists */ }
       this.db.prepare(
         `INSERT INTO upload_sessions (upload_id, intake_id, project_id, file_name, media_type, expected_size, expected_sha256,
-           chunk_size, committed_offset, status, created_by_principal, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           chunk_size, committed_offset, status, created_by_principal, owner_scope_id, created_at, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         upload.upload_id, upload.intake_id, upload.project_id, upload.file_name, upload.media_type,
         upload.expected_size, upload.expected_sha256, upload.chunk_size, 0, 'open',
-        upload.created_by, upload.created_at, upload.updated_at, upload.expires_at,
+        upload.created_by, effectiveOwnerScope ?? null, upload.created_at, upload.updated_at, upload.expires_at,
       )
       return upload
     })
@@ -4897,6 +5098,9 @@ export class ResearchKernel {
     chunkSha256: string
   }): ChunkAppendResult {
     const row = this.getUploadSessionRow(uploadId, intakeId)
+    this.assertChatScopeOpen(row.project_id, row.owner_scope_id ?? undefined)
+    const intakeOwner = this.getIntakeSessionRow(intakeId, row.project_id)
+    this.assertChatScopeOpen(row.project_id, intakeOwner.owner_scope_id ?? undefined)
     if (row.status !== 'open') {
       throw new KernelError(409, 'upload_session_closed', `upload session ${uploadId} is ${row.status} — no more chunks accepted`)
     }
@@ -4943,21 +5147,46 @@ export class ResearchKernel {
       throw new KernelError(409, 'chunk_gap',
         `chunk starts at ${range.start} but committed_offset is ${row.committed_offset} — chunks must be contiguous`)
     }
-    // start === committed_offset：顺序追加。
-    const partPath = this.uploadSessionPartPath(intakeId, uploadId)
-    try {
-      mkdirMode(join(this.intakeStagedRoot, intakeId), 0o700)
-      const fd = openSync(partPath, row.committed_offset === 0 ? 'w' : 'r+', 0o600)
-      try {
-        writeSync(fd, Buffer.from(input.bytes), 0, len, row.committed_offset)
-        chmodSync(partPath, 0o600)
-      } finally {
-        closeSync(fd)
-      }
-    } catch (error) {
-      throw new KernelError(500, 'stage_write_failed', `upload session staged write failed: ${(error as Error).message}`)
-    }
+    // start === committed_offset：顺序追加。The filesystem write remains
+    // inside the same SQLite write transaction as the final liveness check;
+    // whichever operation (append or scope tombstone) linearizes first is
+    // followed by the other, and tombstone cleanup cannot miss late bytes.
     return withTransaction(this.db, () => {
+      const live = this.db.prepare('SELECT * FROM upload_sessions WHERE upload_id = ? AND intake_id = ?')
+        .get(uploadId, intakeId) as UploadSessionRow | undefined
+      if (live === undefined) throw new KernelError(404, 'upload_session_not_found', `upload session ${uploadId} not found`)
+      if (live.status !== 'open') {
+        throw new KernelError(409, 'upload_session_closed', `upload session ${uploadId} is ${live.status} — no more chunks accepted`)
+      }
+      this.assertChatScopeOpen(live.project_id, live.owner_scope_id ?? undefined)
+      const liveIntake = this.getIntakeSessionRow(intakeId, live.project_id)
+      this.assertChatScopeOpen(live.project_id, liveIntake.owner_scope_id ?? undefined)
+      if (range.start < live.committed_offset) {
+        const existing = this.db.prepare('SELECT size, sha256 FROM upload_chunks WHERE upload_id = ? AND offset = ?')
+          .get(uploadId, range.start) as { size: number; sha256: string } | undefined
+        if (existing !== undefined && existing.size === len && existing.sha256 === actualSha) {
+          return { upload_id: uploadId, committed_offset: live.committed_offset, replayed: true }
+        }
+        throw new KernelError(409, 'chunk_overlap_conflict',
+          `chunk at offset ${range.start} overlaps committed data with different content (committed_offset ${live.committed_offset})`)
+      }
+      if (range.start > live.committed_offset) {
+        throw new KernelError(409, 'chunk_gap',
+          `chunk starts at ${range.start} but committed_offset is ${live.committed_offset} — chunks must be contiguous`)
+      }
+      const partPath = this.uploadSessionPartPath(intakeId, uploadId)
+      try {
+        mkdirMode(join(this.intakeStagedRoot, intakeId), 0o700)
+        const fd = openSync(partPath, live.committed_offset === 0 ? 'w' : 'r+', 0o600)
+        try {
+          writeSync(fd, Buffer.from(input.bytes), 0, len, live.committed_offset)
+          chmodSync(partPath, 0o600)
+        } finally {
+          closeSync(fd)
+        }
+      } catch (error) {
+        throw new KernelError(500, 'stage_write_failed', `upload session staged write failed: ${(error as Error).message}`)
+      }
       this.db.prepare('INSERT INTO upload_chunks (upload_id, offset, size, sha256) VALUES (?, ?, ?, ?)')
         .run(uploadId, range.start, len, actualSha)
       const committed = range.end + 1
@@ -4976,6 +5205,7 @@ export class ResearchKernel {
    */
   finalizeUploadSession(intakeId: string, uploadId: string): IntakeArtifact {
     const row = this.getUploadSessionRow(uploadId, intakeId)
+    this.assertChatScopeOpen(row.project_id, row.owner_scope_id ?? undefined)
     if (row.status === 'finalized' && row.finalized_sha256 !== null) {
       const existing = this.db.prepare('SELECT * FROM intake_artifacts WHERE intake_id = ? AND artifact_id = ?')
         .get(intakeId, `sha256:${row.finalized_sha256}`) as IntakeArtifactRow | undefined
@@ -4999,6 +5229,7 @@ export class ResearchKernel {
     }
     const sessionRow = this.getIntakeSessionRow(intakeId)
     const session = this.intakeSessionFromRow(sessionRow)
+    if (sessionRow.project_id !== null) this.assertChatScopeOpen(sessionRow.project_id, sessionRow.owner_scope_id ?? undefined)
     this.assertIntakeMutable(session)
     this.assertIntakeNotExpired(session)
     if (row.committed_offset !== row.expected_size) {
@@ -5026,6 +5257,24 @@ export class ResearchKernel {
     const artifactTarget = this.intakeStagedPath(intakeId, actualSha)
     const now = nowIso()
     return withTransaction(this.db, () => {
+      // Hashing happens outside the write transaction. Re-resolve every live
+      // owner after that filesystem window so a concurrent project delete or
+      // upload abort wins before artifact promotion.
+      const liveUpload = this.db.prepare('SELECT * FROM upload_sessions WHERE upload_id = ? AND intake_id = ?')
+        .get(uploadId, intakeId) as UploadSessionRow | undefined
+      if (liveUpload === undefined) {
+        throw new KernelError(404, 'upload_session_not_found', `upload session ${uploadId} not found`)
+      }
+      if (liveUpload.status !== 'open') {
+        throw new KernelError(409, 'upload_session_closed', `upload session ${uploadId} is ${liveUpload.status} — cannot finalize`)
+      }
+      this.getProject(liveUpload.project_id)
+      this.assertChatScopeOpen(liveUpload.project_id, liveUpload.owner_scope_id ?? undefined)
+      const liveSessionRow = this.getIntakeSessionRow(intakeId, liveUpload.project_id)
+      const liveSession = this.intakeSessionFromRow(liveSessionRow)
+      this.assertChatScopeOpen(liveUpload.project_id, liveSessionRow.owner_scope_id ?? undefined)
+      this.assertIntakeMutable(liveSession)
+      this.assertIntakeNotExpired(liveSession)
       const existing = this.db.prepare('SELECT * FROM intake_artifacts WHERE intake_id = ? AND artifact_id = ?')
         .get(intakeId, artifactId) as IntakeArtifactRow | undefined
       if (existing === undefined) {
@@ -5052,13 +5301,20 @@ export class ResearchKernel {
         this.db.prepare(
           'INSERT INTO intake_artifacts (intake_id, artifact_id, file_name, media_type, size_bytes, sha256, quarantine, scan_result, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
         ).run(intakeId, artifactId, artifact.file_name, artifact.media_type, artifact.size_bytes, artifact.sha256, artifact.quarantine, '{}', now)
-        this.setIntakeStatus(intakeId, 'uploading', sessionRow.status, 'artifact_staged')
-        this.db.prepare('UPDATE upload_sessions SET status = ?, finalized_sha256 = ?, updated_at = ? WHERE upload_id = ?')
+        this.setIntakeStatus(intakeId, 'uploading', liveSessionRow.status, 'artifact_staged')
+        this.db.prepare('UPDATE upload_sessions SET status = ?, finalized_sha256 = ?, owns_artifact = 1, updated_at = ? WHERE upload_id = ?')
           .run('finalized', actualSha, now, uploadId)
         return artifact
       }
       // 幂等重放：artifact 已存在（重复 finalize / 内容去重）。
-      this.db.prepare('UPDATE upload_sessions SET status = ?, finalized_sha256 = ?, updated_at = ? WHERE upload_id = ?')
+      if (artifactTarget !== partPath) {
+        try { unlinkSync(partPath) } catch (error) {
+          if ((error as { code?: string }).code !== 'ENOENT') {
+            throw new KernelError(500, 'stage_write_failed', `deduplicated upload cleanup failed: ${(error as Error).message}`)
+          }
+        }
+      }
+      this.db.prepare('UPDATE upload_sessions SET status = ?, finalized_sha256 = ?, owns_artifact = 0, updated_at = ? WHERE upload_id = ?')
         .run('finalized', actualSha, now, uploadId)
       return {
         intake_id: existing.intake_id,
@@ -5074,38 +5330,28 @@ export class ResearchKernel {
     })
   }
 
-  /** CHUNK-01 abort：幂等；删除会话行 + chunk 行 + staging 字节（释放配额）。
-   * 会话已不存在（重复 abort / 已被 GC）时同样返回 ok —— 幂等 no-op。 */
+  /** CHUNK-01 abort：幂等；先持久化 aborted cleanup ledger 并删除
+   * chunk rows。若 finalize 与关闭 session 竞态，则只撤销由该 upload
+   * 新建且仍为 staged 的 artifact；去重/已扫描 artifact 不受影响。
+   * unlink 成功后才删除会话行。 */
   abortUploadSession(intakeId: string, uploadId: string): { ok: true } {
-    const row = this.db.prepare('SELECT upload_id FROM upload_sessions WHERE upload_id = ? AND intake_id = ?')
-      .get(uploadId, intakeId) as { upload_id: string } | undefined
-    if (row !== undefined) {
-      withTransaction(this.db, () => {
-        this.db.prepare('DELETE FROM upload_chunks WHERE upload_id = ?').run(uploadId)
-        this.db.prepare('DELETE FROM upload_sessions WHERE upload_id = ?').run(uploadId)
-      })
-    }
-    try { unlinkSync(this.uploadSessionPartPath(intakeId, uploadId)) } catch { /* already gone */ }
+    const marked = withTransaction(this.db, () => this.markUploadAbortedInTransaction(intakeId, uploadId))
+    if (marked !== undefined) this.cleanupAbortedUpload(intakeId, uploadId)
     return { ok: true }
   }
 
   /**
-   * CHUNK-01 GC：过期（≥24h）开放会话 —— 删除行 + staging 字节，释放
-   * 配额。由 kernel 常驻 sweep 定时器调用（与 PTY idle sweep 同周期），
-   * 也可按需手动触发。返回回收的会话数。
+   * CHUNK-01 GC：立即重试 aborted cleanup ledger，并回收过期（≥24h）
+   * open session。只有 staging 字节确认不存在后才删除 ledger row。
    */
   cleanupUploadSessions(now = Date.now()): number {
     const expired = this.db.prepare(
-      "SELECT upload_id, intake_id FROM upload_sessions WHERE status = 'open' AND expires_at < ?",
+      "SELECT upload_id, intake_id FROM upload_sessions WHERE status = 'aborted' OR (status = 'open' AND expires_at < ?)",
     ).all(new Date(now).toISOString()) as unknown as Array<{ upload_id: string; intake_id: string }>
     let removed = 0
     for (const item of expired) {
-      withTransaction(this.db, () => {
-        this.db.prepare('DELETE FROM upload_chunks WHERE upload_id = ?').run(item.upload_id)
-        this.db.prepare('DELETE FROM upload_sessions WHERE upload_id = ?').run(item.upload_id)
-      })
-      try { unlinkSync(this.uploadSessionPartPath(item.intake_id, item.upload_id)) } catch { /* already gone */ }
-      removed += 1
+      withTransaction(this.db, () => this.markUploadAbortedInTransaction(item.intake_id, item.upload_id))
+      if (this.cleanupAbortedUpload(item.intake_id, item.upload_id)) removed += 1
     }
     return removed
   }

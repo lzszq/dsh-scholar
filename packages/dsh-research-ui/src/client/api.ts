@@ -114,6 +114,7 @@ export async function apiResult<T>(path: string, init?: RequestInit): Promise<Ap
       }
       return { ok: true, data: (await response.json()) as T, status: response.status }
     } catch {
+      if (init?.signal?.aborted === true) break
       // retry once on transport failures
     }
   }

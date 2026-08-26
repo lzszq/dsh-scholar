@@ -183,7 +183,7 @@ Sidecar 只复用 protocol_version、schema_version、database_id 和预期配�
 - 分页不保证数据库快照隔离，但稳定 keyset 保证不重复；新插入可能出现在下一次从头刷新。
 - ETag：双引号包围资源 version/hash，例如 "tex:doc_x:path:7:sha256..."。
 - 修改优先使用 body expected_version；If-Match 可携带同一 ETag，两者同时存在必须一致。
-- Idempotency-Key 长度 1–200，同一 project/key 且 request hash 相同返回原响应；hash 不同返回 409 idempotency_conflict。
+- Idempotency-Key 长度 1–200，只有同一 project、同一 Chat owner scope、同一 key 且 request hash 相同才返回原响应；project、scope 或 hash 任一不同都返回 409 idempotency_conflict，不得跨 authority 重放 Intake。
 
 ## 7. AuthZ 能力矩阵
 

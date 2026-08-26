@@ -24,6 +24,9 @@ function run(args: string[], env: Record<string, string> = {}) {
 
 describe('private @deepseek-ai registry compatibility harness', () => {
   it('pins source-build DSH peers while keeping the published host surface optional', () => {
+    const baseline = JSON.parse(readFileSync(join(repo, 'config/dsh-baseline.json'), 'utf8')) as {
+      version: string
+    }
     const manifest = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')) as {
       peerDependencies: Record<string, string>
       peerDependenciesMeta: Record<string, { optional?: boolean }>
@@ -38,8 +41,8 @@ describe('private @deepseek-ai registry compatibility harness', () => {
       expect(manifest.devDependencies[name], name).toBeDefined()
     }
     for (const name of dshPeers.filter(name => name.startsWith('@deepseek-ai/dsh-'))) {
-      expect(manifest.peerDependencies[name], name).toBe('^0.1.0-rc.8')
-      expect(manifest.devDependencies[name], name).toBe('0.1.0-rc.8')
+      expect(manifest.peerDependencies[name], name).toBe(`^${baseline.version}`)
+      expect(manifest.devDependencies[name], name).toBe(baseline.version)
     }
 
     const scripts = (manifest as typeof manifest & {
@@ -50,6 +53,10 @@ describe('private @deepseek-ai registry compatibility harness', () => {
 
     const workspace = readFileSync(join(repo, 'pnpm-workspace.yaml'), 'utf8')
     expect(workspace).toMatch(/^autoInstallPeers: true$/m)
+    const pinnedDshVersions = [...workspace.matchAll(/'@deepseek-ai\/dsh-[^'@]+@([^']+)'/g)]
+      .map(match => match[1])
+    expect(pinnedDshVersions.length).toBeGreaterThan(0)
+    expect(new Set(pinnedDshVersions)).toEqual(new Set([baseline.version]))
   })
 
   it('is pending locally but fail-closed by default and in CI', () => {

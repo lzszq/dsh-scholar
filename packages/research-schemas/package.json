@@ -12,6 +12,11 @@
       "import": "./lib/index.js",
       "default": "./lib/index.js"
     },
+    "./chat-agent": {
+      "types": "./lib/chat-agent.d.ts",
+      "import": "./lib/chat-agent.js",
+      "default": "./lib/chat-agent.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {

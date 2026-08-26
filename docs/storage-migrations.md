@@ -733,3 +733,11 @@ Runner completion→classification→synthesis request 本身不新增 migration
 `0033_full_auto_global_idempotency` 把 `SCHEMA_VERSION` 提升到 `30`，只追加 `full_auto_gate_idempotency`，不修改 0001–0032 的 body/checksum。`idempotency_key` 是全局主键；每行保存 canonical request SHA-256、exact project/Gate/revision、唯一 Decision、authority receipt 与创建时间，并以外键绑定既有 Project/Gate/Decision。
 
 Kernel 在 full-auto approval 事务开始时先按全局 key 查询：同 digest 从 ledger 重放 exact receipt；不同 project、Gate、revision 或 strict body 得到 409 `idempotency_conflict`，且不会进入 Gate/Decision 写入。首次成功则在 Decision、Gate/Project side effect 与 Outbox 所在的同一 SQLite 事务插入 ledger，因此不存在 Decision 成功而幂等 receipt 丢失的提交窗口。0033 不回填历史 Gate-local key，也不增加兼容查询；升级不改写 Project、Gate 或 Decision。`tests/unit/migrations.test.ts` 覆盖 fresh/reopen/29→30 与 Project 不变，`tests/unit/full-auto.test.ts` 覆盖跨 Gate、跨项目和重启后的同体/异体行为。
+
+## 17. Chat 上传关闭竞态所有权（migration 0034）
+
+`0034_upload_abort_ownership` 把 `SCHEMA_VERSION` 提升到 `31`，为 `upload_sessions` 追加 `owns_artifact INTEGER NOT NULL DEFAULT 0` 与 nullable `owner_scope_id TEXT`，为 `intake_sessions` 追加 nullable `owner_scope_id TEXT`，并新建以 `(project_id,scope_id)` 为主键的 `chat_scope_tombstones`。它不修改 0021 的已发布 migration body/checksum，也不改写既有 Project、Intake 或 Artifact；历史 Intake/upload 默认不声明 artifact 所有权、也不追溯绑定 Chat scope。
+
+新 finalize 只有在本次上传实际创建隔离区内、仍为 `staged` 的 IntakeArtifact 时才写 `owns_artifact=1`；内容去重命中既有 artifact 时写 0。显式关闭 Chat session 时，Kernel 在同一事务持久化 scope tombstone、删除 chunk ledger、把该 scope 的 open/finalized upload 全部转为 `aborted` cleanup ledger，并仅在提交后消费文件清理；因此提交后崩溃仍可由启动/sweep 收敛。迟到的 Intake begin、upload begin、append 与 finalize 都在写入前检查 tombstone并以 `409 chat_scope_closed` 失败；scoped Intake 的 admission、幂等重放/active reuse 与 insert 同处一个写事务，owner scope 作为 provenance 持久化。upload begin 的 Project/Intake/scope/quota 也同处 `BEGIN IMMEDIATE`，并发 begin 不能同时使用旧配额。
+
+客户端取消信号覆盖 Intake 请求、hash、chunk 与 finalize；若成功响应和取消交错，补偿 abort 可以撤销刚完成的 late finalize，同时不会删除预先存在、已去重或已经扫描的材料。重复 abort 必须保留尚未 unlink 的 `owns_artifact=1`，不能把失败账本降为 0。direct/multipart same-SHA stage 在写锁内解除旧 upload ownership；cleanup 也在该写锁内先检查当前 artifact row，旧 ledger 因而不能删除后来重建的新一代同路径文件。若同一 staged artifact 有其他 finalized upload 引用，所有权会在事务内转移；文件 unlink 失败则保留 `aborted` row 由 sweep 重试。finalize 在文件 hash 后、artifact promote 前必须在写事务内重新检查 upload 为 open、Project 未删除、scope 未关闭且 Intake 仍可写，保证 abort/delete/close 已先提交时不会产生新 artifact。

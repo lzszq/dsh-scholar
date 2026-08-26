@@ -109,6 +109,43 @@ describe('ONBOARD-01 begin', () => {
     kernel.close()
   })
 
+  it('binds an Intake idempotency key to the exact project and Chat scope', () => {
+    const kernel = freshKernel()
+    const projectA = kernel.createProject({ name: 'a', workspace: '/a', brief: makeBrief() })
+    const projectB = kernel.createProject({ name: 'b', workspace: '/b', brief: makeBrief() })
+    const first = kernel.beginIntake({
+      project_id: projectA.project_id,
+      source_label: 'chat',
+      idempotency_key: 'authority-key',
+      request_hash: 'same-hash',
+      owner_scope_id: 'scope-a',
+    })
+    const replay = kernel.beginIntake({
+      project_id: projectA.project_id,
+      source_label: 'chat',
+      idempotency_key: 'authority-key',
+      request_hash: 'same-hash',
+      owner_scope_id: 'scope-a',
+    })
+    expect(replay.intake_id).toBe(first.intake_id)
+    expectKernelError(() => kernel.beginIntake({
+      project_id: projectB.project_id,
+      source_label: 'chat',
+      idempotency_key: 'authority-key',
+      request_hash: 'same-hash',
+      owner_scope_id: 'scope-a',
+    }), 409, 'idempotency_conflict')
+    expectKernelError(() => kernel.beginIntake({
+      project_id: projectA.project_id,
+      source_label: 'chat',
+      idempotency_key: 'authority-key',
+      request_hash: 'same-hash',
+      owner_scope_id: 'scope-b',
+    }), 409, 'idempotency_conflict')
+    expect(count(kernel, 'intake_sessions')).toBe(1)
+    kernel.close()
+  })
+
   it('reuses the single active intake per project (intake_id + project unique)', () => {
     const kernel = freshKernel()
     const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })

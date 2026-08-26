@@ -26,6 +26,7 @@
 
 import type { ChatAttachmentRef } from './types'
 import { authHeaders, base, ensureCsrfToken } from './api'
+import { sha256 } from '@noble/hashes/sha2.js'
 
 export type QueueItemState =
   | 'hashing'
@@ -52,6 +53,8 @@ export interface UploadQueueItem {
   projectId: string | null
   /** 客户端 hashing 阶段预计算的整体 sha256（服务端 finalize 复算比对）。 */
   expectedSha256: string | null
+  /** Server-negotiated chunk cap. Persisted for exact-offset resume. */
+  chunkSize: number | null
   /** 已提交字节数（= 下一个可发送 chunk 的 offset）。 */
   committedOffset: number
   retryCount: number
@@ -81,6 +84,8 @@ export interface UploadTransport {
     expected_size: number
     expected_sha256?: string
     chunk_size?: number
+    owner_scope_id?: string
+    signal?: AbortSignal
   }): Promise<{ upload_id: string; chunk_size: number; committed_offset: number }>
   appendChunk(input: {
     project_id: string
@@ -91,9 +96,25 @@ export interface UploadTransport {
     total: number
     bytes: Uint8Array
     sha256: string
+    signal?: AbortSignal
   }): Promise<{ committed_offset: number; replayed: boolean }>
-  finalize(input: { project_id: string; upload_id: string; intake_id: string }): Promise<unknown>
-  abort(input: { project_id: string; upload_id: string; intake_id: string }): Promise<unknown>
+  finalize(input: { project_id: string; upload_id: string; intake_id: string; signal?: AbortSignal }): Promise<unknown>
+  abort(input: { project_id: string; upload_id: string; intake_id: string; signal?: AbortSignal }): Promise<unknown>
+  /** Browser recovery seam. Upload drivers do not require it, while the
+   * page-lifetime queue uses it to reconcile durable offsets after reload. */
+  listSessions?(input: { project_id: string; intake_id: string; signal?: AbortSignal }): Promise<UploadSessionProjection[]>
+}
+
+export interface UploadSessionProjection {
+  upload_id: string
+  intake_id: string
+  file_name: string
+  media_type: string
+  expected_size: number
+  expected_sha256: string | null
+  chunk_size: number
+  committed_offset: number
+  status: 'open' | 'finalized' | 'aborted' | 'expired'
 }
 
 let fileIdCounter = 0
@@ -112,6 +133,7 @@ export function enqueueFiles(
     intakeId: null,
     projectId: null,
     expectedSha256: null,
+    chunkSize: null,
     committedOffset: 0,
     retryCount: 0,
     lastError: null,
@@ -128,8 +150,14 @@ export function markQueued(item: UploadQueueItem): UploadQueueItem {
 }
 
 /** begin 成功：绑定服务端会话，进入 uploading。 */
-export function markUploading(item: UploadQueueItem, uploadId: string, intakeId: string, projectId: string): UploadQueueItem {
-  return { ...item, state: 'uploading', uploadId, intakeId, projectId, lastError: null }
+export function markUploading(
+  item: UploadQueueItem,
+  uploadId: string,
+  intakeId: string,
+  projectId: string,
+  chunkSize: number,
+): UploadQueueItem {
+  return { ...item, state: 'uploading', uploadId, intakeId, projectId, chunkSize, lastError: null }
 }
 
 /** 下一个待发送 chunk 范围（[start, end]，end 含）；已传完 → null。 */
@@ -252,6 +280,27 @@ export async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
+export interface SliceableUploadFile {
+  readonly size: number
+  slice(start?: number, end?: number): { arrayBuffer(): Promise<ArrayBuffer> }
+}
+
+/** Incremental whole-file SHA-256. Only one bounded slice is resident at a
+ * time, so the browser's memory use does not grow with a multi-GiB upload. */
+export async function sha256File(file: SliceableUploadFile, chunkSize = 8 * 1024 * 1024, signal?: AbortSignal): Promise<string> {
+  if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > 32 * 1024 * 1024) {
+    throw new Error('invalid hash chunk size')
+  }
+  const hasher = sha256.create()
+  for (let start = 0; start < file.size; start += chunkSize) {
+    if (signal?.aborted === true) throw signal.reason ?? new Error('upload cancelled')
+    const end = Math.min(start + chunkSize, file.size)
+    hasher.update(new Uint8Array(await file.slice(start, end).arrayBuffer()))
+  }
+  if (signal?.aborted === true) throw signal.reason ?? new Error('upload cancelled')
+  return [...hasher.digest()].map(byte => byte.toString(16).padStart(2, '0')).join('')
+}
+
 /**
  * 上传驱动：顺序发送 chunk（begin → append → finalize）。失败重试
  * （retryCount < maxRetries）。返回最终队列。PURE 于 transport 与
@@ -263,20 +312,35 @@ export async function driveUpload(
   options: {
     chunkSize?: number
     maxRetries?: number
-    onState?: (item: UploadQueueItem) => void
+    /** Return false when the exact-session owner rejected this late state. */
+    onState?: (item: UploadQueueItem) => boolean | void
     readBytes?: (fileId: string, start: number, end: number) => Promise<Uint8Array | null>
     /** 每 chunk 前询问是否继续；返回 false → 暂停（pauseItem）并返回。 */
     shouldContinue?: (item: UploadQueueItem) => boolean
+    /** Exact-session cancellation, shared across composer remounts. */
+    signal?: AbortSignal
+    /** Durable server-side scope bound to this Chat session. */
+    ownerScopeId?: string
   } = {},
 ): Promise<UploadQueueItem> {
-  const chunkSize = options.chunkSize ?? 8 * 1024 * 1024
+  let chunkSize = item.chunkSize ?? options.chunkSize ?? 8 * 1024 * 1024
   const maxRetries = options.maxRetries ?? 3
-  const readBytes = options.readBytes ?? ((fileId, start, end) => {
-    const provider = uploadByteProviders.get(fileId)
-    return provider === undefined ? Promise.resolve(null) : provider.read(fileId, start, end)
-  })
+  const readBytes = options.readBytes ?? (() => Promise.resolve(null))
   let current = item
-  const emit = (next: UploadQueueItem): void => { current = next; options.onState?.(next) }
+  const emit = (next: UploadQueueItem): boolean => {
+    current = next
+    return options.onState?.(next) !== false
+  }
+  const shouldContinue = (next: UploadQueueItem): boolean =>
+    options.signal?.aborted !== true && (options.shouldContinue?.(next) ?? true)
+  const abortRejectedSession = async (next: UploadQueueItem): Promise<void> => {
+    if (next.uploadId === null || next.intakeId === null || next.projectId === null) return
+    await transport.abort({
+      project_id: next.projectId,
+      upload_id: next.uploadId,
+      intake_id: next.intakeId,
+    }).catch(() => {})
+  }
 
   if (current.state === 'hashing') emit(markFailed(current, new Error('hash the file before driving the upload')))
   if (current.state === 'failed') return current
@@ -294,8 +358,34 @@ export async function driveUpload(
         expected_size: current.fileSize,
         expected_sha256: current.expectedSha256,
         chunk_size: chunkSize,
+        owner_scope_id: options.ownerScopeId,
+        signal: options.signal,
       })
-      emit(markUploading(current, session.upload_id, current.intakeId ?? '', current.projectId ?? ''))
+      if (!Number.isSafeInteger(session.chunk_size) || session.chunk_size <= 0 || session.chunk_size > 32 * 1024 * 1024) {
+        await transport.abort({
+          project_id: current.projectId ?? '',
+          upload_id: session.upload_id,
+          intake_id: current.intakeId ?? '',
+        }).catch(() => {})
+        throw new Error('invalid negotiated chunk size')
+      }
+      chunkSize = session.chunk_size
+      const begun = markUploading(
+        current,
+        session.upload_id,
+        current.intakeId ?? '',
+        current.projectId ?? '',
+        chunkSize,
+      )
+      if (!shouldContinue(begun)) {
+        const paused = { ...begun, state: 'paused' as const }
+        if (!emit(paused)) await abortRejectedSession(paused)
+        return current
+      }
+      if (!emit(begun)) {
+        await abortRejectedSession(begun)
+        return current
+      }
     } catch (error) {
       emit(markFailed(current, error))
       return current
@@ -308,7 +398,7 @@ export async function driveUpload(
   const intakeId = current.intakeId ?? ''
   const projectId = current.projectId ?? ''
   while (current.committedOffset < current.fileSize) {
-    if (options.shouldContinue !== undefined && !options.shouldContinue(current)) {
+    if (!shouldContinue(current)) {
       emit(pauseItem(current))
       return current
     }
@@ -332,8 +422,17 @@ export async function driveUpload(
           total: current.fileSize,
           bytes: chunk,
           sha256: sha,
+          signal: options.signal,
         })
-        emit(applyAppendResult(current, result))
+        const appended = applyAppendResult(current, result)
+        // A user can pause while appendChunk is in flight. Re-check the
+        // external exact-session state before publishing the response so the
+        // driver's stale "uploading" snapshot cannot overwrite that pause.
+        if (!shouldContinue(appended)) {
+          emit({ ...appended, state: 'paused' })
+          return current
+        }
+        emit(appended)
         break
       } catch (error) {
         attempts += 1
@@ -341,17 +440,36 @@ export async function driveUpload(
           emit(markFailed(current, error))
           return current
         }
+        if (!shouldContinue(current)) {
+          emit({ ...current, state: 'paused', lastError: null })
+          return current
+        }
         emit({ ...current, lastError: (error as Error)?.message ?? String(error) })
       }
     }
   }
 
+  if (!shouldContinue(current)) {
+    emit({ ...current, state: 'paused' })
+    return current
+  }
   try {
     emit(markFinalizing(current))
-    await transport.finalize({ project_id: projectId, upload_id: uploadId, intake_id: intakeId })
+    await transport.finalize({ project_id: projectId, upload_id: uploadId, intake_id: intakeId, signal: options.signal })
+    // A close can race a finalize that the server already accepted. Reconcile
+    // it with an idempotent abort before returning; the Kernel removes only a
+    // still-staged artifact owned by this upload.
+    if (!shouldContinue(current)) {
+      await abortRejectedSession(current)
+      return current
+    }
     emit(markStaged(current))
     return current
   } catch (error) {
+    if (options.signal?.aborted === true) {
+      await abortRejectedSession(current)
+      return current
+    }
     emit(markFailed(current, error))
     return current
   }
@@ -363,27 +481,6 @@ export async function driveUpload(
  */
 export interface FileByteProvider {
   read(fileId: string, start: number, end: number): Promise<Uint8Array | null>
-}
-
-export function fileByteProvider(files: ReadonlyMap<string, File>): FileByteProvider {
-  return {
-    async read(fileId, start, end) {
-      const file = files.get(fileId)
-      if (file === undefined) return null
-      return new Uint8Array(await file.slice(start, end + 1).arrayBuffer())
-    },
-  }
-}
-
-/** 全局字节提供者注册表（browser 接线注册 File-backed provider）。 */
-const uploadByteProviders = new Map<string, FileByteProvider>()
-
-export function registerByteProvider(fileId: string, provider: FileByteProvider): void {
-  uploadByteProviders.set(fileId, provider)
-}
-
-export function unregisterByteProvider(fileId: string): void {
-  uploadByteProviders.delete(fileId)
 }
 
 /**
@@ -417,13 +514,15 @@ export function browserTransport(input: {
           expected_size: body.expected_size,
           expected_sha256: body.expected_sha256,
           chunk_size: body.chunk_size,
+          owner_scope_id: body.owner_scope_id,
         }),
+        signal: body.signal,
       })
       if (!response.ok) throw new Error(`begin upload session failed (${response.status})`)
       const session = (await response.json()) as { upload_id: string; chunk_size: number; committed_offset: number }
       return session
     },
-    async appendChunk({ project_id, upload_id, intake_id, start, end, total, bytes, sha256 }) {
+    async appendChunk({ project_id, upload_id, intake_id, start, end, total, bytes, sha256, signal }) {
       const response = await fetchImpl(
         `${baseUrl()}/v1/projects/${encodeURIComponent(project_id)}/intake/${encodeURIComponent(intake_id)}/upload-sessions/${encodeURIComponent(upload_id)}/chunks`,
         {
@@ -435,27 +534,64 @@ export function browserTransport(input: {
             ...(await headers()),
           },
           body: bytes as unknown as BodyInit,
+          signal,
         },
       )
       if (!response.ok) throw new Error(`chunk append failed (${response.status})`)
       const result = (await response.json()) as { committed_offset: number; replayed: boolean }
       return result
     },
-    async finalize({ project_id, upload_id, intake_id }) {
+    async finalize({ project_id, upload_id, intake_id, signal }) {
       const response = await fetchImpl(
         `${baseUrl()}/v1/projects/${encodeURIComponent(project_id)}/intake/${encodeURIComponent(intake_id)}/upload-sessions/${encodeURIComponent(upload_id)}/finalize`,
-        { method: 'POST', headers: { 'content-type': 'application/json', ...(await headers()) }, body: '{}' },
+        { method: 'POST', headers: { 'content-type': 'application/json', ...(await headers()) }, body: '{}', signal },
       )
       if (!response.ok) throw new Error(`finalize failed (${response.status})`)
       return (await response.json()) as unknown
     },
-    async abort({ project_id, upload_id, intake_id }) {
+    async abort({ project_id, upload_id, intake_id, signal }) {
       const response = await fetchImpl(
         `${baseUrl()}/v1/projects/${encodeURIComponent(project_id)}/intake/${encodeURIComponent(intake_id)}/upload-sessions/${encodeURIComponent(upload_id)}/abort`,
-        { method: 'POST', headers: { 'content-type': 'application/json', ...(await headers()) }, body: '{}' },
+        { method: 'POST', headers: { 'content-type': 'application/json', ...(await headers()) }, body: '{}', signal },
       )
       if (!response.ok) throw new Error(`abort failed (${response.status})`)
       return (await response.json()) as unknown
+    },
+    async listSessions({ project_id, intake_id, signal }) {
+      const response = await fetchImpl(
+        `${baseUrl()}/v1/projects/${encodeURIComponent(project_id)}/intake/${encodeURIComponent(intake_id)}/upload-sessions`,
+        { headers: { accept: 'application/json', ...(await auth()) }, signal },
+      )
+      if (!response.ok) throw new Error(`list upload sessions failed (${response.status})`)
+      const body = await response.json() as unknown
+      if (!Array.isArray(body)) throw new Error('invalid upload session list')
+      return body.flatMap((candidate): UploadSessionProjection[] => {
+        if (candidate === null || typeof candidate !== 'object') return []
+        const value = candidate as Record<string, unknown>
+        if (
+          typeof value.upload_id !== 'string' || typeof value.intake_id !== 'string'
+          || typeof value.file_name !== 'string' || typeof value.media_type !== 'string'
+          || !Number.isSafeInteger(value.expected_size) || (value.expected_size as number) < 0
+          || !Number.isSafeInteger(value.chunk_size) || (value.chunk_size as number) <= 0
+          || (value.chunk_size as number) > 32 * 1024 * 1024
+          || !Number.isSafeInteger(value.committed_offset) || (value.committed_offset as number) < 0
+          || (value.committed_offset as number) > (value.expected_size as number)
+          || (value.expected_sha256 !== null && typeof value.expected_sha256 !== 'string')
+          || (typeof value.expected_sha256 === 'string' && !/^[a-f0-9]{64}$/i.test(value.expected_sha256))
+          || !['open', 'finalized', 'aborted', 'expired'].includes(String(value.status))
+        ) return []
+        return [{
+          upload_id: value.upload_id,
+          intake_id: value.intake_id,
+          file_name: value.file_name,
+          media_type: value.media_type,
+          expected_size: value.expected_size as number,
+          expected_sha256: value.expected_sha256 as string | null,
+          chunk_size: value.chunk_size as number,
+          committed_offset: value.committed_offset as number,
+          status: value.status as UploadSessionProjection['status'],
+        }]
+      })
     },
   }
 }

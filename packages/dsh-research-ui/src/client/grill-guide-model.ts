@@ -7,7 +7,7 @@
  *
  * The card is driven by two server reads (both v2 — the kernel serves the
  * Grill routes only under /v2, see server.ts handleV2; chat.ts's
- * executeChatInput already uses /v2/projects/{id}/grill):
+ * The Chat conversation pipeline already uses /v2/projects/{id}/grill):
  *   GET /v2/projects/{id}         → project row with brief_status
  *   GET /v2/projects/{id}/grill   → projectGrillProjection
  *

@@ -27,7 +27,7 @@ import { startKernelServer } from '../../packages/research-kernel/lib/server.js'
 import type { UploadQueueItem, UploadTransport } from '../../packages/dsh-research-ui/src/client/chunked-upload'
 import {
   applyAppendResult, chatAttachmentRef, driveUpload, enqueueFiles, markHashed, markUploading,
-  nextChunkRange, pauseItem, queueSummary, resumeItem, retryItem,
+  browserTransport, nextChunkRange, pauseItem, queueSummary, resumeItem, retryItem,
 } from '../../packages/dsh-research-ui/src/client/chunked-upload'
 
 function freshKernel(): ResearchKernel {
@@ -305,6 +305,109 @@ describe('CHUNK-01 finalize: streaming size/sha256 recompute → IntakeArtifact'
     expect(list.finalized_sha256).toBe(sha256(content))
   })
 
+  it('a close-time abort compensates a completed finalize only while its owned artifact is still staged', () => {
+    const kernel = freshKernel()
+    const { intakeId } = projectAndIntake(kernel)
+    const content = Buffer.from('late-finalize')
+    const { artifact, session } = chunkedUpload(kernel, intakeId, content, 'late.bin')
+    const artifactPath = join(kernel.intakeStagedRoot, intakeId, `${artifact.sha256}.part`)
+
+    expect(kernel.db.prepare('SELECT owns_artifact FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ owns_artifact: 1 })
+    expect(existsSync(artifactPath)).toBe(true)
+
+    kernel.abortUploadSession(intakeId, session.upload_id)
+
+    expect(kernel.listUploadSessions(intakeId)).toEqual([])
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM intake_artifacts WHERE intake_id = ?').get(intakeId))
+      .toEqual({ n: 0 })
+    expect(existsSync(artifactPath)).toBe(false)
+  })
+
+  it('transfers staged-artifact ownership across deduplicated uploads and never retracts a scanned artifact', () => {
+    const kernel = freshKernel()
+    const { intakeId } = projectAndIntake(kernel)
+    const content = Buffer.from('shared-content')
+    const first = chunkedUpload(kernel, intakeId, content, 'first.txt')
+    const second = chunkedUpload(kernel, intakeId, content, 'second.txt')
+
+    kernel.abortUploadSession(intakeId, first.session.upload_id)
+    expect(kernel.db.prepare('SELECT owns_artifact FROM upload_sessions WHERE upload_id = ?').get(second.session.upload_id))
+      .toEqual({ owns_artifact: 1 })
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM intake_artifacts WHERE intake_id = ?').get(intakeId))
+      .toEqual({ n: 1 })
+
+    kernel.scanIntake(intakeId)
+    kernel.abortUploadSession(intakeId, second.session.upload_id)
+    expect(kernel.db.prepare('SELECT quarantine FROM intake_artifacts WHERE intake_id = ?').get(intakeId))
+      .toEqual({ quarantine: 'clean' })
+    expect(existsSync(join(kernel.intakeStagedRoot, intakeId, `${first.artifact.sha256}.part`))).toBe(true)
+  })
+
+  it('preserves a failed artifact cleanup ledger across repeated abort and restart sweep', () => {
+    const kernel = freshKernel()
+    const { intakeId } = projectAndIntake(kernel)
+    const content = Buffer.from('retry-cleanup')
+    const { artifact, session } = chunkedUpload(kernel, intakeId, content, 'retry.bin')
+    const internals = kernel as unknown as {
+      removeIntakeStageFile: (targetIntakeId: string, sha: string) => boolean
+    }
+    const remove = internals.removeIntakeStageFile.bind(kernel)
+    internals.removeIntakeStageFile = () => false
+
+    kernel.abortUploadSession(intakeId, session.upload_id)
+    expect(kernel.db.prepare('SELECT status, owns_artifact FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ status: 'aborted', owns_artifact: 1 })
+    kernel.abortUploadSession(intakeId, session.upload_id)
+    expect(kernel.db.prepare('SELECT status, owns_artifact FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ status: 'aborted', owns_artifact: 1 })
+
+    internals.removeIntakeStageFile = remove
+    expect(kernel.cleanupUploadSessions()).toBe(1)
+    expect(existsSync(join(kernel.intakeStagedRoot, intakeId, `${artifact.sha256}.part`))).toBe(false)
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ n: 0 })
+  })
+
+  it('never lets an old aborted ledger unlink a newly restaged same-SHA artifact', () => {
+    const kernel = freshKernel()
+    const { intakeId } = projectAndIntake(kernel)
+    const content = Buffer.from('new-generation')
+    const { artifact, session } = chunkedUpload(kernel, intakeId, content, 'old.bin')
+    const internals = kernel as unknown as {
+      removeIntakeStageFile: (targetIntakeId: string, sha: string) => boolean
+    }
+    const remove = internals.removeIntakeStageFile.bind(kernel)
+    internals.removeIntakeStageFile = () => false
+    kernel.abortUploadSession(intakeId, session.upload_id)
+    internals.removeIntakeStageFile = remove
+
+    const restaged = kernel.stageIntakeArtifact(intakeId, { file_name: 'new.bin', content })
+    expect(restaged.sha256).toBe(artifact.sha256)
+    expect(kernel.db.prepare('SELECT owns_artifact FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ owns_artifact: 0 })
+    expect(kernel.cleanupUploadSessions()).toBe(1)
+    const path = join(kernel.intakeStagedRoot, intakeId, `${artifact.sha256}.part`)
+    expect(readFileSync(path)).toEqual(content)
+    expect(kernel.db.prepare('SELECT quarantine FROM intake_artifacts WHERE intake_id = ? AND sha256 = ?').get(intakeId, artifact.sha256))
+      .toEqual({ quarantine: 'staged' })
+  })
+
+  it('treats direct same-SHA staging as an independent reference before upload abort', () => {
+    const kernel = freshKernel()
+    const { intakeId } = projectAndIntake(kernel)
+    const content = Buffer.from('independent-reference')
+    const { artifact, session } = chunkedUpload(kernel, intakeId, content, 'upload.bin')
+    kernel.stageIntakeArtifact(intakeId, { file_name: 'direct.bin', content })
+    expect(kernel.db.prepare('SELECT owns_artifact FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ owns_artifact: 0 })
+
+    kernel.abortUploadSession(intakeId, session.upload_id)
+    expect(kernel.db.prepare('SELECT quarantine FROM intake_artifacts WHERE intake_id = ? AND sha256 = ?').get(intakeId, artifact.sha256))
+      .toEqual({ quarantine: 'staged' })
+    expect(existsSync(join(kernel.intakeStagedRoot, intakeId, `${artifact.sha256}.part`))).toBe(true)
+  })
+
   it('finalized session feeds scanIntake → clean verdict, then the full intake pipeline works', () => {
     const kernel = freshKernel()
     const { intakeId } = projectAndIntake(kernel)
@@ -361,6 +464,140 @@ describe('CHUNK-01 abort + GC', () => {
     // A fresh session survives GC.
     kernel.beginUploadSession(intakeId, { file_name: 'fresh.bin', expected_size: 10 })
     expect(kernel.cleanupUploadSessions()).toBe(0)
+  })
+
+  it('recovers an aborted cleanup ledger left by a crash before filesystem unlink', () => {
+    const kernel = freshKernel()
+    const { intakeId } = projectAndIntake(kernel)
+    const session = kernel.beginUploadSession(intakeId, { file_name: 'pending-cleanup.bin', expected_size: 10 })
+    kernel.appendUploadChunk(intakeId, session.upload_id, {
+      bytes: Buffer.from('0123'), contentRange: 'bytes 0-3/10', chunkSha256: sha256('0123'),
+    })
+    const partPath = join(kernel.intakeStagedRoot, intakeId, `${session.upload_id}.part`)
+    kernel.db.prepare("UPDATE upload_sessions SET status = 'aborted' WHERE upload_id = ?").run(session.upload_id)
+
+    expect(existsSync(partPath)).toBe(true)
+    expect(kernel.cleanupUploadSessions()).toBe(1)
+    expect(existsSync(partPath)).toBe(false)
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ n: 0 })
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ n: 0 })
+  })
+
+  it('durably tombstones a Chat scope, aborts its stages, and rejects every late Intake/begin', () => {
+    const kernel = freshKernel()
+    const { projectId, intakeId } = projectAndIntake(kernel)
+    const session = kernel.beginUploadSession(intakeId, {
+      file_name: 'late.bin', expected_size: 4, owner_scope_id: 's-exact-chat',
+    })
+    kernel.appendUploadChunk(intakeId, session.upload_id, {
+      bytes: Buffer.from('0123'), contentRange: 'bytes 0-3/4', chunkSha256: sha256('0123'),
+    })
+
+    expect(kernel.tombstoneChatScope(projectId, 's-exact-chat')).toEqual({ ok: true, aborted_uploads: 1 })
+    expect(kernel.listUploadSessions(intakeId)).toEqual([])
+    expect(kernel.tombstoneChatScope(projectId, 's-exact-chat')).toEqual({ ok: true, aborted_uploads: 0 })
+    expectKernelError(() => kernel.beginUploadSession(intakeId, {
+      file_name: 'later.bin', expected_size: 1, owner_scope_id: 's-exact-chat',
+    }), 409, 'chat_scope_closed')
+    expectKernelError(() => kernel.beginIntake({
+      project_id: projectId, source_label: 'late attachment intake', owner_scope_id: 's-exact-chat',
+    }), 409, 'chat_scope_closed')
+    expectKernelError(() => kernel.finalizeUploadSession(intakeId, session.upload_id), 404, 'upload_session_not_found')
+  })
+
+  it('atomically persists aborted ledgers before tombstone filesystem cleanup', () => {
+    const kernel = freshKernel()
+    const { projectId, intakeId } = projectAndIntake(kernel)
+    const content = Buffer.from('crash-after-tombstone')
+    const { artifact, session } = chunkedUpload(kernel, intakeId, content, 'crash.bin')
+    kernel.db.prepare('UPDATE upload_sessions SET owner_scope_id = ? WHERE upload_id = ?')
+      .run('s-crash-window', session.upload_id)
+    const internals = kernel as unknown as {
+      cleanupAbortedUpload: (targetIntakeId: string, uploadId: string) => boolean
+    }
+    const cleanup = internals.cleanupAbortedUpload.bind(kernel)
+    internals.cleanupAbortedUpload = () => false
+
+    expect(kernel.tombstoneChatScope(projectId, 's-crash-window')).toEqual({ ok: true, aborted_uploads: 1 })
+    expect(kernel.db.prepare('SELECT status, owns_artifact FROM upload_sessions WHERE upload_id = ?').get(session.upload_id))
+      .toEqual({ status: 'aborted', owns_artifact: 1 })
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM intake_artifacts WHERE intake_id = ?').get(intakeId))
+      .toEqual({ n: 0 })
+    expect(existsSync(join(kernel.intakeStagedRoot, intakeId, `${artifact.sha256}.part`))).toBe(true)
+
+    internals.cleanupAbortedUpload = cleanup
+    expect(kernel.cleanupUploadSessions()).toBe(1)
+    expect(existsSync(join(kernel.intakeStagedRoot, intakeId, `${artifact.sha256}.part`))).toBe(false)
+  })
+
+  it('persists the owner scope on Chat-created Intake and rejects its idempotent replay after close', () => {
+    const kernel = freshKernel()
+    const { projectId, intakeId } = projectAndIntake(kernel)
+    kernel.db.prepare("UPDATE intake_sessions SET status = 'accepted' WHERE intake_id = ?").run(intakeId)
+    const owned = kernel.beginIntake({
+      project_id: projectId,
+      source_label: 'Chat attachment intake',
+      owner_scope_id: 's-owned-intake',
+      idempotency_key: 'owned-intake-key',
+      request_hash: 'owned-intake-hash',
+    })
+    expect(kernel.db.prepare('SELECT owner_scope_id FROM intake_sessions WHERE intake_id = ?').get(owned.intake_id))
+      .toEqual({ owner_scope_id: 's-owned-intake' })
+    expectKernelError(() => kernel.beginUploadSession(owned.intake_id, {
+      file_name: 'wrong-scope.bin', expected_size: 1, owner_scope_id: 's-other-chat',
+    }), 409, 'chat_scope_mismatch')
+    const unscopedUpload = kernel.beginUploadSession(owned.intake_id, {
+      file_name: 'human-takeover.bin', expected_size: 1,
+    })
+    expect(kernel.tombstoneChatScope(projectId, 's-owned-intake')).toEqual({ ok: true, aborted_uploads: 1 })
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM upload_sessions WHERE upload_id = ?').get(unscopedUpload.upload_id))
+      .toEqual({ n: 0 })
+    expectKernelError(() => kernel.stageIntakeArtifact(owned.intake_id, {
+      file_name: 'late-direct.txt', content: 'must not stage',
+    }), 409, 'chat_scope_closed')
+    expectKernelError(() => kernel.beginUploadSession(owned.intake_id, {
+      file_name: 'late-unscoped.bin', expected_size: 1,
+    }), 409, 'chat_scope_closed')
+    expectKernelError(() => kernel.beginIntake({
+      project_id: projectId,
+      source_label: 'Chat attachment intake',
+      owner_scope_id: 's-owned-intake',
+      idempotency_key: 'owned-intake-key',
+      request_hash: 'owned-intake-hash',
+    }), 409, 'chat_scope_closed')
+    const replacement = kernel.beginIntake({
+      project_id: projectId,
+      source_label: 'Different Chat attachment intake',
+      owner_scope_id: 's-other-chat',
+    })
+    expect(replacement.intake_id).not.toBe(owned.intake_id)
+    expect(kernel.db.prepare('SELECT owner_scope_id FROM intake_sessions WHERE intake_id = ?').get(replacement.intake_id))
+      .toEqual({ owner_scope_id: 's-other-chat' })
+  })
+})
+
+describe('CHUNK-01 browser recovery projection', () => {
+  it('keeps only bounded, internally consistent server sessions', async () => {
+    const valid = {
+      upload_id: 'upl-ok', intake_id: 'intake-1', file_name: 'paper.pdf', media_type: 'application/pdf',
+      expected_size: 4, expected_sha256: 'a'.repeat(64), chunk_size: 2, committed_offset: 2, status: 'open',
+    }
+    const transport = browserTransport({
+      baseImpl: () => 'https://scholar.invalid',
+      authHeadersImpl: async () => ({}),
+      csrfImpl: async () => undefined,
+      fetchImpl: async () => new Response(JSON.stringify([
+        valid,
+        { ...valid, upload_id: 'upl-overflow', committed_offset: 5 },
+        { ...valid, upload_id: 'upl-negative', committed_offset: -1 },
+        { ...valid, upload_id: 'upl-bad-hash', expected_sha256: 'not-sha256' },
+      ]), { status: 200, headers: { 'content-type': 'application/json' } }),
+    })
+
+    await expect(transport.listSessions?.({ project_id: 'project-a', intake_id: 'intake-1' }))
+      .resolves.toEqual([valid])
   })
 })
 
@@ -445,6 +682,33 @@ describe('CHUNK-01 HTTP surface (/v1/projects/{id}/intake/{iid}/upload-sessions*
       await new Promise<void>(resolve => server.close(() => resolve()))
     }
   })
+
+  it('persists an exact Chat scope tombstone and rejects late HTTP upload work', async () => {
+    const kernel = freshKernel()
+    const { projectId, intakeId } = projectAndIntake(kernel)
+    const { server, port } = await startKernelServer({ kernel, host: '127.0.0.1', port: 0 })
+    try {
+      const baseUrl = `http://127.0.0.1:${port}`
+      const scopeId = 's-http-close'
+      const close = await fetch(`${baseUrl}/v1/projects/${projectId}/chat-scopes/${scopeId}/tombstone`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      })
+      expect(close.status).toBe(200)
+      expect(await close.json()).toEqual({ ok: true, aborted_uploads: 0 })
+
+      const begin = await fetch(`${baseUrl}/v1/projects/${projectId}/intake/${intakeId}/upload-sessions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ file_name: 'late.txt', expected_size: 4, owner_scope_id: scopeId }),
+      })
+      expect(begin.status).toBe(409)
+      expect(((await begin.json()) as { error: { code: string } }).error.code).toBe('chat_scope_closed')
+      expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM upload_sessions WHERE owner_scope_id = ?').get(scopeId))
+        .toEqual({ n: 0 })
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
 })
 
 // ── 客户端队列状态机（PURE，无 DOM）──────────────────────────────────────
@@ -453,7 +717,7 @@ function baseItem(overrides: Partial<UploadQueueItem> = {}): UploadQueueItem {
   return {
     fileId: 'f1', fileName: 'paper.pdf', fileSize: 100, mediaType: 'application/pdf',
     state: 'queued', uploadId: null, intakeId: 'intk_1', projectId: 'rsp_1',
-    expectedSha256: null, committedOffset: 0, retryCount: 0, lastError: null, ...overrides,
+    expectedSha256: null, chunkSize: null, committedOffset: 0, retryCount: 0, lastError: null, ...overrides,
   }
 }
 
@@ -613,5 +877,131 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
     })
     expect(resumed.state).toBe('scanning')
     expect(resumed.committedOffset).toBe(16)
+  })
+
+  it('preserves a pause requested while appendChunk is in flight', async () => {
+    const file = Buffer.from('01234567')
+    const item = markHashed(baseItem({ fileSize: 8 }), sha256(file))
+    let paused = false
+    let releaseAppend: ((result: { committed_offset: number; replayed: boolean }) => void) | undefined
+    let signalAppendStarted: (() => void) | undefined
+    const appendStarted = new Promise<void>(resolve => { signalAppendStarted = resolve })
+    let appends = 0
+    const transport: UploadTransport = {
+      async beginSession() { return { upload_id: 'upl_1', chunk_size: 4, committed_offset: 0 } },
+      appendChunk() {
+        appends += 1
+        signalAppendStarted?.()
+        return new Promise(resolve => { releaseAppend = resolve })
+      },
+      async finalize() { throw new Error('must not finalize while paused') },
+      async abort() {},
+    }
+    const pending = driveUpload(item, transport, {
+      chunkSize: 4,
+      readBytes: async (_f, start, end) => file.subarray(start, end + 1),
+      shouldContinue: () => !paused,
+    })
+    await appendStarted
+    paused = true
+    releaseAppend!({ committed_offset: 4, replayed: false })
+    const result = await pending
+
+    expect(result).toMatchObject({ state: 'paused', committedOffset: 4 })
+    expect(appends).toBe(1)
+  })
+
+  it('honours the server-negotiated chunk cap and persists it in the queue item', async () => {
+    const file = Buffer.from('0123456789')
+    const item = markHashed(baseItem({ fileSize: file.byteLength }), sha256(file))
+    const ranges: Array<[number, number]> = []
+    const transport: UploadTransport = {
+      async beginSession() { return { upload_id: 'upl_1', chunk_size: 3, committed_offset: 0 } },
+      async appendChunk(input) {
+        ranges.push([input.start, input.end])
+        expect(input.bytes.byteLength).toBeLessThanOrEqual(3)
+        return { committed_offset: input.end + 1, replayed: false }
+      },
+      async finalize() {},
+      async abort() {},
+    }
+
+    const result = await driveUpload(item, transport, {
+      chunkSize: 8,
+      readBytes: async (_fileId, start, end) => file.subarray(start, end + 1),
+    })
+
+    expect(result).toMatchObject({ state: 'scanning', chunkSize: 3 })
+    expect(ranges).toEqual([[0, 2], [3, 5], [6, 8], [9, 9]])
+  })
+
+  it('preserves begin-in-flight pause and aborts a server session rejected by its owner', async () => {
+    const file = Buffer.from('0123')
+    const item = markHashed(baseItem({ fileSize: file.byteLength }), sha256(file))
+    let paused = false
+    let acceptState = true
+    let releaseBegin: ((session: { upload_id: string; chunk_size: number; committed_offset: number }) => void) | undefined
+    const aborted: string[] = []
+    const transport: UploadTransport = {
+      beginSession: () => new Promise(resolve => { releaseBegin = resolve }),
+      async appendChunk() { throw new Error('must not append while paused') },
+      async finalize() { throw new Error('must not finalize while paused') },
+      async abort(input) { aborted.push(input.upload_id) },
+    }
+    const pending = driveUpload(item, transport, {
+      readBytes: async () => file,
+      shouldContinue: () => !paused,
+      onState: () => acceptState,
+    })
+    paused = true
+    releaseBegin!({ upload_id: 'upl-paused', chunk_size: 2, committed_offset: 0 })
+    await expect(pending).resolves.toMatchObject({ state: 'paused', uploadId: 'upl-paused', chunkSize: 2 })
+    expect(aborted).toEqual([])
+
+    paused = false
+    acceptState = false
+    const rejected = driveUpload(item, transport, {
+      readBytes: async () => file,
+      shouldContinue: () => true,
+      onState: () => acceptState,
+    })
+    releaseBegin!({ upload_id: 'upl-orphan', chunk_size: 2, committed_offset: 0 })
+    await rejected
+    expect(aborted).toEqual(['upl-orphan'])
+  })
+
+  it('compensates a finalize that completes after its exact Chat session is cancelled', async () => {
+    const controller = new AbortController()
+    let signalFinalizeStarted: (() => void) | undefined
+    let releaseFinalize: (() => void) | undefined
+    const finalizeStarted = new Promise<void>(resolve => { signalFinalizeStarted = resolve })
+    const aborted: string[] = []
+    const transport: UploadTransport = {
+      async beginSession() { throw new Error('existing upload must not begin again') },
+      async appendChunk() { throw new Error('fully uploaded item must not append') },
+      finalize: () => {
+        signalFinalizeStarted?.()
+        return new Promise<void>(resolve => { releaseFinalize = resolve })
+      },
+      async abort(input) { aborted.push(input.upload_id) },
+    }
+    const item = baseItem({
+      state: 'uploading', uploadId: 'upl-finalizing', fileSize: 4, committedOffset: 4,
+      expectedSha256: sha256('0123'),
+    })
+    const states: string[] = []
+    const pending = driveUpload(item, transport, {
+      signal: controller.signal,
+      onState: next => { states.push(next.state) },
+    })
+
+    await finalizeStarted
+    controller.abort()
+    releaseFinalize?.()
+    const result = await pending
+
+    expect(result.state).toBe('finalizing')
+    expect(states).not.toContain('scanning')
+    expect(aborted).toEqual(['upl-finalizing'])
   })
 })

@@ -8,7 +8,7 @@ DSH Scholar is an AI research workspace for computational research. It keeps pro
 
 ## What it provides
 
-- **Stage-aware research guidance**: Chat supports natural conversation, Grill Me intake, file upload, explicit slash commands, and an authoritative next-step prompt for the current research stage.
+- **Stage-aware research guidance**: Chat supports natural conversation, Grill Me intake, file upload, visual-model input, explicit slash commands, and an authoritative next-step prompt for the current research stage.
 - **Governed research workflow**: Scope, Idea, Contract, Evidence, Direction, and Release decisions remain explicit, revision-bound, and auditable.
 - **Controlled execution**: Runner Profiles describe local, local-Docker, or remote-SSH environments, including pinned container images and declared NVIDIA GPU capability.
 - **Integrated workspace**: project-scoped Chat, editable files, session-bound Web terminals, run logs, artifacts, TeX source, compilation diagnostics, and PDF preview share the same context.
@@ -22,6 +22,7 @@ DSH Scholar is an AI research workspace for computational research. It keeps pro
 - `full-auto` means automatic approval only for the allowlisted Scope, Idea, Contract, and Budget Gates of an exact registered FixtureProfile. Its only canonical action executor is currently `survey_run`. Release, Direction, Intake, Evidence, and unsupported actions remain Human-controlled or are parked with a typed reason.
 - A name-only `/new <name>` project always starts as `gate-only` and collects its Brief through Grill Me; it does not silently inherit `full-auto`.
 - Formal experiments must bind immutable code and data snapshots, a frozen Protocol where required, and an explicit Runner Profile. Chat text, ordinary stdout, and Interactive Terminal output do not automatically become formal Evidence.
+- Images sent to a visual model are untrusted, current-turn Chat context. They do not automatically become OCR output, Brief answers, Evidence, Claims, Gate decisions, or proof that a command ran.
 - The product focuses on computational research such as machine learning, data science, and bioinformatics. It is not intended for clinical decisions, human studies, wet-lab work, or other high-risk research.
 
 ## Quick start
@@ -100,6 +101,22 @@ Open **Settings → Plugin config → dsh Scholar** in DSH. Saved plugin changes
 
 When `full-auto` is enabled for a valid fixture, Settings also reports worker state, restart-required state, the fixture-only boundary, and the latest park reason. Release remains Human-controlled. The Standalone URL cannot contain credentials, query parameters, or fragments. **Copy standalone access token** is available only from a loopback DSH instance after an explicit click; the page never displays the token and does not expose Kernel, Runner, Provider, or SSH secrets.
 
+### Visual models in Chat
+
+Scholar reads the live model catalog from DSH instead of guessing capability from a model name. Configure the actual DeepSeek-compatible image endpoint as an image-capable catalog entry in the DSH profile:
+
+```yaml
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    models:
+      - id: your-vision-model
+        name: Your Vision Model
+        inputModalities: [text, image]
+```
+
+Restart DSH, choose the model marked with `👁` in Scholar, attach or paste PNG, JPEG, WebP, or GIF images, then send a normal-language Chat message. The same upload may enter project Intake, but its visual bytes are consumed only by that successful free-conversation turn. A text-only or undeclared model is rejected before provider network I/O; Scholar never silently falls back to a text answer.
+
 ## Start or continue research
 
 Choose one of three entry points:
@@ -149,7 +166,7 @@ The screenshots show the same project and revision. See the [reproduction receip
 
 | Area | Purpose |
 |---|---|
-| Chat | Natural conversation, Grill questions, uploads, command completion, and stage-aware guidance. |
+| Chat | Natural conversation, Grill questions, uploads, visual-model input, command completion, and stage-aware guidance. |
 | Workspace | Browse, search, edit, upload, and manage project files with version/etag conflict protection. |
 | Run / Terminal | Inspect formal Job state and read-only logs, or operate a project/session-bound Web PTY. |
 | Evidence / Artifacts | Preview and download outputs, and review metrics, provenance, confidence, and claim links. |
@@ -159,7 +176,7 @@ The screenshots show the same project and revision. See the [reproduction receip
 
 ## Validation boundary
 
-The repository's automated acceptance covers builds, schemas, Kernel and Client behavior, governance and security regressions, persistence/restart behavior, DSH plugin contracts, and controlled local-Docker fixtures. Real browser/ARIA observation, a clean DSH Host cold start, production model/reviewer providers, remote SSH/GPU execution, production mTLS termination, and environment-specific TeX rendering remain deployment-specific manual acceptance items. Check the [current implementation status](docs/hardening-v0.2-status.md) and [manual acceptance checklist](docs/manual-acceptance.md) before relying on those paths.
+The repository's automated acceptance covers builds, schemas, Kernel and Client behavior, governance and security regressions, persistence/restart behavior, DSH plugin contracts, visual-request admission with a controlled adapter, and controlled local-Docker fixtures. Real browser/ARIA observation, a clean DSH Host cold start, a production visual/reviewer provider, remote SSH/GPU execution, production mTLS termination, and environment-specific TeX rendering remain deployment-specific manual acceptance items. Check the [current implementation status](docs/hardening-v0.2-status.md) and [manual acceptance checklist](docs/manual-acceptance.md) before relying on those paths.
 
 ## Documentation
 

@@ -8,7 +8,7 @@ DSH Scholar 是面向纯计算研究的 AI 科研工作台。它把项目对话�
 
 ## 产品能力
 
-- **按阶段引导研究**：Chat 支持自由对话、Grill Me 信息收集、文件上传、显式 slash command，并依据当前研究阶段展示权威下一步。
+- **按阶段引导研究**：Chat 支持自由对话、Grill Me 信息收集、文件上传、视觉模型输入、显式 slash command，并依据当前研究阶段展示权威下一步。
 - **可治理的研究流程**：Scope、Idea、Contract、Evidence、Direction 和 Release 决策都有明确权限、revision 绑定和审计记录。
 - **受控执行**：Runner Profile 描述本机、本机 Docker 或远程 SSH 环境，包括固定容器镜像和声明式 NVIDIA GPU 能力。
 - **一体化工作台**：项目级 Chat、可编辑文件、session 绑定 Web 终端、运行日志、产物、TeX 源码、编译诊断和 PDF 预览共用同一上下文。
@@ -22,6 +22,7 @@ DSH Scholar 是面向纯计算研究的 AI 科研工作台。它把项目对话�
 - `full-auto` 只会为精确登记的 FixtureProfile 自动批准 allowlist 内的 Scope、Idea、Contract 和 Budget Gate；目前唯一的 canonical action executor 是 `survey_run`。Release、Direction、Intake、Evidence 和未登记动作仍由人处理，或以明确原因 park。
 - 只有名称的 `/new <name>` 始终以 `gate-only` 创建，并通过 Grill Me 收集 Brief，不会静默继承 `full-auto`。
 - 正式实验必须绑定不可变代码/数据快照、必要时的 frozen Protocol，以及显式 Runner Profile。Chat 文本、普通 stdout 和 Interactive Terminal 输出不会自动成为正式 Evidence。
+- 发送给视觉模型的图片只是当前轮次中不可信的 Chat 上下文，不会自动成为 OCR 结果、Brief 答案、Evidence、Claim、Gate 决策，也不能证明命令已经运行。
 - 产品聚焦机器学习、数据科学、生物信息学等纯计算研究，不适用于临床决策、人体试验、湿实验或其他高风险研究。
 
 ## 快速开始
@@ -100,6 +101,22 @@ dsh plugin --profile web remove @dsh-scholar/research-plugin
 
 有效 fixture 启用 `full-auto` 后，Settings 还会显示 worker 状态、是否需要重启、fixture-only 边界和最近一次 park 原因；Release 始终由人决定。Standalone 地址不能包含凭据、query 或 fragment。“复制 standalone 访问令牌”只在 loopback DSH 中、经用户显式点击后可用；页面不会显示令牌，也不会暴露 Kernel、Runner、Provider 或 SSH secret。
 
+### 在 Chat 中使用视觉模型
+
+Scholar 从 DSH 读取实时模型目录，不会根据模型名称猜测视觉能力。请在 DSH profile 中把实际可接收图片的 DeepSeek 兼容端点显式登记为视觉模型：
+
+```yaml
+- id: llm-deepseek
+  name: '@deepseek-ai/dsh-llm-deepseek'
+  config:
+    models:
+      - id: your-vision-model
+        name: Your Vision Model
+        inputModalities: [text, image]
+```
+
+重启 DSH 后，在 Scholar 中选择带 `👁` 标记的模型，上传、拖放或粘贴 PNG、JPEG、WebP 或 GIF，再发送普通自然语言消息。同一文件可以进入项目 Intake，但视觉字节只由这次成功的自由对话消费。文本模型或未声明视觉能力的模型会在请求 Provider 之前被拒绝，Scholar 不会静默降级成纯文本回答。
+
 ## 开始或继续研究
 
 有三种入口：
@@ -149,7 +166,7 @@ Chat 同时接受普通自然语言和一级 slash command。显式命令是确�
 
 | 区域 | 用途 |
 |---|---|
-| Chat | 自由对话、Grill 问题、上传、命令补全和按阶段引导。 |
+| Chat | 自由对话、Grill 问题、上传、视觉模型输入、命令补全和按阶段引导。 |
 | Workspace | 浏览、搜索、编辑、上传和管理项目文件，通过 version/etag 防止冲突覆盖。 |
 | Run / Terminal | 查看正式 Job 状态和只读日志，或操作项目/session 绑定的 Web PTY。 |
 | Evidence / Artifacts | 预览和下载产物，评审指标、来源、置信度和 Claim 关系。 |
@@ -159,7 +176,7 @@ Chat 同时接受普通自然语言和一级 slash command。显式命令是确�
 
 ## 验收边界
 
-仓库自动验收覆盖构建、Schema、Kernel/Client 行为、治理和安全回归、持久化与重启、DSH 插件契约，以及受控的本机 Docker fixture。真实浏览器/ARIA 观感、干净 DSH Host 冷启动、生产模型与 reviewer provider、远程 SSH/GPU、生产 mTLS 终止和具体环境的 TeX 渲染仍需部署方人工验收。使用这些路径前，请查看[当前实现状态](docs/hardening-v0.2-status.md)和[人工验收清单](docs/manual-acceptance.md)。
+仓库自动验收覆盖构建、Schema、Kernel/Client 行为、治理和安全回归、持久化与重启、DSH 插件契约、受控适配器下的视觉请求准入，以及本机 Docker fixture。真实浏览器/ARIA 观感、干净 DSH Host 冷启动、生产视觉模型与 reviewer provider、远程 SSH/GPU、生产 mTLS 终止和具体环境的 TeX 渲染仍需部署方人工验收。使用这些路径前，请查看[当前实现状态](docs/hardening-v0.2-status.md)和[人工验收清单](docs/manual-acceptance.md)。
 
 ## 文档
 

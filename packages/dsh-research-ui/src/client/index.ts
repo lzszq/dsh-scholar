@@ -8,8 +8,8 @@
  */
 
 import { t, getLocale, subscribeLocale, assertLocaleParity, registerOverlayRebuild } from './i18n/index'
-import { chromeTabGroups, chromeTabs, chromeModelChoices } from './i18n/chrome'
-import { api } from './api'
+import { chromeTabGroups, chromeTabs, chromeModelChoices, type ChromeModelCatalogEntry } from './i18n/chrome'
+import { api, apiResult } from './api'
 import { el, pill, copyText, ACCENTS, ACCENT_DARK, rootHost } from './ui'
 import type { ProjectRow, Projection } from './types'
 import { isTabKey, isTabVisible, navOrder, navShortcutIndex, parseDeepLink, reconcileVisibleNavigation, startActions, tabGroups, visibleTabKeys, type TabKey } from './nav'
@@ -28,10 +28,11 @@ import {
   state, readTheme, writeTheme, radiusValue, textureValue, accentColor,
   tabSave, tabLoad, autoRefreshEnabled,
   notifLoad, favProjectsLoad,
-  chatActivateProject, chatDeactivateProject, chatSyncActive,
+  chatActivateProject, chatDeactivateProject, chatDiscardProject, chatSyncActive, chatTrackedProjectIds,
+  flushChatScopeCloseOutbox,
 } from './state'
 import { renderSidebar, sidebarSortLoad } from './sidebar'
-import { renderChat } from './chat'
+import { disposeChatAttachments, renderChat } from './chat'
 import { terminalDisconnect, renderTerminal } from './terminal'
 import { renderPhase } from './panels/phase'
 import { renderGates } from './panels/gates'
@@ -61,6 +62,9 @@ import {
   restoreFocus,
   shouldDeferBackgroundRefresh,
 } from './focus-preservation'
+import { ModelPreferenceCommit } from './model-preference'
+import { chatTurnFlightStore } from './chat-turn-flight'
+import { backgroundProjectScopesToProbe, projectIsAuthoritativelyGone, projectRenderTargetIsCurrent } from './project-liveness'
 
 export { setStandaloneBridge } from './api'
 /** Kernel reachability (dsh-web offline indicator). */
@@ -709,13 +713,26 @@ export function apply(options: ApplyOptions = {}): void {
   // Research-agent model seat. It belongs to the chat composer rather than
   // global header chrome; the server still persists it through /api/model.
   const modelSelect = el('select', 'chat-model-select')
+  modelSelect.disabled = true
+  const modelPreference = new ModelPreferenceCommit()
+  let runtimeModels: ChromeModelCatalogEntry[] = []
+  const syncModelSelectDisabled = (): void => {
+    modelSelect.disabled = modelPreference.busy() || chatTurnFlightStore.anyActive()
+  }
   modelSelect.onchange = () => {
     const chosen = modelSelect.value
-    void api<{ ok?: boolean }>('/api/model', {
-      method: 'PUT',
-      body: JSON.stringify({ model: chosen }),
-    }).then(state => {
-      if (state?.ok !== true) {
+    const commit = modelPreference.select(chosen, async value => {
+      const saved = await api<{ ok?: boolean }>('/api/model', {
+        method: 'PUT',
+        body: JSON.stringify({ model: value }),
+      })
+      return saved?.ok === true
+    })
+    syncModelSelectDisabled()
+    void commit.then(saved => {
+      syncModelSelectDisabled()
+      if (!saved) {
+        modelSelect.value = modelPreference.acknowledged()
         modelSelect.title = t('shell', 'shell.model.error')
         setTimeout(() => { modelSelect.title = t('shell', 'shell.model.label') }, 3000)
       }
@@ -724,9 +741,10 @@ export function apply(options: ApplyOptions = {}): void {
   const paintModelSelect = (): void => {
     const modelValue = modelSelect.value
     modelSelect.replaceChildren()
-    for (const choice of chromeModelChoices()) {
+    for (const choice of chromeModelChoices(runtimeModels)) {
       const opt = el('option', '', choice.label)
       opt.value = choice.id
+      opt.disabled = choice.disabled === true
       modelSelect.append(opt)
     }
     modelSelect.value = modelValue
@@ -734,11 +752,15 @@ export function apply(options: ApplyOptions = {}): void {
     modelSelect.title = t('shell', 'shell.model.label')
   }
   paintModelSelect()
-  void api<{ ok?: boolean; model?: string }>('/api/model').then(state => {
+  void api<{ ok?: boolean; model?: string; models?: ChromeModelCatalogEntry[] }>('/api/model').then(state => {
     if (state?.ok === true && typeof state.model === 'string') {
-      modelSelect.value = state.model
+      runtimeModels = Array.isArray(state.models) ? state.models : []
+      paintModelSelect()
+      if (modelPreference.initialize(state.model)) modelSelect.value = state.model
     }
-  }).catch(() => { /* keep auto default */ })
+  }).catch(() => { /* keep auto default */ }).finally(() => {
+    syncModelSelectDisabled()
+  })
   const headerActions = el('div', 'header-actions')
   headerActions.append(modeBadge, commandsBtn, shortcutsBtn, bellBtn, themeBtn, refresh)
   header.appendChild(headerActions)
@@ -1107,6 +1129,7 @@ export function apply(options: ApplyOptions = {}): void {
     targetBody.dataset.panel = key
     targetBody.classList.toggle('chat-active', key === 'chat')
     if (key !== 'chat') {
+      disposeChatAttachments(targetChatDock)
       targetChatDock.hidden = true
       targetChatDock.replaceChildren()
     }
@@ -1146,7 +1169,15 @@ export function apply(options: ApplyOptions = {}): void {
     }
 
     switch (key) {
-      case 'chat': await renderChat(targetBody, targetChatDock, projectId, modelSelect, docked ? 'dock' : 'main'); break
+      case 'chat': await renderChat(
+        targetBody,
+        targetChatDock,
+        projectId,
+        modelSelect,
+        docked ? 'dock' : 'main',
+        () => modelPreference.barrier(),
+        syncModelSelectDisabled,
+      ); break
       case 'phase': await renderPhase(targetBody, projection, projectId, methodology); break
       case 'gates': await renderGates(targetBody, projectId); break
       case 'runs': renderRuns(targetBody, projection); break
@@ -1176,10 +1207,12 @@ export function apply(options: ApplyOptions = {}): void {
     // the async project requests complete makes the body gain its height for a
     // frame, which visibly shifts the whole conversation while typing.
     if (state.activeTab !== 'chat') {
+      disposeChatAttachments(chatDock)
       chatDock.hidden = true
       chatDock.replaceChildren()
     }
     if (dockLayout.openPanel !== 'chat') {
+      disposeChatAttachments(dockChatDock)
       dockChatDock.hidden = true
       dockChatDock.replaceChildren()
     }
@@ -1206,7 +1239,19 @@ export function apply(options: ApplyOptions = {}): void {
       paintKernelDot()
     }
     // Project list drives the standalone workspace sidebar.
-    const projects = (await api<ProjectRow[]>('/v1/projects')) ?? []
+    const projectsResult = await apiResult<ProjectRow[]>('/v1/projects')
+    const projects = projectsResult.ok ? projectsResult.data : []
+    if (projectsResult.ok) {
+      void flushChatScopeCloseOutbox()
+      const backgroundScopes = backgroundProjectScopesToProbe(chatTrackedProjectIds(), state.projectId, projects)
+      const probes = await Promise.all(backgroundScopes.map(async projectId => ({
+        projectId,
+        result: await apiResult<Projection>(`/v1/projects/${encodeURIComponent(projectId)}/projection`),
+      })))
+      for (const probe of probes) {
+        if (!probe.result.ok && probe.result.status === 404) chatDiscardProject(probe.projectId)
+      }
+    }
     // dsh-web session ordering: most recently active first (by updated_at).
     projects.sort((a, b) => String(b.updated_at ?? '').localeCompare(String(a.updated_at ?? '')))
     if (!kernelOnline) {
@@ -1231,18 +1276,26 @@ export function apply(options: ApplyOptions = {}): void {
     let projection: LoadedProjection | null = null
     let methodology: CompactMethodologyProjection | null = null
     if (target !== undefined) {
-      const [fetched, methodologyFetched] = await Promise.all([
-        api<Projection>(`/v1/projects/${encodeURIComponent(target)}/projection`),
+      const [fetchedResult, methodologyFetched] = await Promise.all([
+        apiResult<Projection>(`/v1/projects/${encodeURIComponent(target)}/projection`),
         api<CompactMethodologyProjection>(methodologyProjectionPath(target)),
       ])
       methodology = methodologyFetched
+      const fetched = fetchedResult.ok ? fetchedResult.data : null
+      const targetGone = projectIsAuthoritativelyGone(target, projectsResult.ok, projects, fetchedResult.status)
+      // Destructive cleanup belongs to the deleted target even if the user
+      // selected another project while this request was in flight.
+      if (targetGone) chatDiscardProject(target)
+      // The queued render for the newer selection owns all visible state.
+      // Never let an older response clear it or write the old project back.
+      if (!projectRenderTargetIsCurrent(target, state.projectId)) return
       if (fetched === null || fetched.project === undefined) {
         projection = null
         // A deleted project is absent from the authoritative list and all
-        // ordinary reads return 404. Clear the stale selection so the Start
-        // screen gives the user the next available action instead of leaving
-        // a dead deep link selected.
-        if (!projects.some(project => project.project_id === target)) state.projectId = undefined
+        // ordinary reads return 404. Only an authoritative list + projection
+        // result may trigger destructive local cleanup; transport/server
+        // failures retain the transcript and upload queue for recovery.
+        if (targetGone) state.projectId = undefined
       }
       else {
         state.projectId = fetched.project.project_id
@@ -1291,9 +1344,11 @@ export function apply(options: ApplyOptions = {}): void {
         cards.appendChild(card)
       }
       start.appendChild(cards)
+      disposeChatAttachments(chatDock)
       chatDock.hidden = true
       chatDock.replaceChildren()
       dockBody.replaceChildren()
+      disposeChatAttachments(dockChatDock)
       dockChatDock.replaceChildren()
       applyDockGeometry()
       body.replaceChildren(start)
@@ -1307,9 +1362,11 @@ export function apply(options: ApplyOptions = {}): void {
       deactivatePanelTransport('trajectory')
       deactivatePanelTransport('pty')
       deactivatePanelTransport('manuscript')
+      disposeChatAttachments(chatDock)
       chatDock.hidden = true
       chatDock.replaceChildren()
       dockBody.replaceChildren()
+      disposeChatAttachments(dockChatDock)
       dockChatDock.replaceChildren()
       applyDockGeometry()
       body.replaceChildren(el('div', 'error-banner', t('shell', 'shell.kernelUnreachableProject', { project: activeTarget })))
@@ -1347,6 +1404,7 @@ export function apply(options: ApplyOptions = {}): void {
       await renderPage(dockBody, dockChatDock, dockedPanel, projection, methodology, activeTarget, true)
     } else {
       dockBody.replaceChildren()
+      disposeChatAttachments(dockChatDock)
       dockChatDock.hidden = true
       dockChatDock.replaceChildren()
     }
@@ -1574,7 +1632,7 @@ export function apply(options: ApplyOptions = {}): void {
       } else if (state.chatDetailIndex >= 0) {
         state.chatDetailIndex = -1
         state.rerender()
-      } else if (state.chatQuoteTarget !== null) {
+      } else if (state.chatQuoteTarget?.session_id === state.chatActiveId) {
         state.chatQuoteTarget = null
         state.rerender()
       }

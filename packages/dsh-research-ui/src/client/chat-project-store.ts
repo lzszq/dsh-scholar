@@ -3,6 +3,18 @@ import type { ChatMessage, ChatSession } from './types'
 export interface KeyValueStorage {
   getItem(key: string): string | null
   setItem(key: string, value: string): void
+  removeItem(key: string): void
+}
+
+export interface EnumerableKeyValueStorage extends KeyValueStorage {
+  readonly length: number
+  key(index: number): string | null
+}
+
+export interface ChatQuoteTarget {
+  session_id: string
+  index: number
+  text: string
 }
 
 export interface ChatProjectSnapshot {
@@ -12,7 +24,7 @@ export interface ChatProjectSnapshot {
   draft: string
   history: string[]
   detailIndex: number
-  quoteTarget: { index: number; text: string } | null
+  quoteTarget: ChatQuoteTarget | null
   searchQuery: string
   commandsOnly: boolean
   sessionSearchQuery: string
@@ -28,6 +40,22 @@ export function chatProjectStorageKeys(projectId: string): { sessions: string; a
     active: `${PREFIX}:active:${suffix}`,
     context: `${PREFIX}:context:${suffix}`,
   }
+}
+
+/** Enumerate persisted project transcript scopes for authoritative external
+ * deletion reconciliation. Malformed keys are ignored fail-closed. */
+export function listChatProjectSnapshotIds(storage: EnumerableKeyValueStorage): string[] {
+  const prefix = `${PREFIX}:sessions:`
+  const result = new Set<string>()
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index)
+    if (key?.startsWith(prefix) !== true) continue
+    try {
+      const projectId = decodeURIComponent(key.slice(prefix.length))
+      if (projectId !== '') result.add(projectId)
+    } catch { /* malformed external storage key */ }
+  }
+  return [...result]
 }
 
 function isMessage(value: unknown, projectId: string): value is ChatMessage {
@@ -79,8 +107,18 @@ export function loadChatProjectSnapshot(storage: KeyValueStorage, projectId: str
       if (Array.isArray(context.history)) snapshot.history = context.history.filter((line): line is string => typeof line === 'string').slice(-50)
       if (Number.isInteger(context.detailIndex)) snapshot.detailIndex = context.detailIndex as number
       const quote = context.quoteTarget
-      if (typeof quote === 'object' && quote !== null && Number.isInteger((quote as { index?: unknown }).index) && typeof (quote as { text?: unknown }).text === 'string') {
-        snapshot.quoteTarget = { index: (quote as { index: number }).index, text: (quote as { text: string }).text }
+      if (
+        typeof quote === 'object' && quote !== null
+        && typeof (quote as { session_id?: unknown }).session_id === 'string'
+        && snapshot.sessions.some(session => session.id === (quote as { session_id: string }).session_id)
+        && Number.isInteger((quote as { index?: unknown }).index)
+        && typeof (quote as { text?: unknown }).text === 'string'
+      ) {
+        snapshot.quoteTarget = {
+          session_id: (quote as { session_id: string }).session_id,
+          index: (quote as { index: number }).index,
+          text: (quote as { text: string }).text,
+        }
       }
       if (typeof context.searchQuery === 'string') snapshot.searchQuery = context.searchQuery
       if (typeof context.commandsOnly === 'boolean') snapshot.commandsOnly = context.commandsOnly
@@ -111,6 +149,13 @@ export function saveChatProjectSnapshot(storage: KeyValueStorage, snapshot: Chat
   }))
 }
 
+export function deleteChatProjectSnapshot(storage: KeyValueStorage, projectId: string): void {
+  const keys = chatProjectStorageKeys(projectId)
+  storage.removeItem(keys.sessions)
+  storage.removeItem(keys.active)
+  storage.removeItem(keys.context)
+}
+
 export function appendStoredChatMessage(
   storage: KeyValueStorage,
   projectId: string,
@@ -125,6 +170,39 @@ export function appendStoredChatMessage(
   session.messages.push(message)
   session.messages = session.messages.slice(-CHAT_MAX)
   if (markUnread) session.unread = (session.unread ?? 0) + 1
+  saveChatProjectSnapshot(storage, snapshot)
+  return true
+}
+
+export function appendStoredChatHistory(
+  storage: KeyValueStorage,
+  projectId: string,
+  line: string,
+): boolean {
+  const normalized = line.trim()
+  if (normalized === '') return false
+  const snapshot = loadChatProjectSnapshot(storage, projectId)
+  if (snapshot.history.at(-1) !== normalized) snapshot.history.push(normalized)
+  snapshot.history = snapshot.history.slice(-50)
+  saveChatProjectSnapshot(storage, snapshot)
+  return true
+}
+
+/** Consume a delayed quote from the exact persisted project/session only. */
+export function consumeStoredChatQuote(
+  storage: KeyValueStorage,
+  projectId: string,
+  sessionId: string,
+  expected: ChatQuoteTarget | null,
+): boolean {
+  if (expected === null || expected.session_id !== sessionId) return false
+  const snapshot = loadChatProjectSnapshot(storage, projectId)
+  const current = snapshot.quoteTarget
+  if (
+    current === null || current.session_id !== sessionId
+    || current.index !== expected.index || current.text !== expected.text
+  ) return false
+  snapshot.quoteTarget = null
   saveChatProjectSnapshot(storage, snapshot)
   return true
 }

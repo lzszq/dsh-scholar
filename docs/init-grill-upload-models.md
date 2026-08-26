@@ -55,7 +55,13 @@ Chat composer 必须持续显示带文字的“上传文件”按钮以及选择
 - abort 幂等；开放 stage 至少保留 24h 并能查询 offset，浏览器刷新或断线后继续。扫描前字节只在隔离 Intake staging，不能写项目 Artifact/CAS authority。
 - archive 的条目数、展开总量、单条目与压缩比限制独立于 Intake 总上传配额。
 
+浏览器恢复契约：队列 metadata 只按 exact project/session 持久化，禁止保存 File、base64 或本地路径；普通项目切换不得清空 page-lifetime File。hard reload 后通过服务端 upload-session list 对账 status、committed offset 与服务端协商的 `chunk_size`，并提示用户重新选择文件；只有名称、大小、媒体类型及重新计算的 whole-file SHA-256 与原 stage 全部一致才可从 offset 继续。缺失、expired、aborted 或身份不匹配的 stage 必须清除旧 upload id/offset/chunk cap，重选后重新 begin，不能循环请求失效 stage。显式关闭 session 必须先 tombstone scope，拒绝迟到的 Intake/hash/chunk/finalize continuation，并 best-effort abort 已创建的 server stage；begin 或 append 在途返回后都必须重新检查 pause/liveness，不能覆盖用户暂停，owner 已关闭时须 best-effort abort 刚创建的 stage。项目删除还必须建立 project tombstone、清除 transcript 和全部 queue metadata、取消活动模型 turn；Kernel 在 tombstone 事务内删除 chunk 并把 open session 变成 durable aborted cleanup ledger，提交后清理隔离 `.part`，成功后才删 ledger，失败由 sweep 重试，浏览器不得在项目不可读后补发 abort。其他 tab/API/DSH 删除项目时，只有成功项目列表与目标 projection 404 的组合才允许清本地 scope；transport/5xx 保留恢复数据。旧 render 只有 frozen project target 仍被选中时才可提交可见 state，不能用 A 的迟到响应覆盖 B。
+
 ## 4. Model Provider、SecretRef 与项目绑定
+
+后台上传 scope 同样参与外部删除回收：成功 project list 后枚举本页所有 page-lifetime scope store（transcript、upload、vision、turn、attachment-flight）持有的项目，列表缺失且 projection 404 时执行完整 project discard；不能只枚举成功写入 localStorage 的 transcript，也不能只清当前选中项目，storage quota/private-mode 写失败和网络/5xx 都不得造成错误释放或漏清仍在内存中的 File/queue。
+
+关闭 exact Chat session 是服务端可恢复的 authority event，而非纯浏览器清理：本地先 tombstone exact project/session并同步取消 attachment-flight/turn/vision/upload，再把关闭意图写入独立 local outbox；outbox 已持久化或 Kernel 已 ACK 后才删除 transcript session，storage 失败则保留可见 session，项目激活/成功 project-list refresh 自动重放。Chat 创建的 Intake 和 upload session 均携带并持久化 `owner_scope_id`；Kernel 在同一事务写 durable tombstone并把相关 upload 转 aborted ledger，拒绝迟到 begin/append/finalize。客户端 AbortSignal 覆盖 Intake、分片 hash 与上传，且对取消交错的成功 finalize 做幂等补偿 abort。仅本 session 新建且仍 staged 的 artifact 可由补偿删除；重复 abort 不丢 ownership ledger，direct same-SHA stage 在写锁内接管新 generation，预存、去重、已扫描和后来重建的材料必须保留。
 
 Model Provider 是 instance/global 资源；项目和 Intake 只能引用 opaque `provider_id` 与 `model_id`，不能携带 endpoint、API key、环境变量名或任意连接参数。
 
@@ -86,10 +92,28 @@ Settings 的“Models & OCR”折叠组提供 Provider 列表、新建/编辑/�
 - OCR 文本是不可信外部内容：不得执行其中指令，不得访问 secret，不得成为 Human answer、Gate Decision、verified Evidence 或 supported Claim。
 - 失败只返回稳定 error code 和安全诊断；Provider 原始响应、prompt、secret、endpoint 与 token 不进入普通日志、Trajectory、浏览器或 Bundle。
 
-## 6. 页面引导、i18n 与人工验收
+## 6. Chat 视觉模型
 
-Init/Chat/Upload/Settings/OCR 每个非终态页面必须由 Kernel 投影给出一个主 NextAction：现在做什么、为什么、由谁做、阻断项和目标 route。UI 可以翻译 chrome，但不能本地猜测业务动作。
+Scholar Chat 的图片输入复用同一个上传入口，但“研究材料接入”和“当前轮视觉上下文”是两个相互独立的结果：文件继续进入项目 active Intake，Chat 消息只持久化 Intake stage ref；受支持图片的原始字节仅在当前自由对话请求中瞬态编码，不写入 Chat state/localStorage，也不得自动变成 OCR Observation、Evidence、Claim、Brief answer 或任何 Gate Decision。slash command 与确定性 Grill answer 不消费待发送图片；只有视觉模型成功完成自由对话轮次后，客户端才清除本轮视觉标记。待发送图片及其 `File` handle 必须由当前 project/session 的 live client state 持有，上传进度、附件消息或普通投影触发的局部/全页 render 不得清空；只有成功消费、用户显式移除、切换到不再持有该 live session 的页面或 hard reload 才可 fail closed。不得把 render-local `Set` 当作该状态的权威所有者。
 
-首发支持 zh/en，至少覆盖 name-only 创建、当前 Grill 问题、skip/unknown/edit、Brief 预览/确认、批量队列、暂停/恢复/冲突、Provider/SecretRef/OCR 状态与错误、下一步提示和 aria。语言切换不得丢失已输入项目名、当前答案或上传队列。
+浏览器到 standalone BFF 的闭合 wire 为 `images: Array<{mediaType,data,name?}>`，只接受 PNG、JPEG、WebP 与 GIF、最多 20 项，整个 JSON 请求受 16 MiB envelope 约束。一次选择、拖放或粘贴形成一个原子视觉批次：客户端必须先把该批次与当前 exact-session 队列合并，在读取任何 `File` 字节前一次性校验媒体类型、数量、原始大小与 base64 envelope 上界；任一项失败时本批零项进入视觉队列，也不得先读取前 20 项再在第 21 项失败。通过后才按顺序有界编码，并在最终 JSON 序列化后由 private bridge 再做精确 envelope 检查；不得并发读取全部图片再等待 BFF 拒绝。研究材料 Intake 上传与本轮视觉上下文相互独立，视觉批次拒绝不得伪装为视觉成功。每个待发送图片必须有可键盘访问的显式移除动作，移除只影响下一次视觉对话，不删除已进入 Intake 的材料。BFF 只做严格形状与媒体类型校验；canonical base64、实际字节类型、单图/聚合大小、像素、宽高和持久化由当前 DSH `AttachmentStore.imageLimits` 与 `admitEncodedImages` 权威执行。插件只把返回的 opaque `ImageAttachmentRef` 作为 DSH LLM `ImageBlock` 交给适配器，绝不把浏览器 data URL、文件路径或 base64 直接拼入 prompt、日志、Trajectory 或 Kernel 数据。
+
+模型发现目录必须来自当前 DSH `ctx.llm.listProviders/listModels`，standalone 不维护静态模型名单；但目录只用于 discovery，绝不是请求白名单。模型选择值由 provider 与 opaque model id 组成，只在第一个 `/` 处分隔，后续 `/` 属于 model id。未限定模型名不再兼容且不得猜测 Provider；已保存的限定 route 即使不在 advisory catalog，也必须由所属 adapter 的 `ctx.llm.resolveModelInfo(provider, model)` 精确解析，成功则仍按原 route 使用，失败则显示不可用并 fail closed，绝不能静默改跑 Auto 或目录第一项。每个真实 turn 都必须重新解析 exact adapter metadata，不能直接信任 catalog 中可能过期的 capability。`inputModalities` 字段缺失表示 unknown；显式数组是权威声明，因此空数组或不含 text 的数组表示不能承载 Scholar 固定的 text prompt，必须禁用且不能拖垮其他目录项。视觉模型还必须同时显式包含 text 与 image，选择器才用 `👁` 标记。Auto 仅在用户没有显式选择时使用插件 PI 默认；两者都没有时才按目录顺序解析并跳过离线或明确不支持 text 的项。Auto 解析一旦收到取消信号必须立即停止，不能继续探测或发起模型请求。DSH model bridge 不可用时不能保存具体模型。Bridge 业务失败使用闭合 typed code，HTTP/BFF 只 allowlist code，不得靠英文 `Error.message` 推导协议结果。首版稳定失败包括 `vision_model_required`、`vision_image_rejected`、`vision_attachment_service_unavailable`、`vision_model_unavailable` 与 `payload_too_large`，zh/en 必须给出可操作提示；任何携图请求的通用网络、provider、协议或反序列化失败都不得退回确定性文本回答，失败后图片留在原会话待重试。
+
+模型选择 PUT 是发送前的持久化屏障：用户切换模型后，selector 在 BFF 明确确认前保持 pending，立即发送必须等待同一写入；保存失败恢复上一个已确认值并阻止该 turn，不能让 UI 显示新模型而 DSH agent 仍读取旧偏好。初始化 GET 的迟到响应不能覆盖已经开始的用户 PUT，也不能重置其发送屏障；显式 UI 选择必须优先于插件 PI 默认，Auto 才允许回退。发送动作必须在第一次异步 `File.arrayBuffer()` 之前冻结 exact `{project_id, chat_session_id, transcript history, quote, visual file ids}`，整个编码、BFF 请求和延迟回复都只写回该项目/会话；期间切换项目或 Chat 不得把文本、图片、命令历史或回复写入新焦点，会话已被显式关闭时则终止写入。编码与提交为 exact project/session 单飞；飞行状态必须独立于某次 composer DOM，上传/消息/locale/projection 重绘后仍阻止重复提交并冻结模型 selector。图片 wire 只属于 `conversation` operation；`generate_ideas`、slash command 与 Grill 的 strict schema 必须拒绝图片字段。DSH 插件与 standalone 之间只发布一个原子替换的 `0600 agent-bridge.json`（loopback origin、pid、started_at、token 同一版本）；不得把 endpoint 与 token 分文件发布或保留读 fallback，热更新发布失败必须保留上一份完整可用描述。
+
+图片与其中的文字始终是不可信研究输入：模型可以描述、比较图表或辅助讨论，但不得执行图片中的指令，不得据此声明已运行命令或完成 canonical mutation。DSH 原生 Chat 继续使用 Host 自己的 attachment rail；Scholar 不复制 Host 的图片存储或 provider serializer。DeepSeek direct adapter 的默认目录在端点发布前仍可能是 text-only；部署方必须在 DSH `llm-deepseek` 模型目录中为实际视觉端点显式配置 `inputModalities: [text, image]`，Scholar 不凭模型名称猜测能力。
+
+2026-08-21 browser computer-use 首轮复核曾暴露一处缺陷：选择/粘贴/拖放的图片会先显示为下一轮视觉上下文，随后异步 Intake 上传写入附件消息并触发 Chat 重绘，旧的 render-local visual set 被重新初始化，尚未执行自由对话便丢失待发送状态。现已用 exact `project_id + chat_session_id` 的 memory-only `ChatVisionTurnStore` 取代 render-local 所有权，并在 Chat 每次挂载时从该 Store 重建队列；关闭会话会清理对应 scope，hard reload 仍按设计 fail closed。focused 自动回归覆盖重绘保留、项目/会话隔离和成功消费。
+
+同日修复后 computer-use 复测通过浏览器核心链路：两图批量选择、单图粘贴、单图拖放均进入真实 Intake/Chat handler；四图在全部异步上传消息、手动 Refresh 与 Chat 1→Chat 2→Chat 1 切换后仍只在原会话显示；text-only 模型返回 `vision_model_required` 后四图继续保留；切换 `deepseek-official/deepseek-v4-flash-vision-exp` 后真实模型准确描述 cat/coffee/lily/gamepad，成功回复后队列清空。drag-over accent、AT-SPI 名称及 composer→upload→model→formatting→clear→send 的 Tab 顺序也通过。当前 Linux computer-use provider不提供原生文件 chooser、二进制系统剪贴板、跨应用 file drag、屏幕截图或屏幕阅读器朗读，因此这些 OS/AT 集成仍为 `NOT_RUN_MANUAL_PENDING`；本次用真实 Upload 按钮后 CDP 设置 file input，并以浏览器 Clipboard/Drag 事件驱动同一生产 handler，再由 computer-use accessibility tree观察，不能外推为原生跨应用输入已验收。
+
+同步视觉预检通过后必须立即把整批图片写入 exact-session 的下一轮视觉队列，再独立启动 Intake 查询/创建；不得让 Intake 网络等待形成“先发送纯文本、稍后才出现图片”的竞态。Intake 失败只把研究材料上传标成可重试，不清除视觉上下文。普通项目切换仍持有该 live session 的 page-lifetime File；成功消费、显式移除、session close、project delete 或 hard reload 才清理视觉字节。
+
+## 7. 页面引导、i18n 与人工验收
+
+Init/Chat/Upload/Settings/OCR/Vision 每个非终态页面必须由 Kernel 投影给出一个主 NextAction：现在做什么、为什么、由谁做、阻断项和目标 route。UI 可以翻译 chrome，但不能本地猜测业务动作。
+
+首发支持 zh/en，至少覆盖 name-only 创建、当前 Grill 问题、skip/unknown/edit、Brief 预览/确认、批量队列、暂停/恢复/冲突、Provider/SecretRef/OCR 状态与错误、视觉图片待发送状态/能力拒绝、下一步提示和 aria。语言切换不得丢失已输入项目名、当前答案、上传队列或尚未消费的视觉图片。
 
 开发阶段不以真实模型、2–10 GiB 文件、私有 Provider、真实浏览器或网络故障作为提交前置；必须完成 schema/migration/unit/contract/typecheck/build/static checks，并把真实环境场景排入 `manual-acceptance.md`。

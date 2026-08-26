@@ -804,6 +804,7 @@ const intakeBeginSchema = z.object({
   expires_in_ms: z.number().int().positive().optional(),
   idempotency_key: z.string().optional(),
   request_hash: z.string().optional(),
+  owner_scope_id: z.string().min(1).max(160).regex(/^[A-Za-z0-9._:-]+$/).optional(),
 }).strict()
 
 const intakeAnswersSchema = z.object({
@@ -834,6 +835,7 @@ const uploadSessionBeginSchema = z.object({
   expected_size: z.number().int().nonnegative(),
   expected_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   chunk_size: z.number().int().positive().optional(),
+  owner_scope_id: z.string().min(1).max(160).regex(/^[A-Za-z0-9._:-]+$/).optional(),
 }).strict()
 
 /** MODEL-01 (init-grill-upload-models.md §4): provider create/update/delete. */
@@ -2010,6 +2012,10 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
               send(res, 404, { error: { code: 'not_found', message: 'unknown model-binding route' } })
               return
             }
+            if (sub === 'chat-scopes' && subId !== undefined && subSubId === 'tombstone' && method === 'POST') {
+              ok(res, kernel.tombstoneChatScope(id, subId))
+              return
+            }
             // ONBOARD-01 (research-onboarding.md / api-contracts.md §16):
             // intake sessions are project-scoped on this surface — every
             // route re-resolves the intake under the path project (cross-
@@ -2025,6 +2031,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
                   expires_in_ms: input.expires_in_ms,
                   idempotency_key: input.idempotency_key,
                   request_hash: input.request_hash,
+                  owner_scope_id: input.owner_scope_id,
                 })
                 send(res, 201, session)
                 return
