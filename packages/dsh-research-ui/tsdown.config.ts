@@ -20,7 +20,7 @@ export default defineConfig({
     // The standalone browser host exposes no npm module loader. Keep the
     // emulator self-contained in client.js and let bundle verification reject
     // any accidental runtime dependency.
-    alwaysBundle: [/^@xterm\//],
+    alwaysBundle: [/^@xterm\//, /^@noble\/hashes/, /^@dsh-scholar\/research-schemas\/chat-agent$/, /^zod$/],
   },
   plugins: [{
     name: 'dsh-scholar-xterm-css-inline',

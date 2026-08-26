@@ -8,10 +8,12 @@
  */
 import { t } from './index'
 import { readNavigationVisibility, type NavigationVisibility } from '../navigation-preferences'
+import { scholarModelUsability, type ScholarModelCatalogEntry } from '../../shared/model-catalog'
 
 export interface ChromeTab { key: string; label: string; description: string }
 export interface ChromeTabGroup { label: string; tabs: ChromeTab[] }
-export interface ChromeModelChoice { id: string; label: string }
+export interface ChromeModelChoice { id: string; label: string; disabled?: boolean; visual?: boolean }
+export type ChromeModelCatalogEntry = ScholarModelCatalogEntry
 
 /** Tab groups with labels/descriptions in the CURRENT locale. */
 export function chromeTabGroups(visibility: NavigationVisibility = readNavigationVisibility()): ChromeTabGroup[] {
@@ -62,10 +64,17 @@ export function chromeTabs(visibility: NavigationVisibility = readNavigationVisi
 }
 
 /** Research-agent model selector choices in the CURRENT locale. */
-export function chromeModelChoices(): ChromeModelChoice[] {
+export function chromeModelChoices(models: readonly ChromeModelCatalogEntry[] = []): ChromeModelChoice[] {
   return [
     { id: '', label: t('shell', 'shell.model.auto') },
-    { id: 'deepseek-v4-flash', label: t('shell', 'shell.model.deepseek-v4-flash') },
-    { id: 'deepseek-v4-pro', label: t('shell', 'shell.model.deepseek-v4-pro') },
+    ...models.map(model => {
+      const usability = scholarModelUsability(model)
+      return {
+        id: model.id,
+        label: `${usability.visual ? '👁 ' : ''}${model.name}`,
+        disabled: !usability.selectable,
+        visual: usability.visual,
+      }
+    }),
   ]
 }

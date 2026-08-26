@@ -1,15 +1,11 @@
 import type { ChatSession, ClaimRow, ContextMenuItem, GateRow, Projection } from './types'
+import type { ScholarChatImage } from '@dsh-scholar/research-schemas/chat-agent'
 import { api, apiResult, authHeaders, base, ensureCsrfToken } from './api'
 import { getLocale, t } from './i18n/index'
 import { CHAT_COMMANDS } from './modals/commands'
 import { openCommandHistoryModal, openGlobalSearchModal, openSessionSearchModal } from './modals/search'
-import { CHAT_MAX, activeChatProjectId, chatClear, chatPersist, chatPush, chatPushToProjectSession, chatSessionArchive, chatSessionClose, chatSessionEnsure, chatSessionNew, chatSessionRename, chatSessionSelect, chatSessionsPersist, chatSyncActive, chatUpsertAttachmentForProjectSession, favCommands, historyPush, state, tabSave } from './state'
+import { CHAT_MAX, activeChatProjectId, chatClear, chatPersist, chatPush, chatPushToProjectSession, chatSessionArchive, chatSessionClose, chatSessionEnsure, chatSessionNew, chatSessionRename, chatSessionSelect, chatSessionsPersist, chatSyncActive, consumeChatQuoteForProjectSession, favCommands, historyPushToProject, state, tabSave } from './state'
 import { copyText, el, fmtId, focusChatComposerAtEnd, openContextMenu, pill, rootHost, showToast, statusLabel } from './ui'
-import {
-  browserTransport, chatAttachmentRef, driveUpload, enqueueFiles, fileByteProvider, markHashed,
-  pauseItem, registerByteProvider, resumeItem, retryItem, sha256Hex, unregisterByteProvider,
-  type UploadQueueItem,
-} from './chunked-upload'
 import {
   grillAnswerPayload, grillConfirmPayload, grillErrorKey, grillGuideModel,
   loadGrillGuideState,
@@ -17,12 +13,29 @@ import {
 } from './grill-guide-model'
 import { planNaturalChatTurn, projectStageGuidance, safeSuggestedChatCommand, type ChatTurnProjection } from './chat-turn-model'
 import { captureChatScroll, restoreChatScrollTop, type ChatScrollPosition } from './chat-scroll-model'
-import { activeIntakeId, intakeBeginPayload } from './intake-flow'
+import { intakeBeginPayload } from './intake-flow'
+import { ChatVisionInputError, encodeChatVisionImages } from './chat-vision'
+import { chatTurnFlightStore } from './chat-turn-flight'
+import { createChatAttachmentController, type ChatAttachmentController } from './chat-attachments'
+import {
+  ChatVisionError,
+  standaloneChatModel,
+  type ChatModelTurn,
+  type ChatModelTurnReply,
+  type ChatModelTurnRequest,
+} from './chat-model-turn'
 export let dragSessionId: string | null = null
 
 export type ChatSurface = 'main' | 'dock'
 
 const chatScrollPositions = new Map<string, ChatScrollPosition>()
+const activeAttachmentControllers = new WeakMap<HTMLElement, ChatAttachmentController>()
+
+/** Release DOM listeners before a Chat Dock is replaced or hidden. */
+export function disposeChatAttachments(dock: HTMLElement): void {
+  activeAttachmentControllers.get(dock)?.dispose()
+  activeAttachmentControllers.delete(dock)
+}
 
 function chatScrollKey(surface: ChatSurface, projectId: string, sessionId: string): string {
   return `${surface}:${projectId}:${sessionId}`
@@ -317,47 +330,24 @@ function naturalGuidanceText(projection: ChatTurnProjection): string {
 export interface ChatTurnResult {
   text: string
   suggestedCommand?: string
+  /** True only after the model completed a turn containing the transient images. */
+  consumedVisualInputs?: boolean
 }
 
-interface ChatModelTurnRequest {
+export interface ChatTurnContext {
   sessionId: string
-  text: string
-  locale: 'zh' | 'en'
-  project: {
-    project_id: string
-    name?: string
-    status?: string
-    brief_status?: string
-    next_actions_v2?: unknown[]
-  }
   history: Array<{ role: 'user' | 'assistant'; text: string }>
 }
 
-interface ChatModelTurnReply {
-  assistantText: string
-  suggestedCommand?: string
-}
-
-type ChatModelTurn = (payload: ChatModelTurnRequest) => Promise<ChatModelTurnReply | null>
-
-const standaloneChatModel: ChatModelTurn = async payload => {
-  const response = await fetch(`${base()}/api/chat/turn`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...(await authHeaders()), 'x-csrf-token': (await ensureCsrfToken()) ?? '' },
-    body: JSON.stringify({
-      project_id: payload.project.project_id,
-      session_id: payload.sessionId,
-      text: payload.text,
-      locale: payload.locale,
-      history: payload.history,
-    }),
-  })
-  if (!response.ok) return null
-  const result = await response.json() as { operation?: unknown; assistant_text?: unknown; suggested_command?: unknown }
-  if (result.operation !== 'conversation' || typeof result.assistant_text !== 'string') return null
+/** Freeze exact project/session transcript ownership before browser file I/O. */
+export function captureChatTurnContext(projectId: string, sessionId: string): ChatTurnContext {
+  const session = state.chatSessions.find(candidate => candidate.project_id === projectId && candidate.id === sessionId)
   return {
-    assistantText: result.assistant_text,
-    ...(typeof result.suggested_command === 'string' ? { suggestedCommand: result.suggested_command } : {}),
+    sessionId,
+    history: (session?.messages ?? [])
+      .filter((message): message is typeof message & { role: 'user' | 'assistant' } => message.role === 'user' || message.role === 'assistant')
+      .slice(-12)
+      .map(message => ({ role: message.role, text: message.text.slice(0, 2_000) })),
   }
 }
 
@@ -393,10 +383,17 @@ export async function executeChatTurn(
   line: string,
   activeProjectId: string | undefined,
   chatModelTurn: ChatModelTurn = standaloneChatModel,
+  loadImages: () => Promise<ScholarChatImage[]> = async () => [],
+  context?: ChatTurnContext,
+  signal?: AbortSignal,
 ): Promise<ChatTurnResult> {
+  const frozenContext = context ?? captureChatTurnContext(
+    activeProjectId ?? '',
+    state.chatActiveId ?? `scholar-${activeProjectId ?? 'none'}`,
+  )
   const input = chatInputKind(line)
   if (input.kind === 'command') {
-    const answer = await executeChatCommand(input.line, activeProjectId)
+    const answer = await executeChatCommand(input.line, activeProjectId, { sessionId: frozenContext.sessionId })
     const guidanceProjectId = commandProjectId(input.line, activeProjectId)
     if (guidanceProjectId === undefined || guidanceProjectId === '') return { text: answer }
     const latest = await api<Projection>(`/v2/projects/${encodeURIComponent(guidanceProjectId)}/projection`)
@@ -405,10 +402,7 @@ export async function executeChatTurn(
   if (activeProjectId === undefined || activeProjectId === '') return { text: t('shell', 'shell.chat.natural.noProjection') }
   // Freeze the active session context before the first await. Switching tabs,
   // sessions or projects while the request is running must not mix histories.
-  const history = state.chatMessages
-    .filter((message): message is typeof message & { role: 'user' | 'assistant' } => message.role === 'user' || message.role === 'assistant')
-    .slice(-12)
-    .map(message => ({ role: message.role, text: message.text.slice(0, 2_000) }))
+  const history = frozenContext.history
   const current = await api<ProjectGrillProjection>(`/v2/projects/${encodeURIComponent(activeProjectId)}/grill`)
   if (current === null) return { text: t('shell', 'shell.chat.natural.noProjection') }
   if (current !== null && (current.question !== null || current.ready_to_confirm)) {
@@ -431,15 +425,17 @@ export async function executeChatTurn(
   if (projection === null) return { text: t('shell', 'shell.chat.natural.noProjection') }
   const plan = planNaturalChatTurn(input.text, projection)
   if (plan.kind === 'command') {
-    const answer = await executeChatCommand(plan.command, activeProjectId, { naturalText: input.text })
+    const answer = await executeChatCommand(plan.command, activeProjectId, { naturalText: input.text, sessionId: frozenContext.sessionId })
     const latest = await api<Projection>(`/v2/projects/${encodeURIComponent(activeProjectId)}/projection`)
     return { text: withGuidance(answer, latest ?? projection) }
   }
 
   let modelReply: ChatModelTurnReply | null = null
+  let images: ScholarChatImage[] = []
   try {
-    modelReply = await chatModelTurn({
-      sessionId: state.chatActiveId ?? `scholar-${activeProjectId}`,
+    images = await loadImages()
+    const modelPayload: ChatModelTurnRequest = {
+      sessionId: frozenContext.sessionId,
       text: input.text,
       locale: getLocale() === 'en' ? 'en' : 'zh',
       project: {
@@ -450,8 +446,26 @@ export async function executeChatTurn(
         next_actions_v2: projection.next_actions_v2,
       },
       history,
-    })
-  } catch {
+      images,
+    }
+    modelReply = signal === undefined
+      ? await chatModelTurn(modelPayload)
+      : await chatModelTurn(modelPayload, { signal })
+  } catch (error) {
+    if (signal?.aborted === true) throw error
+    if (images.length > 0 || error instanceof ChatVisionInputError) {
+      const code = error instanceof ChatVisionError || error instanceof ChatVisionInputError ? error.code : 'vision_model_unavailable'
+      const key = code === 'vision_model_required'
+        ? 'shell.chat.vision.modelRequired'
+        : code === 'vision_attachment_service_unavailable'
+          ? 'shell.chat.vision.serviceUnavailable'
+          : code === 'payload_too_large'
+            ? 'shell.chat.vision.payloadTooLarge'
+            : code === 'vision_image_rejected'
+              ? 'shell.chat.vision.imageRejected'
+              : 'shell.chat.vision.modelUnavailable'
+      return { text: t('shell', key) }
+    }
     // Standalone/no-model instances keep deterministic guidance available.
   }
 
@@ -467,12 +481,8 @@ export async function executeChatTurn(
   }
   const latest = await api<Projection>(`/v2/projects/${encodeURIComponent(activeProjectId)}/projection`)
   const text = withGuidance(answer, latest ?? projection)
-  return suggestedCommand === undefined ? { text } : { text, suggestedCommand }
-}
-
-/** Compatibility wrapper retained for command/router unit tests. */
-export async function executeChatInput(line: string, activeProjectId: string | undefined): Promise<string> {
-  return (await executeChatTurn(line, activeProjectId)).text
+  const visual = images.length > 0 && modelReply !== null ? { consumedVisualInputs: true as const } : {}
+  return suggestedCommand === undefined ? { text, ...visual } : { text, suggestedCommand, ...visual }
 }
 
 /**
@@ -483,7 +493,7 @@ export async function executeChatInput(line: string, activeProjectId: string | u
 export async function executeChatCommand(
   line: string,
   activeProjectId: string | undefined,
-  context: { naturalText?: string } = {},
+  context: { naturalText?: string; sessionId?: string } = {},
 ): Promise<string> {
   const trimmed = line.trim().replace(/^\//, '')
   const parts = trimmed.split(/\s+/)
@@ -607,12 +617,13 @@ export async function executeChatCommand(
       if ((parts[1] ?? '').toLowerCase() === 'generate') {
         const parsedCount = Number(parts[2] ?? 3)
         if (!Number.isInteger(parsedCount) || parsedCount < 1 || parsedCount > 5) return 'usage: /ideas generate [1-5]'
+        if (context.sessionId === undefined || context.sessionId === '') return t('shell', 'shell.chat.ideas.generateFailed', { code: 'session_required' })
         const response = await fetch(`${base()}/api/chat/ideas`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', ...(await authHeaders()), 'x-csrf-token': (await ensureCsrfToken()) ?? '' },
           body: JSON.stringify({
             project_id: activeProjectId,
-            session_id: state.chatActiveId ?? `scholar-${activeProjectId}`,
+            session_id: context.sessionId,
             text: context.naturalText ?? `/ideas generate ${parsedCount}`,
             count: parsedCount,
             locale: getLocale() === 'en' ? 'en' : 'zh',
@@ -835,12 +846,15 @@ export async function renderChat(
   projectId: string,
   modelSelect?: HTMLSelectElement,
   surface: ChatSurface = 'main',
+  waitForModelPreference?: () => Promise<boolean>,
+  syncModelSelector?: () => void,
 ): Promise<void> {
   if (activeChatProjectId() !== projectId) return
   const renderedSessionId = state.chatActiveId
   if (renderedSessionId === null) return
   // Rebuild the persistent footer synchronously. Its old geometry stays in
   // place throughout async refresh work, and this swap cannot paint halfway.
+  disposeChatAttachments(dock)
   dock.replaceChildren()
   const shell = el('div', 'chat-shell')
 
@@ -1760,7 +1774,7 @@ export async function renderChat(
           divider: true,
           onPick: () => {
             state.chatDraft = ''
-            state.chatQuoteTarget = { index: i, text: msg.text }
+            state.chatQuoteTarget = { session_id: renderedSessionId, index: i, text: msg.text }
             state.rerender()
             focusChatComposerAtEnd()
           },
@@ -1827,7 +1841,7 @@ export async function renderChat(
         state.chatDraft = ''
         state.activeTab = 'chat'
         tabSave()
-        state.chatQuoteTarget = { index: i, text: msg.text }
+        state.chatQuoteTarget = { session_id: renderedSessionId, index: i, text: msg.text }
         state.rerender()
         focusChatComposerAtEnd()
       }
@@ -1975,7 +1989,7 @@ export async function renderChat(
   // transcript shell and the scrollable panel body.
   const composerRow = el('div', 'chat-composer-row')
   // dsh-web quote-reply: pending quote banner above the composer.
-  if (state.chatQuoteTarget !== null) {
+  if (state.chatQuoteTarget?.session_id === renderedSessionId) {
     const quoteBanner = el('div', 'chat-quote')
     quoteBanner.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:6px;background:var(--accent-soft);border:1px solid var(--accent);border-radius:8px;padding:5px 10px;font-size:10.5px;color:var(--text)'
     const qText = el('span', 'grow', t('shell', 'shell.chat.replyingTo', { text: `${state.chatQuoteTarget.text.slice(0, 70)}${state.chatQuoteTarget.text.length > 70 ? '…' : ''}` }))
@@ -2055,25 +2069,61 @@ export async function renderChat(
     }
     completionBox.style.display = 'flex'
   }
+  const attachments = createChatAttachmentController({
+    projectId,
+    sessionId: renderedSessionId,
+    composer,
+    textInput: input,
+  })
   const send = el('button', 'chat-send', '↑')
   send.setAttribute('aria-label', t('shell', 'shell.chat.sendAria'))
+  const setSubmittingControls = (submitting: boolean): void => {
+    input.disabled = submitting
+    send.disabled = submitting
+    syncModelSelector?.()
+  }
+  setSubmittingControls(chatTurnFlightStore.active(projectId, renderedSessionId))
   const run = async (): Promise<void> => {
     const line = input.value.trim()
     if (line === '') return
-    historyPush(line)
+    const originProjectId = projectId
+    const originSessionId = renderedSessionId
+    if (!chatTurnFlightStore.begin(originProjectId, originSessionId)) return
+    let finished = false
+    const finishSubmission = (): void => {
+      if (finished) return
+      finished = true
+      chatTurnFlightStore.end(originProjectId, originSessionId)
+      setSubmittingControls(false)
+      if (!input.isConnected) state.rerender()
+    }
+    const turnContext = captureChatTurnContext(originProjectId, originSessionId)
+    const turnSignal = chatTurnFlightStore.signal(originProjectId, originSessionId)
+    const queuedVision = attachments.queuedVision()
+    const visionFileIds = queuedVision.map(item => item.fileId)
+    const quote = state.chatQuoteTarget?.session_id === originSessionId ? state.chatQuoteTarget : null
+    setSubmittingControls(true)
+    const modelReady = await (waitForModelPreference?.() ?? Promise.resolve(true))
+    if (!modelReady) {
+      finishSubmission()
+      showToast(rootHost(), t('shell', 'shell.model.error'))
+      return
+    }
+    const userWritten = chatPushToProjectSession(originProjectId, originSessionId, {
+      role: 'user',
+      text: line,
+      time: new Date().toLocaleTimeString(getLocale()),
+      ...(quote === null ? {} : { quote }),
+    }, false)
+    if (!userWritten) {
+      finishSubmission()
+      return
+    }
+    consumeChatQuoteForProjectSession(originProjectId, originSessionId, quote)
+    historyPushToProject(originProjectId, line)
     input.value = ''
     state.chatDraft = ''
     completionBox.style.display = 'none'
-    // dsh-web quote-reply: attach a pending quote to this message.
-    const quote = state.chatQuoteTarget
-    state.chatQuoteTarget = null
-    // The session that launched this command (the reply lands back here
-    // even if the user switched sessions while it ran).
-    const originProjectId = projectId
-    const originSessionId = state.chatActiveId
-    chatPush('user', line, quote ?? undefined)
-    input.disabled = true
-    send.disabled = true
     // dsh-web streaming feel: a "running…" bubble while the command works.
     const runningBubble = el('div', 'chat-running')
     const spinner = el('span')
@@ -2086,10 +2136,18 @@ export async function renderChat(
     chatScrollPositions.set(scrollKey, scrollPosition)
     streamEl.scrollTop = streamEl.scrollHeight
     try {
-      const result = await executeChatTurn(line, projectId)
+      const result = await executeChatTurn(
+        line,
+        originProjectId,
+        undefined,
+        () => encodeChatVisionImages(queuedVision.map(item => item.file)),
+        turnContext,
+        turnSignal,
+      )
+      if (result.consumedVisualInputs === true) {
+        attachments.consumeVision(visionFileIds)
+      }
       const answer = result.text
-      input.disabled = false
-      send.disabled = false
       runningBubble.remove()
       // dsh-web streaming feel: reveal the answer progressively in chunks
       // (line-by-line for multi-line answers, word-wise for single lines).
@@ -2108,6 +2166,7 @@ export async function renderChat(
             time: new Date().toLocaleTimeString(getLocale()),
             ...(result.suggestedCommand === undefined ? {} : { suggested_command: result.suggestedCommand }),
           }, true)
+          finishSubmission()
           state.rerender()
           if (activeChatProjectId() === originProjectId) showToast(rootHost(), `✓ ${line.slice(0, 40)}${line.length > 40 ? '…' : ''}`)
           return
@@ -2122,14 +2181,13 @@ export async function renderChat(
       streamEl.appendChild(answerBubble)
       reveal()
     } catch (error) {
-      input.disabled = false
-      send.disabled = false
       runningBubble.remove()
       chatPushToProjectSession(originProjectId, originSessionId, {
         role: 'error',
         text: t('shell', 'shell.chat.commandFailedDetail', { detail: (error as Error).message }),
         time: new Date().toLocaleTimeString(getLocale()),
       }, true)
+      finishSubmission()
       state.rerender()
       if (activeChatProjectId() === originProjectId) showToast(rootHost(), t('shell', 'shell.chat.commandFailed'))
     }
@@ -2202,183 +2260,7 @@ export async function renderChat(
   }
   // dsh-web composer toolbar: markdown quick-inserts at the cursor.
   const toolbar = el('div', 'chat-composer-tools')
-  // INIT-GRILL-02 §2/§3: 附件按钮/拖拽/粘贴 → 同一 active Intake 的批量
-  // 分块队列。消息只保存 attachment/stage ref；scan/OCR 与 Human 确认前
-  // 不写 Project Artifact。队列状态机在 chunked-upload.ts（PURE，已测）；
-  // 浏览器视觉（真实拖拽/粘贴观感）NOT_RUN_MANUAL_PENDING。
-  const attachBtn = el('button', 'hbtn chat-attach-button', `📎 ${t('shell', 'shell.chat.attachButton')}`)
-  attachBtn.title = t('shell', 'shell.chat.attachTitle')
-  attachBtn.setAttribute('aria-label', t('shell', 'shell.chat.attachTitle'))
-  const attachInput = document.createElement('input')
-  attachInput.type = 'file'
-  attachInput.multiple = true
-  attachInput.setAttribute('aria-label', t('shell', 'shell.chat.attachTitle'))
-  attachInput.style.display = 'none'
-  const queueStrip = el('div', 'chat-composer-tools')
-  queueStrip.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:10px'
-  queueStrip.style.display = 'none'
-  let queueItems: UploadQueueItem[] = []
-  const filesById = new Map<string, File>()
-  const transport = browserTransport()
-  const renderQueue = (): void => {
-    queueStrip.replaceChildren()
-    if (queueItems.length === 0) { queueStrip.style.display = 'none'; return }
-    queueStrip.style.display = 'flex'
-    for (const item of queueItems) {
-      // 状态符号 + 文件名 + 百分比；状态名是机器值（title 原样，非 chrome）。
-      const marker = item.state === 'failed' ? '✗' : item.state === 'ready' ? '✓' : item.state === 'paused' ? '⏸' : item.state === 'uploading' ? '⏳' : '•'
-      const pct = item.fileSize > 0 ? Math.round((item.committedOffset / item.fileSize) * 100) : 0
-      const chipText = `${marker} ${item.fileName}${item.committedOffset < item.fileSize ? ` ${pct}%` : ''}`
-      const chip = el('span', 'artifact-kind', chipText)
-      chip.title = item.lastError ?? item.state
-      const actions = el('span')
-      if (item.state === 'uploading' || item.state === 'queued') {
-        const p = el('button', 'hbtn', '⏸')
-        p.title = t('shell', 'shell.chat.attachPause')
-        p.style.cssText = 'padding:0 4px;font-size:9px'
-        p.onclick = () => { queueItems = queueItems.map(x => x.fileId === item.fileId ? pauseItem(x) : x); pushRef(item); renderQueue() }
-        actions.appendChild(p)
-      } else if (item.state === 'paused') {
-        const r = el('button', 'hbtn', '▶')
-        r.title = t('shell', 'shell.chat.attachResume')
-        r.style.cssText = 'padding:0 4px;font-size:9px'
-        r.onclick = () => {
-          const resumed = resumeItem(item)
-          queueItems = queueItems.map(x => x.fileId === item.fileId ? resumed : x)
-          renderQueue()
-          void driveUpload(resumed, transport, { readBytes: (fid, s, e) => fileByteProvider(filesById).read(fid, s, e), onState: onUploadState }).then(fin => { queueItems = queueItems.map(x => x.fileId === fin.fileId ? fin : x); pushRef(fin); renderQueue() })
-        }
-        actions.appendChild(r)
-      } else if (item.state === 'failed' && item.retryCount < 3) {
-        const r = el('button', 'hbtn', '↻')
-        r.title = t('shell', 'shell.chat.attachRetry')
-        r.style.cssText = 'padding:0 4px;font-size:9px'
-        r.onclick = () => {
-          const retried = retryItem(item)
-          queueItems = queueItems.map(x => x.fileId === item.fileId ? retried : x)
-          renderQueue()
-          void driveUpload(retried, transport, { readBytes: (fid, s, e) => fileByteProvider(filesById).read(fid, s, e), onState: onUploadState }).then(fin => { queueItems = queueItems.map(x => x.fileId === fin.fileId ? fin : x); pushRef(fin); renderQueue() })
-        }
-        actions.appendChild(r)
-      }
-      chip.appendChild(actions)
-      queueStrip.appendChild(chip)
-    }
-  }
-  const uploadOrigins = new Map<string, { projectId: string; sessionId: string | null }>()
-  const pushRef = (item: UploadQueueItem): void => {
-    const ref = chatAttachmentRef(item)
-    if (ref === null) return
-    const origin = uploadOrigins.get(item.fileId)
-    if (origin === undefined || ref.project_id !== origin.projectId) return
-    chatUpsertAttachmentForProjectSession(origin.projectId, origin.sessionId, {
-      role: 'user',
-      text: `📎 ${item.fileName}`,
-      time: new Date().toLocaleTimeString(getLocale()),
-      attachment: ref,
-    })
-  }
-  const onUploadState = (item: UploadQueueItem): void => {
-    queueItems = queueItems.map(x => x.fileId === item.fileId ? item : x)
-    pushRef(item)
-    renderQueue()
-  }
-  let intakeRequest: Promise<string | null> | null = null
-  const ensureAttachmentIntake = async (): Promise<string | null> => {
-    if (intakeRequest !== null) return intakeRequest
-    intakeRequest = (async () => {
-      const intakes = await api<Array<{ intake_id?: string; status?: string }>>(`/v1/projects/${encodeURIComponent(projectId)}/intake`)
-      const existing = activeIntakeId(intakes)
-      if (existing !== null) return existing
-      const created = await apiResult<{ intake_id?: string }>(`/v1/projects/${encodeURIComponent(projectId)}/intake`, {
-        method: 'POST',
-        body: JSON.stringify(chatAttachmentBeginPayload()),
-      })
-      return created.ok && typeof created.data.intake_id === 'string' ? created.data.intake_id : null
-    })()
-    try {
-      return await intakeRequest
-    } finally {
-      intakeRequest = null
-    }
-  }
-  const attachFiles = async (files: File[]): Promise<void> => {
-    if (projectId === '' || projectId === undefined) {
-      showToast(rootHost(), t('shell', 'shell.chat.attachNoProject'))
-      return
-    }
-    const intakeId = await ensureAttachmentIntake()
-    if (intakeId === null) {
-      showToast(rootHost(), t('shell', 'shell.chat.attachIntakeFailed'))
-      return
-    }
-    const items = enqueueFiles(files.map(f => ({ name: f.name, size: f.size, type: f.type })))
-    const originSessionId = state.chatActiveId
-    for (const item of items) uploadOrigins.set(item.fileId, { projectId, sessionId: originSessionId })
-    queueItems.push(...items)
-    renderQueue()
-    for (const item of items) {
-      const file = files[items.indexOf(item)]
-      if (file === undefined) continue
-      filesById.set(item.fileId, file)
-      registerByteProvider(item.fileId, fileByteProvider(filesById))
-      let hashed = item
-      try {
-        hashed = markHashed(item, await sha256Hex(new Uint8Array(await file.arrayBuffer())))
-      } catch (error) {
-        queueItems = queueItems.map(x => x.fileId === item.fileId ? { ...x, state: 'failed' as const, lastError: (error as Error).message } : x)
-        renderQueue()
-        continue
-      }
-      hashed = { ...hashed, intakeId, projectId }
-      queueItems = queueItems.map(x => x.fileId === item.fileId ? hashed : x)
-      const fin = await driveUpload(hashed, transport, {
-        readBytes: (fid, s, e) => fileByteProvider(filesById).read(fid, s, e),
-        onState: onUploadState,
-        shouldContinue: (cur) => !queueItems.some(q => q.fileId === cur.fileId && q.state === 'paused'),
-      })
-      unregisterByteProvider(item.fileId)
-      queueItems = queueItems.map(x => x.fileId === item.fileId ? fin : x)
-      pushRef(fin)
-      if (fin.state === 'failed') {
-        chatPushToProjectSession(projectId, originSessionId, {
-          role: 'error',
-          text: t('shell', 'shell.chat.attachFailed', { name: fin.fileName, reason: fin.lastError ?? 'unknown' }),
-          time: new Date().toLocaleTimeString(getLocale()),
-        }, true)
-      } else if (fin.state === 'scanning') {
-        chatPushToProjectSession(projectId, originSessionId, {
-          role: 'assistant',
-          text: t('shell', 'shell.chat.attachStaged', { name: fin.fileName }),
-          time: new Date().toLocaleTimeString(getLocale()),
-        }, true)
-      }
-      renderQueue()
-    }
-  }
-  attachBtn.onclick = () => attachInput.click()
-  attachInput.onchange = () => {
-    const picked = [...(attachInput.files ?? [])]
-    attachInput.value = ''
-    if (picked.length > 0) void attachFiles(picked)
-  }
-  const composerDropTarget = composer
-  composerDropTarget.ondragover = (event) => { event.preventDefault(); composer.style.borderColor = 'var(--accent)' }
-  composerDropTarget.ondragleave = () => { composer.style.borderColor = '' }
-  composerDropTarget.ondrop = (event) => {
-    event.preventDefault()
-    composer.style.borderColor = ''
-    const dropped = [...(event.dataTransfer?.files ?? [])]
-    if (dropped.length > 0) void attachFiles(dropped)
-  }
-  input.onpaste = (event) => {
-    const pasted = [...(event.clipboardData?.files ?? [])]
-    if (pasted.length > 0) {
-      event.preventDefault()
-      void attachFiles(pasted)
-    }
-  }
-  composer.appendChild(attachInput)
+  composer.appendChild(attachments.fileInput)
   const mkBtn = (label: string, title: string): HTMLButtonElement => {
     const b = el('button', 'hbtn', label)
     b.title = title
@@ -2405,7 +2287,7 @@ export async function renderChat(
   listBtn.onclick = () => insertMarkdown('\n- ', '', 'item')
   // Upload remains the first toolbar action so it stays discoverable when a
   // narrow Dock clips lower-priority formatting controls.
-  toolbar.appendChild(attachBtn)
+  toolbar.appendChild(attachments.button)
   if (modelSelect !== undefined) toolbar.appendChild(modelSelect)
   toolbar.append(boldBtn, codeBtn, linkBtn, listBtn, clear)
   const attachHint = el('span', 'chat-attach-hint', t('shell', 'shell.chat.attachHint'))
@@ -2417,7 +2299,9 @@ export async function renderChat(
   // Keep attachment progress inside the composer. As a sibling of the
   // composer it became a narrow flex column and looked like there was no
   // upload surface at all.
-  composer.insertBefore(queueStrip, input)
+  composer.insertBefore(attachments.queue, input)
+  attachments.mount()
+  activeAttachmentControllers.set(dock, attachments)
   composerRow.appendChild(composer)
   dock.append(completionBox, composerRow)
   dock.hidden = false

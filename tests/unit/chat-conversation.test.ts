@@ -12,9 +12,20 @@ function json(value: unknown): Response {
 afterEach(() => {
   vi.unstubAllGlobals()
   state.chatMessages = []
+  state.chatSessions = []
+  state.chatActiveId = null
 })
 
 describe('project-scoped free conversation', () => {
+  it('does not encode pending images for a slash command', async () => {
+    const loadImages = vi.fn(async () => { throw new Error('must not encode') })
+
+    const result = await executeChatTurn('/help', 'prj_1', undefined, loadImages)
+
+    expect(result.text).toContain('/new <name>')
+    expect(loadImages).not.toHaveBeenCalled()
+  })
+
   it('records a collecting Brief answer from the ordinary Chat composer without duplicating the next question', async () => {
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input)
@@ -75,7 +86,12 @@ describe('project-scoped free conversation', () => {
       })
     })
     vi.stubGlobal('fetch', fetch)
-    state.chatMessages = [{ role: 'user', text: '调研 temporal localization', time: 'now' }]
+    state.chatSessions = [{
+      project_id: 'prj_1', id: 'session-1', name: 'Chat 1',
+      messages: [{ role: 'assistant', text: 'Prior project-scoped context', time: 'earlier' }],
+    }]
+    state.chatActiveId = 'session-1'
+    state.chatMessages = state.chatSessions[0]!.messages
     const host = vi.fn().mockResolvedValue({
       assistantText: '我可以先帮你收窄检索问题。',
       suggestedCommand: '/research should-be-rejected',
@@ -89,7 +105,7 @@ describe('project-scoped free conversation', () => {
     expect(host).toHaveBeenCalledWith(expect.objectContaining({
       text: '调研 temporal localization',
       project: expect.objectContaining({ project_id: 'prj_1', status: 'SCOPED', brief_status: 'confirmed' }),
-      history: [{ role: 'user', text: '调研 temporal localization' }],
+      history: [{ role: 'assistant', text: 'Prior project-scoped context' }],
     }))
     expect(fetch).toHaveBeenCalledTimes(3)
   })
@@ -257,6 +273,7 @@ describe('project-scoped free conversation', () => {
   })
 
   it('uses the standalone DSH model bridge for ordinary project conversation by default', async () => {
+    const controller = new AbortController()
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const path = String(input)
       if (path.endsWith('/grill')) {
@@ -282,14 +299,109 @@ describe('project-scoped free conversation', () => {
     })
     vi.stubGlobal('fetch', fetch)
 
-    const result = await executeChatTurn('我们先讨论一下哪些方向最值得做', 'prj_1')
+    const result = await executeChatTurn(
+      '我们先讨论一下哪些方向最值得做', 'prj_1', undefined, async () => [], undefined, controller.signal,
+    )
 
     expect(result.text).toContain('校准误差和长尾鲁棒性')
     const modelCall = fetch.mock.calls.find(([input]) => String(input).endsWith('/api/chat/turn'))
     expect(modelCall).toBeDefined()
+    expect(modelCall?.[1]?.signal).toBe(controller.signal)
     expect(JSON.parse(String(modelCall?.[1]?.body))).toMatchObject({
       project_id: 'prj_1', text: '我们先讨论一下哪些方向最值得做',
     })
+  })
+
+  it('forwards transient visual context only with a free conversation turn', async () => {
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/grill')) {
+        return json({
+          project_revision: 2, intake_revision: 2, question: null,
+          brief_preview: { problem: '', scope: '', primary_metrics: [], target_outputs: [] },
+          ready_to_confirm: false,
+        })
+      }
+      if (path.endsWith('/api/chat/turn') && init?.method === 'POST') {
+        return json({ operation: 'conversation', assistant_text: 'The chart plateaus after epoch 8.' })
+      }
+      if (path.includes('/v2/projects/prj_1/projection')) {
+        return json({
+          project: { project_id: 'prj_1', status: 'SURVEYING', brief_status: 'confirmed' },
+          next_actions_v2: [],
+        })
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    vi.stubGlobal('fetch', fetch)
+    const images = [{ mediaType: 'image/png' as const, data: 'aW1hZ2U=', name: 'curve.png' }]
+
+    const result = await executeChatTurn('What does this chart show?', 'prj_1', undefined, async () => images)
+
+    expect(result.consumedVisualInputs).toBe(true)
+    const modelCall = fetch.mock.calls.find(([input]) => String(input).endsWith('/api/chat/turn'))
+    expect(JSON.parse(String(modelCall?.[1]?.body))).toMatchObject({ images })
+  })
+
+  it('keeps visual context pending and explains when the selected model is text-only', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const path = String(input)
+      if (path.endsWith('/grill')) {
+        return json({
+          project_revision: 2, intake_revision: 2, question: null,
+          brief_preview: { problem: '', scope: '', primary_metrics: [], target_outputs: [] },
+          ready_to_confirm: false,
+        })
+      }
+      if (path.endsWith('/api/chat/turn')) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'vision_model_required', message: 'safe' } }), {
+          status: 422,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return json({
+        project: { project_id: 'prj_1', status: 'SURVEYING', brief_status: 'confirmed' },
+        next_actions_v2: [],
+      })
+    }))
+
+    const result = await executeChatTurn('分析图片', 'prj_1', undefined, async () => [
+      { mediaType: 'image/png', data: 'aW1hZ2U=', name: 'curve.png' },
+    ])
+
+    expect(result.text).toMatch(/模型.*图片|model.*image/i)
+    expect(result.consumedVisualInputs).toBeUndefined()
+  })
+
+  it('never turns a failed visual request into an ordinary deterministic text answer', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const path = String(input)
+      if (path.endsWith('/grill')) {
+        return json({
+          project_revision: 2, intake_revision: 2, question: null,
+          brief_preview: { problem: '', scope: '', primary_metrics: [], target_outputs: [] },
+          ready_to_confirm: false,
+        })
+      }
+      if (path.endsWith('/api/chat/turn')) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'model_unavailable', message: 'safe' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return json({
+        project: { project_id: 'prj_1', status: 'SURVEYING', brief_status: 'confirmed' },
+        next_actions_v2: [],
+      })
+    }))
+
+    const result = await executeChatTurn('分析图片', 'prj_1', undefined, async () => [
+      { mediaType: 'image/png', data: 'aW1hZ2U=', name: 'curve.png' },
+    ])
+
+    expect(result.text).toMatch(/视觉模型.*不可用|vision model.*unavailable/i)
+    expect(result.text).not.toMatch(/自由对话|discuss this freely/i)
+    expect(result.consumedVisualInputs).toBeUndefined()
   })
 
   it('freezes the originating session history before asynchronous project reads', async () => {
@@ -302,11 +414,17 @@ describe('project-scoped free conversation', () => {
         next_actions_v2: [],
       })
     }))
-    state.chatMessages = [{ role: 'user', text: 'project A history', time: 'now' }]
+    state.chatSessions = [{
+      project_id: 'prj_a', id: 'session-a', name: 'Chat A',
+      messages: [{ role: 'user', text: 'project A history', time: 'now' }],
+    }]
+    state.chatMessages = state.chatSessions[0]!.messages
+    state.chatActiveId = 'session-a'
     const host = vi.fn().mockResolvedValue({ assistantText: 'answer for A' })
 
     const pending = executeChatTurn('question for A', 'prj_a', host)
     state.chatMessages = [{ role: 'user', text: 'project B private history', time: 'later' }]
+    state.chatActiveId = 'session-b'
     releaseGrill(json({
       project_revision: 2, intake_revision: 2, question: null,
       brief_preview: { problem: '', scope: '', primary_metrics: [], target_outputs: [] },
@@ -315,6 +433,7 @@ describe('project-scoped free conversation', () => {
     await pending
 
     expect(host).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-a',
       project: expect.objectContaining({ project_id: 'prj_a' }),
       history: [{ role: 'user', text: 'project A history' }],
     }))

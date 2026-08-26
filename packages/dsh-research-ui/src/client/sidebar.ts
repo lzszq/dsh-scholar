@@ -3,7 +3,7 @@ import { api } from './api'
 import { openDeleteProjectModal, openNewProjectModal, openProjectDetailModal, openRenameModal } from './modals/project'
 import { openCompareModal } from './modals/search'
 import { openSettingsModal } from './modals/settings'
-import { favProjectToggle, favProjects, state, tabSave } from './state'
+import { chatDiscardProject, favProjectToggle, favProjects, state, tabSave } from './state'
 import { STATUS_META, copyText, el, openContextMenu, rootHost, showToast, statusLabel } from './ui'
 import { t } from './i18n/index'
 /** Sidebar search filter (dsh-web "Search sessions" feel). */
@@ -222,6 +222,7 @@ export function renderSidebar(
             onPick: () => openDeleteProjectModal(root, {
               project_id: id, name: p.name ?? id, status: p.status ?? '', revision: p.revision ?? 0,
             }, () => {
+              chatDiscardProject(id)
               if (state.projectId === id) state.projectId = undefined
               showToast(rootHost(), t('shell', 'shell.deleteProject.deleted', { name: p.name ?? id }))
               state.rerender()
@@ -288,6 +289,7 @@ export function renderSidebar(
           openDeleteProjectModal(root, {
             project_id: id, name: p.name ?? id, status: p.status ?? '', revision: p.revision ?? 0,
           }, () => {
+            chatDiscardProject(id)
             if (state.projectId === id) state.projectId = undefined
             showToast(rootHost(), t('shell', 'shell.deleteProject.deleted', { name: p.name ?? id }))
             state.rerender()

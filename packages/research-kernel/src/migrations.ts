@@ -27,7 +27,7 @@ import { METHODOLOGY_ROLLOUT_DDL } from './rollout-policy.js'
 import { ArtifactCas } from './cas.js'
 
 /** Code-side schema version; bumped only when the migration set grows. */
-export const SCHEMA_VERSION = 30
+export const SCHEMA_VERSION = 31
 
 export interface MigrationReport {
   /** Row counts per affected table (legacy import steps). */
@@ -112,6 +112,31 @@ CREATE TABLE IF NOT EXISTS full_auto_gate_idempotency (
   FOREIGN KEY (decision_id) REFERENCES decisions(decision_id)
 );
 `
+
+/** REVIEW-UPLOAD-02: mark which upload created a still-isolated Intake
+ * artifact. A late session-close abort may then compensate a finalize without
+ * deleting an artifact that pre-dated or was deduplicated by that upload. */
+const uploadAbortOwnership = (db: DatabaseSync, report: MigrationReport): void => {
+  ensureColumn(db, 'upload_sessions', 'owns_artifact', 'INTEGER NOT NULL DEFAULT 0 CHECK (owns_artifact IN (0,1))')
+  ensureColumn(db, 'upload_sessions', 'owner_scope_id', 'TEXT')
+  ensureColumn(db, 'intake_sessions', 'owner_scope_id', 'TEXT')
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_scope_tombstones (
+      project_id TEXT NOT NULL,
+      scope_id TEXT NOT NULL,
+      closed_at TEXT NOT NULL,
+      PRIMARY KEY (project_id, scope_id),
+      FOREIGN KEY (project_id) REFERENCES projects(project_id)
+    );
+  `)
+  if (report.rows === undefined) report.rows = {}
+  report.rows.upload_sessions_with_owned_artifact = Number((db.prepare(
+    'SELECT COUNT(*) AS n FROM upload_sessions WHERE owns_artifact = 1',
+  ).get() as { n: number }).n)
+  report.rows.chat_scope_tombstones = Number((db.prepare(
+    'SELECT COUNT(*) AS n FROM chat_scope_tombstones',
+  ).get() as { n: number }).n)
+}
 
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex')
@@ -1564,6 +1589,12 @@ export const MIGRATIONS: Migration[] = [
     description: 'CORRECT-02: globally bind each full-auto Gate approval key to one canonical request digest and receipt',
     body: FULL_AUTO_IDEMPOTENCY_DDL,
     up: (db) => { db.exec(FULL_AUTO_IDEMPOTENCY_DDL) },
+  },
+  {
+    id: '0034_upload_abort_ownership',
+    description: 'REVIEW-UPLOAD-02: durable Chat scope tombstones and ownership marker for session-close/upload races',
+    body: uploadAbortOwnership.toString(),
+    up: uploadAbortOwnership,
   },
 ]
 

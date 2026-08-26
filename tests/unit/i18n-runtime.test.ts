@@ -24,6 +24,27 @@ import { chromeModelChoices, chromeTabGroups, chromeTabs } from '../../packages/
 import { CHAT_COMMANDS } from '../../packages/dsh-research-ui/src/client/modals/commands'
 import { phasePipeline, statusLabel } from '../../packages/dsh-research-ui/src/client/ui'
 
+describe('live model selector capability projection', () => {
+  it('marks image-only models unavailable for Scholar Chat while marking text+image models as visual', () => {
+    const choices = chromeModelChoices([
+      { id: 'lab/image-only', name: 'Image Only', input_modalities: ['image'] },
+      { id: 'lab/empty', name: 'Empty', input_modalities: [] },
+      { id: 'lab/unknown', name: 'Unknown' },
+      { id: 'lab/vision-chat', name: 'Vision Chat', input_modalities: ['text', 'image'] },
+      { id: 'deepseek/org/dynamic', name: 'Unavailable exact model', input_modalities: [], available: false },
+    ])
+
+    expect(choices).toEqual([
+      expect.objectContaining({ id: '' }),
+      expect.objectContaining({ id: 'lab/image-only', disabled: true, visual: false }),
+      expect.objectContaining({ id: 'lab/empty', disabled: true, visual: false }),
+      expect.objectContaining({ id: 'lab/unknown', disabled: false, visual: false }),
+      expect.objectContaining({ id: 'lab/vision-chat', disabled: false, visual: true }),
+      expect.objectContaining({ id: 'deepseek/org/dynamic', disabled: true, visual: false }),
+    ])
+  })
+})
+
 interface Report { namespace: string; key: string; locale: 'zh' | 'en' }
 
 let reports: Report[] = []
@@ -118,16 +139,22 @@ describe('i18n runtime: locale switching (acceptance §8 line 135)', () => {
   })
 
   it('model selector choices re-evaluate with the locale', () => {
+    const runtimeModels = [
+      { id: 'deepseek-official/text', name: 'Text', input_modalities: ['text'] as const },
+      { id: 'deepseek-official/vision', name: 'Vision', input_modalities: ['text', 'image'] as const },
+    ]
     setLocale('zh')
-    const zhModels = chromeModelChoices()
+    const zhModels = chromeModelChoices(runtimeModels)
     setLocale('en')
-    const enModels = chromeModelChoices()
+    const enModels = chromeModelChoices(runtimeModels)
     expect(enModels.map(m => m.id)).toEqual(zhModels.map(m => m.id))
     // Model names are proper nouns (identical in both locales), but the
     // 'auto' seat is real copy and must differ.
     for (const m of enModels) expect(m.label).not.toBe('')
     expect(zhModels.find(m => m.id === '')!.label).toBe('自动（默认）')
     expect(enModels.find(m => m.id === '')!.label).toBe('Auto (default)')
+    expect(enModels.find(m => m.id.endsWith('/vision'))!.label).toBe('👁 Vision')
+    expect(enModels.find(m => m.id.endsWith('/text'))!.label).toBe('Text')
   })
 
   it('direct command descriptions re-evaluate from i18n keys', () => {

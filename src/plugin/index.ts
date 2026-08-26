@@ -40,6 +40,7 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-user-questions'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import * as SkillFilesystem from '@deepseek-ai/dsh-skill-filesystem'
@@ -47,6 +48,7 @@ import { mkdtempSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { KernelUnavailableError, ResearchClient } from '@dsh-scholar/research-client'
+import { parseScholarModelId } from '@dsh-scholar/research-schemas/chat-agent'
 import { Engine as ResearchOrchestrator, type EngineRuntimeStatus } from '@dsh-scholar/research-orchestrator'
 import { buildPassages, DiskCache, multiSourceSearch } from '@dsh-scholar/scholar-connectors'
 import { KernelSidecar, resolveDshHome } from './sidecar.js'
@@ -56,7 +58,7 @@ import { RESEARCH_HUMAN_CONFIRMATION_TOOLS, RoleRegistry, RESEARCH_TOOLS, stageP
 import { resolveExistingSkillDirs, selectSkillPacks, selectedSkillNames, type SkillSelection } from './skills.js'
 import { readStandaloneAccessToken } from './standalone-token.js'
 import { createScholarRpcHandler, createScholarViewRpcHandler } from './settings-rpc.js'
-import { createHarnessScholarAgent } from './chat-agent.js'
+import { createHarnessScholarAgent, scholarChatModelPreference } from './chat-agent.js'
 import { ScholarAgentBridge } from './chat-agent-service.js'
 import { projectCreateIdempotencyKey } from './native-chat.js'
 import {
@@ -271,7 +273,8 @@ function standaloneModelPreference(): string {
   try {
     const raw = readFileSync(join(standaloneDataDir(), STANDALONE_MODEL_FILE), 'utf8')
     const parsed = JSON.parse(raw) as { model?: unknown }
-    return typeof parsed.model === 'string' ? parsed.model : ''
+    const model = typeof parsed.model === 'string' ? parsed.model.trim() : ''
+    return parseScholarModelId(model) === null ? '' : model
   } catch {
     return ''
   }
@@ -328,11 +331,19 @@ export async function apply(ctx: Context, config: ResearchPluginConfig = {}): Pr
   // through the authenticated loopback bridge started after the Kernel is
   // healthy. The callback tracks the optional DSH llm service lifecycle.
   let scholarAgent: ReturnType<typeof createHarnessScholarAgent> | undefined
+  let scholarAttachments: AttachmentStore | undefined
   if (typeof ctx.inject === 'function') {
+    ctx.inject(['attachments'], attachmentCtx => {
+      const store = attachmentCtx.attachments
+      scholarAttachments = store
+      return attachmentCtx.effect(() => () => {
+        if (scholarAttachments === store) scholarAttachments = undefined
+      }, 'research-plugin.chat-agent-attachments')
+    })
     ctx.inject(['llm'], llmCtx => {
       const handler = createHarnessScholarAgent(
         llmCtx.llm,
-        () => effectiveConfig.models?.pi ?? standaloneModelPreference(),
+        () => scholarChatModelPreference(effectiveConfig.models?.pi, standaloneModelPreference()),
         async (request, signal) => {
           const client = knowledgeClient
           if (client === undefined || knowledgePrincipal === '') throw new Error('Scholar Knowledge delivery is unavailable')
@@ -341,6 +352,7 @@ export async function apply(ctx: Context, config: ResearchPluginConfig = {}): Pr
             surface: 'scholar-chat',
           }, signal)
         },
+        () => scholarAttachments,
       )
       scholarAgent = handler
       return llmCtx.effect(() => () => {
@@ -478,28 +490,6 @@ export async function apply(ctx: Context, config: ResearchPluginConfig = {}): Pr
     ctx.logger('research').error(`research orchestrator stopped unexpectedly: ${(error as Error).message}`)
   })
 
-  // The standalone BFF and this plugin are separate processes. Publish a
-  // private loopback endpoint + one-time bearer under their shared local
-  // data directory; neither value is exposed to the browser or settings.
-  if (typeof ctx.inject === 'function') {
-    const agentBridge = new ScholarAgentBridge({
-      dataDir: standaloneDataDir(),
-      handler: () => scholarAgent,
-      log: line => ctx.logger('research').info(line),
-    })
-    ctx.effect(() => () => agentBridge.stop(), 'research-plugin.chat-agent-bridge')
-    try {
-      await agentBridge.start()
-    } catch (error) {
-      ctx.logger('research').error(`Scholar agent bridge failed to start: ${(error as Error).message}`)
-      throw error
-    }
-    if (disposed) {
-      await agentBridge.stop()
-      return
-    }
-  }
-
   // The endpoint getter is only read AFTER start: with `port: 0` it resolves
   // the real bound port from the kernel's 0600 runtime/endpoint.json; with a
   // fixed port the kernel is verified healthy on it (SIDE-01 identity gate).
@@ -523,6 +513,28 @@ export async function apply(ctx: Context, config: ResearchPluginConfig = {}): Pr
     if (knowledgeClient === client) knowledgeClient = undefined
     knowledgePrincipal = ''
   }, 'research-plugin.knowledge-delivery')
+
+  // Publish the private model bridge only after every request precondition is
+  // ready. In particular, a discoverable bridge must never expose a model
+  // handler whose exact-session Knowledge delivery is still uninitialized.
+  if (typeof ctx.inject === 'function') {
+    const agentBridge = new ScholarAgentBridge({
+      dataDir: standaloneDataDir(),
+      handler: () => scholarAgent,
+      log: line => ctx.logger('research').info(line),
+    })
+    ctx.effect(() => () => agentBridge.stop(), 'research-plugin.chat-agent-bridge')
+    try {
+      await agentBridge.start()
+    } catch (error) {
+      ctx.logger('research').error(`Scholar agent bridge failed to start: ${(error as Error).message}`)
+      throw error
+    }
+    if (disposed) {
+      await agentBridge.stop()
+      return
+    }
+  }
   const roles = new RoleRegistry()
   const projectScopes = new Map<string, string>()
   const stageSubagents = new StageSubagentCoordinator({

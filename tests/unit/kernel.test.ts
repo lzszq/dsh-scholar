@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { createHash, generateKeyPairSync, sign, type KeyObject } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { ResearchKernel, KernelError } from '@dsh-scholar/research-kernel'
@@ -392,6 +392,23 @@ describe('project state machine', () => {
       request_id: 'req_delete_1',
     }), 409, 'project_not_archived')
 
+    const intake = kernel.beginIntake({ project_id: project.project_id, source_label: 'delete-cleanup' })
+    const upload = kernel.beginUploadSession(intake.intake_id, {
+      file_name: 'partial.bin',
+      media_type: 'application/octet-stream',
+      expected_size: 6,
+    })
+    const chunk = Buffer.from('abc')
+    kernel.appendUploadChunk(intake.intake_id, upload.upload_id, {
+      bytes: chunk,
+      contentRange: 'bytes 0-2/6',
+      chunkSha256: createHash('sha256').update(chunk).digest('hex'),
+    })
+    const uploadPart = join(kernel.intakeStagedRoot, intake.intake_id, `${upload.upload_id}.part`)
+    expect(existsSync(uploadPart)).toBe(true)
+    expect(kernel.db.prepare('SELECT project_id, status FROM upload_sessions WHERE upload_id = ?').get(upload.upload_id))
+      .toEqual({ project_id: project.project_id, status: 'open' })
+
     const archived = kernel.archiveProject(project.project_id)
     const receipt = kernel.deleteProject({
       project_id: project.project_id,
@@ -409,6 +426,15 @@ describe('project state machine', () => {
     })
     expect(kernel.listProjects()).toEqual([])
     expectKernelError(() => kernel.getProject(project.project_id), 404, 'project_not_found')
+    expect(kernel.db.prepare('SELECT upload_id, project_id, status FROM upload_sessions WHERE project_id = ?').all(project.project_id))
+      .toEqual([])
+    expect(kernel.db.prepare('SELECT COUNT(*) AS n FROM upload_chunks WHERE upload_id = ?').get(upload.upload_id))
+      .toEqual({ n: 0 })
+    expect(existsSync(uploadPart)).toBe(false)
+    expectKernelError(() => kernel.beginUploadSession(intake.intake_id, {
+      file_name: 'late.bin', expected_size: 1,
+    }), 404, 'project_not_found')
+    expectKernelError(() => kernel.listUploadSessions(intake.intake_id), 404, 'project_not_found')
     const deleted = kernel.listEvents(project.project_id).filter(event => event.kind === 'project.deleted')
     expect(deleted).toHaveLength(1)
     expect(deleted[0]?.payload).toMatchObject({ project_id: project.project_id, deleted_by: 'pi_owner', request_id: 'req_delete_1' })

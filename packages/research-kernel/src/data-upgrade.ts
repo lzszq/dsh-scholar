@@ -37,7 +37,7 @@ const MERGE_SIDE_EFFECT_TRIGGERS = [
 const MERGE_TABLES = [
   'methodology_rollout_policies',
   'projects', 'project_members', 'budget',
-  'gates', 'decisions', 'budget_block_provenance', 'full_auto_gate_idempotency',
+  'gates', 'decisions', 'budget_block_provenance', 'full_auto_gate_idempotency', 'chat_scope_tombstones',
   'ideas', 'contracts', 'corpus_snapshots', 'code_snapshots',
   'jobs', 'runs', 'artifacts', 'evidence', 'claims', 'events', 'session_links', 'manuscripts',
   'methodology_project_rollout_events',

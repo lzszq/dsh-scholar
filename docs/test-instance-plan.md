@@ -19,7 +19,7 @@
 
 - Node.js 24；
 - pnpm 11；
-- DSH 当前安装基线是 `@deepseek-ai/dsh@next`，每次安装必须记录实际解析的精确版本；本文更新时为 `0.1.0-rc.8`；
+- DSH 当前安装基线是 `@deepseek-ai/dsh@next`，每次安装必须记录实际解析的精确版本；本文更新时 `latest` 与 `next` 均为 `0.1.1-rc.2`，并必须与 `config/dsh-baseline.json` 一致；
 - 只有 DSH 宿主开发或补充兼容性排查才需要源码 checkout，通过 DSH_SCHOLAR_DSH_ROOT 指定；checkout 结果不替代 `@next` 精确版本验收；
 - DSH 发布兼容性验收需要私有 registry URL、短期只读 token、固定 `@deepseek-ai/dsh` spec 和已发布/可安装的固定 Scholar plugin spec；这些 secret 不写仓库 `.npmrc`；
 - Docker，用于正式 Job、Terminal、Golden、TeX 和 clean-room；
@@ -58,7 +58,7 @@ Scholar 尚未发布时，当前标准安装路径是先安装 DSH 的 `next` ta
 
 ~~~bash
 npm install -g @deepseek-ai/dsh@next
-npm ls -g @deepseek-ai/dsh --depth=0  # 本文更新时应记录 0.1.0-rc.8
+npm ls -g @deepseek-ai/dsh --depth=0  # 本文更新时应记录 0.1.1-rc.2
 cd /absolute/path/to/dsh-scholar
 pnpm install --frozen-lockfile
 pnpm run build
@@ -87,14 +87,14 @@ Agent 集成验收必须证明 tools、commands、subagents、四组 Skills 可�
 ~~~bash
 DSH_PRIVATE_REGISTRY_URL=https://registry.example.invalid \
 DSH_PRIVATE_REGISTRY_TOKEN='<short-lived-read-token>' \
-DSH_PRIVATE_DSH_SPEC='@deepseek-ai/dsh@0.1.0-rc.8' \
+DSH_PRIVATE_DSH_SPEC='@deepseek-ai/dsh@0.1.1-rc.2' \
 DSH_SCHOLAR_PLUGIN_SPEC='@dsh-scholar/research-plugin@0.1.0' \
 bash tests/integration/run-dsh-private-registry-tests.sh
 ~~~
 
 脚本自行创建全新安装目录、`DSH_HOME` 和权限 0600 的临时 npm userconfig；输出必须脱敏。缺少真实 registry/credential 时登记 `NOT_RUN_MANUAL_PENDING`，本地 symlink/fake host 不计 PASS。
 
-需要在 Scholar 尚未发布时验证“当前 DSH host 能否安装当前产物”，允许执行一次性 local artifact smoke：从 registry 的 `next` dist-tag 解析并安装 `@deepseek-ai/dsh@next`，随后记录实际安装的精确 `@deepseek-ai/dsh@x.y.z`（本文更新时为 `0.1.0-rc.8`）；把根插件及其所有未发布的本地 `@dsh-scholar/*` 运行时 workspace 包分别经正式 build + pack 生成 `.tgz`，在 `mktemp` 的空 launcher 与独立 `DSH_HOME` 中以 tgz dependency/override 安装完整集合。当前开发阶段不要求单个根插件 tgz 从 registry 解析这些明确未发布的内部包，相关 404 不能判作 DSH 兼容失败；通过条件是所有 Scholar package realpath 均位于临时 profile、没有 checkout symlink，并完成 profile compose/dump、Cordis apply、限定时间存活和 SIGTERM dispose。该 PASS 只证明“当前 `next` host + 当前本地打包集合”的安装/启动兼容性，必须记录 host 精确版本与根插件 tarball hash；不能替代上一段“所有正式发布依赖均可从 registry 固定版本安装”的发布兼容 PASS。临时 npm userconfig 权限必须为 0600，token 只能从进程环境写入，不得出现在 argv、日志或报告，测试结束必须删除临时目录。
+需要在 Scholar 尚未发布时验证“当前 DSH host 能否安装当前产物”，允许执行一次性 local artifact smoke：从 registry 的 `next` dist-tag 解析并安装 `@deepseek-ai/dsh@next`，随后记录实际安装的精确 `@deepseek-ai/dsh@x.y.z`（本文更新时为 `0.1.1-rc.2`）；把根插件及其所有未发布的本地 `@dsh-scholar/*` 运行时 workspace 包分别经正式 build + pack 生成 `.tgz`，在 `mktemp` 的空 launcher 与独立 `DSH_HOME` 中以 tgz dependency/override 安装完整集合。当前开发阶段不要求单个根插件 tgz 从 registry 解析这些明确未发布的内部包，相关 404 不能判作 DSH 兼容失败；通过条件是所有 Scholar package realpath 均位于临时 profile、没有 checkout symlink，并完成 profile compose/dump、Cordis apply、限定时间存活和 SIGTERM dispose。该 PASS 只证明“当前 `next` host + 当前本地打包集合”的安装/启动兼容性，必须记录 host 精确版本与根插件 tarball hash；不能替代上一段“所有正式发布依赖均可从 registry 固定版本安装”的发布兼容 PASS。临时 npm userconfig 权限必须为 0600，token 只能从进程环境写入，不得出现在 argv、日志或报告，测试结束必须删除临时目录。
 
 ## 6. 开发模式启用 Cordis self-referential
 
@@ -168,6 +168,7 @@ CI 中 Docker、TeX、Golden、clean-room 不允许因为依赖缺失而 skip �
 
 ## 11. 运维检查
 
+- 当 Nginx 直接绑定 Tailscale 地址时，不能只依赖 `tailscaled.service` 或普通 `network-online.target`：`tailscaled` 进入 active 后接口/IP 仍可能尚未就绪。Nginx 的 systemd drop-in 必须 `Wants=tailscale-online.target` 且 `After=tailscale-online.target`，复用 Tailscale 自带的 `tailscale wait`，再执行 Nginx 配置检查与绑定。冷启动验收必须确认 Tailscale IP 已存在、Nginx active、目标 443 地址监听且 HTTPS 反代可达；禁止用固定 sleep 或人工重启掩盖竞态；
 - health instance/protocol/schema/database 匹配；
 - migration 与 backup 成功；
 - DB WAL、CAS 空间、孤儿 Blob、过期 lease、孤儿容器；

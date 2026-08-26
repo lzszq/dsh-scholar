@@ -79,7 +79,7 @@ Tab 可收藏，Alt+1…9 切换。上表全部当前业务页面都必须提供
 - 项目投影默认每 8 秒刷新；页面隐藏时暂停，恢复可见立即刷新；
 - 活动 Terminal 使用 SSE，不能由 8 秒轮询或本地逐字动画模拟；
 - TeX save 使用 expected_version，build 使用 expected_document_revision；
-- 请求可取消；页面从主区/Dock 离开或 Dock 关闭时清理 listener、Blob URL 和 stream，仍在可见 Dock 中的页面不得被普通 tab cleanup 错误停止；
+- 请求可取消；页面从主区/Dock 离开或 Dock 关闭时主动 dispose attachment listener，并清理 Blob URL 和 stream，仍在可见 Dock 中的页面不得被普通 tab cleanup 错误停止；关闭 Chat session/删除项目还必须把 exact turn 的取消信号贯穿 BFF 与模型 bridge；
 - 401 只允许一次 session refresh 重试；之后回到解锁/登录，不无限循环；
 - UI 不保存权威业务状态，只缓存选择、布局、草稿和 lastSeq。
 - NextAction、Intake、Trajectory 和 Topology 都读取 Kernel/BFF projection；浏览器不从文案推断状态或因果；
@@ -90,9 +90,13 @@ Tab 可收藏，Alt+1…9 切换。上表全部当前业务页面都必须提供
 
 ## 4. Chat
 
-支持会话新建、切换、重命名、固定、复制、归档、搜索、导出 JSON/Markdown 和最多 200 条本地 transcript。Chat session 必须携带 `project_id`，session 列表、active id、transcript、草稿、引用回复、附件引用和搜索状态按项目分区持久化；项目切换是显式 context switch，不得继续复用固定全局 storage key。异步命令和附件上传必须同时捕获 origin project + origin session，完成时只回写原项目；附件 `project_id` 与当前项目不一致时 fail closed。Chat 同时是 name-only Init 的 Grill Me 主界面：active Init Intake 时，当前权威问题作为 transcript 末尾的 assistant turn 显示，自由文本统一从页面唯一的普通 composer 提交，服务端返回 next question、Brief preview 和下一步；禁止在 composer 外再渲染 textarea/提交按钮或重复显示 next question。跳过/暂时未知是问题消息内的快捷动作，Brief ready 时 PI confirm 也是下一条明确的 Human action。模型文本和服务器 raw error 原样显示；问题 label、CTA、状态、已知错误、aria 等 UI chrome 翻译。
+支持会话新建、切换、重命名、固定、复制、归档、搜索、导出 JSON/Markdown 和最多 200 条本地 transcript。Chat session 必须携带 `project_id`，session 列表、active id、transcript、草稿、引用回复、附件引用和搜索状态按项目分区持久化；项目切换是显式 context switch，不得继续复用固定全局 storage key。异步命令和附件上传必须同时捕获 origin project + origin session，完成时只回写原项目；附件 `project_id` 与当前项目不一致时 fail closed。项目删除建立本地 project tombstone、删除三个 transcript/context key、取消所有活动 turn并清 visual/upload scope，迟到回调不得重新创建 scope；server open stage 由 Kernel 在 tombstone 事务内权威清理，不能依赖删除后的浏览器 abort。外部删除只有在 project list 成功且 projection 404 时清本地数据，网络/5xx 保留。每次 Chat Dock/page `replaceChildren` 或隐藏前必须 dispose 附件 controller，释放 store subscription、drag/drop、paste 和 input handler。Chat 同时是 name-only Init 的 Grill Me 主界面：active Init Intake 时，当前权威问题作为 transcript 末尾的 assistant turn 显示，自由文本统一从页面唯一的普通 composer 提交，服务端返回 next question、Brief preview 和下一步；禁止在 composer 外再渲染 textarea/提交按钮或重复显示 next question。跳过/暂时未知是问题消息内的快捷动作，Brief ready 时 PI confirm 也是下一条明确的 Human action。模型文本和服务器 raw error 原样显示；问题 label、CTA、状态、已知错误、aria 等 UI chrome 翻译。
 
-Composer 的输入分派顺序固定为：显式 `/...` → direct command；active Grill/current question → 单题 Human answer；其余 project-scoped prose → natural turn。Natural turn 先读取权威 `next_actions_v2`，再把文本解析为 canonical operation intent；status/ideas/gates/jobs/claims 等只读意图可直接执行，明确的 Agent 动作可在本次发送构成确认后执行，Human-only、blocked、unknown、歧义或参数不完整动作只返回候选命令/参数和可达页面，禁止浏览器或模型猜状态、Gate、revision 或 capability。Standalone 与 DSH 插件是不同进程：普通自由对话只能经插件拥有的 authenticated loopback model bridge 调用当前 DSH `llm` service；endpoint/token 只写共享本地数据目录中的 `0600` 非 symlink 文件，绝不发送到浏览器、Settings、日志或 transcript。自由对话直接消费有界纯文本模型流，再由插件封装 strict reply；不能要求模型生成 JSON，也不能从自由文本推导或执行写操作。只有 IdeaDraft 等写入候选继续使用严格结构化模型输出。没有可用模型调用 adapter 时也必须接受普通文本并返回确定性阶段引导，不能退回 `Unknown command`；模型可用时其回答仍不能改变 Kernel 投影或绕过 canonical operation。
+Composer 的输入分派顺序固定为：显式 `/...` → direct command；active Grill/current question → 单题 Human answer；其余 project-scoped prose → natural turn。Natural turn 先读取权威 `next_actions_v2`，再把文本解析为 canonical operation intent；status/ideas/gates/jobs/claims 等只读意图可直接执行，明确的 Agent 动作可在本次发送构成确认后执行，Human-only、blocked、unknown、歧义或参数不完整动作只返回候选命令/参数和可达页面，禁止浏览器或模型猜状态、Gate、revision 或 capability。Standalone 与 DSH 插件是不同进程：普通自由对话只能经插件拥有的 authenticated loopback model bridge 调用当前 DSH `llm` service；同一版本的 endpoint/token 只作为共享本地数据目录中的单个原子 `0600 agent-bridge.json` 普通文件发布，绝不发送到浏览器、Settings、日志或 transcript，也不保留旧双文件兼容读。自由对话直接消费有界纯文本模型流，再由插件封装 strict reply；不能要求模型生成 JSON，也不能从自由文本推导或执行写操作。只有 IdeaDraft 等写入候选继续使用严格结构化模型输出。没有可用模型调用 adapter 时也必须接受普通文本并返回确定性阶段引导，不能退回 `Unknown command`；模型可用时其回答仍不能改变 Kernel 投影或绕过 canonical operation。
+
+成功读取 project list 后还要对账后台 Chat scopes：枚举 transcript、upload、vision、turn 与 attachment-flight 五类 page-lifetime store 的项目并集，不能依赖 localStorage 写入成功；列表缺失者逐一请求 projection，只有明确 404 才执行 `chatDiscardProject`。因此在 B 工作时由另一 tab/API 删除 A，也会取消 A 的 Intake/hash/upload/model turn、释放 File/queue/vision 并删 snapshot；暂时断网或 5xx 不清任何后台 scope。
+
+显式关闭 session 必须先封死本地 exact scope，再把 Kernel Chat-scope tombstone 写入 transcript 之外的 durable outbox。outbox 落盘后可立即移除 session；storage 失败时保持 session 可见直到服务端 ACK，项目激活与成功列表刷新重放失败项。Chat 附件取得 Intake 时必须始终 `POST` scoped begin 并携带 session id，由 Kernel 原子选择 unscoped/same-scope Intake 或创建新 Intake；禁止客户端先 GET 后无 scope 复用任意 active Intake。upload 若未显式给 owner，必须继承 Intake 的持久化 owner。AbortSignal 贯穿请求和 hash；客户端即使在取消边界收到 finalize 成功也必须补偿 abort。页面重绘、切换、关闭按钮和项目删除不得通过创建新 controller 重新开放已关闭 scope。
 
 同样的自然语言体验必须覆盖 DSH 本体 Chat，而不是只存在于 standalone composer。`research-core` Skill 指示 Harness Agent 在用户表达研究意图时调用单一 `dsh_scholar` façade，并原样传递文本；工具按当前 DSH session 绑定项目、执行受控 intent、返回本地化回答与最新阶段。项目处于 Brief collecting 时，工具通过正式注入的 Host `ctx.userQuestions.ask()` 一次展示一个问题，把 exact live root Agent 和调用 AbortSignal 原样交还 DSH 原生 composer takeover UI；free text 记为 answered，原生 Skip 记为 skipped，“暂时未知”选项记为 unknown。每次回答前重新读取 link 与 question code/revision，全部收集后只引导到 Scholar 由 PI confirm，不自动决策 Gate。缺少 userQuestions service/provider 时插件启动或提问 fail closed，禁止恢复旧内嵌表单。Agent 不应要求用户先手写 slash；当动作不能安全自动执行时，回答要帮助生成可编辑的一级 slash command，并解释所需 Human/Agent/Runner 与阻断项。
 
@@ -266,7 +270,7 @@ OCR-UI-01：MinerU 配置使用独立纵向表单，内部按服务商、项目�
 
 Execution advanced 内含可编辑 Runner Target/Profile Registry：目标类型明确显示“本机进程（仅 trusted dev/smoke）”“本机 Docker”“远程 SSH”，配置 label、capabilities、resource/network policy、enabled/draining 与 revision/hash；remote-ssh 表单只提交服务端连接配置和 SecretRef 元数据，私钥/token 不回显。项目和实验只用 opaque target/profile picker，显示健康/能力与 pin；offline、host-key mismatch 或 capability mismatch 给出可操作阻断信息，不提供隐式本机回退按钮。所有 label、validation、secret availability、health、aria 具备 zh/en parity。
 
-Start 的 New Project modal 只含 project name；创建成功立即进入 Chat Grill。Upload 是多文件队列，支持 8 MiB 分块、暂停/恢复/取消、offset/hash 冲突、扫描和 OCR 状态。配置项收缩在 Settings 折叠组，不在创建流程铺开。切换语言不得清空项目名、当前 Grill answer 或队列。
+Start 的 New Project modal 只含 project name；创建成功立即进入 Chat Grill。Upload 是多文件队列，默认请求 8 MiB 但每次实际 PUT 使用服务端 begin/list 协商的 chunk cap，并支持暂停/恢复/取消、offset/hash 冲突、失效 stage 重建、扫描和 OCR 状态；begin/append 在途 pause 与 owner close 都必须 race-safe。配置项收缩在 Settings 折叠组，不在创建流程铺开。切换语言不得清空项目名、当前 Grill answer 或队列。
 
 业务页只显示当前策略摘要和“调整”链接，不常驻展开高级项。运行中 Job/PTY/Build 标注 pinned config hash，修改配置只影响新动作。Patch 使用 revision CAS，409 展示 base/current/local；不支持的 target/capability 不隐藏成默认值。
 

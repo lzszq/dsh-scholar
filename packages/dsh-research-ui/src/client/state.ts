@@ -10,10 +10,22 @@ import { getLocale, registerOverlayRebuild, t } from './i18n/index'
 import { ALL_TAB_KEYS } from './nav'
 import {
   appendStoredChatMessage,
+  appendStoredChatHistory,
+  consumeStoredChatQuote,
+  deleteChatProjectSnapshot,
+  listChatProjectSnapshotIds,
   loadChatProjectSnapshot,
   saveChatProjectSnapshot,
   type ChatProjectSnapshot,
+  type ChatQuoteTarget,
 } from './chat-project-store'
+import { chatVisionTurnStore } from './chat-vision'
+import { chatUploadStore } from './chat-upload-store'
+import { browserTransport } from './chunked-upload'
+import { chatTurnFlightStore } from './chat-turn-flight'
+import { chatAttachmentFlightStore } from './chat-attachment-flight'
+import { chatScopeCloseStore } from './chat-scope-close-store'
+import { apiResult } from './api'
 
 export let favProjects = new Set<string>()
 
@@ -34,7 +46,7 @@ export const state = {
   chatHistory: [] as string[],
   historyIndex: -1,
   chatDetailIndex: -1,
-  chatQuoteTarget: null as { index: number; text: string } | null,
+  chatQuoteTarget: null as ChatQuoteTarget | null,
   chatSearchQuery: '',
   chatCommandsOnly: false,
   chatSessionSearchQuery: '',
@@ -244,9 +256,26 @@ export const CHAT_MAX = 200
 /** Multi-session chats (dsh-web session tabs), persisted. */
 export const SESSIONS_KEY = 'dsh-scholar-ui-sessions'
 let chatContextProjectId: string | null = null
+const discardedChatProjects = new Set<string>()
 
 export function activeChatProjectId(): string | null {
   return chatContextProjectId
+}
+
+/** Page scopes that may still own transcript/File/turn state even while a
+ * different project is selected. Used only after an authoritative list read. */
+export function chatTrackedProjectIds(): string[] {
+  const ids = new Set<string>(chatContextProjectId === null ? [] : [chatContextProjectId])
+  try {
+    for (const projectId of listChatProjectSnapshotIds(localStorage)) ids.add(projectId)
+    chatScopeCloseStore.hydrate(localStorage)
+  } catch { /* private mode */ }
+  for (const projectId of chatUploadStore.projectIds()) ids.add(projectId)
+  for (const projectId of chatVisionTurnStore.projectIds()) ids.add(projectId)
+  for (const projectId of chatTurnFlightStore.projectIds()) ids.add(projectId)
+  for (const projectId of chatAttachmentFlightStore.projectIds()) ids.add(projectId)
+  for (const projectId of chatScopeCloseStore.projectIds()) ids.add(projectId)
+  return [...ids]
 }
 
 function currentChatSnapshot(projectId: string): ChatProjectSnapshot {
@@ -281,7 +310,9 @@ function resetChatContext(): void {
 /** Switch the browser-only transcript to one project, persisting the old one. */
 export function chatActivateProject(projectId: string): void {
   if (chatContextProjectId === projectId) return
-  if (chatContextProjectId !== null) chatSessionsPersist()
+  if (chatContextProjectId !== null) {
+    chatSessionsPersist()
+  }
   resetChatContext()
   chatContextProjectId = projectId
   const snapshot = loadChatProjectSnapshot(localStorage, projectId)
@@ -295,10 +326,14 @@ export function chatActivateProject(projectId: string): void {
   state.chatCommandsOnly = snapshot.commandsOnly
   state.chatSessionSearchQuery = snapshot.sessionSearchQuery
   chatSessionEnsure()
+  try { chatScopeCloseStore.hydrate(localStorage) } catch { /* private mode */ }
+  void flushChatScopeCloseOutbox(projectId)
 }
 
 export function chatDeactivateProject(): void {
-  if (chatContextProjectId !== null) chatSessionsPersist()
+  if (chatContextProjectId !== null) {
+    chatSessionsPersist()
+  }
   chatContextProjectId = null
   resetChatContext()
 }
@@ -328,8 +363,9 @@ export function chatSessionEnsure(): void {
   if (projectId === null) return
   state.chatSessions = state.chatSessions.filter(session => session.project_id === projectId)
   if (state.chatSessions.length === 0) {
-    state.chatSessions = [{ project_id: projectId, id: 'default', name: 'Chat 1', messages: [] }]
-    state.chatActiveId = 'default'
+    const id = `s-${crypto.randomUUID()}`
+    state.chatSessions = [{ project_id: projectId, id, name: 'Chat 1', messages: [] }]
+    state.chatActiveId = id
   }
   if (state.chatActiveId === null || !state.chatSessions.some(s => s.id === state.chatActiveId)) {
     state.chatActiveId = state.chatSessions[0]!.id
@@ -338,7 +374,7 @@ export function chatSessionEnsure(): void {
 }
 export function chatSessionNew(): void {
   if (chatContextProjectId === null) return
-  const id = `s${Date.now()}`
+  const id = `s-${crypto.randomUUID()}`
   state.chatSessions.push({ project_id: chatContextProjectId, id, name: `Chat ${state.chatSessions.length + 1}`, messages: [] })
   state.chatActiveId = id
   state.chatDraft = ''
@@ -346,9 +382,24 @@ export function chatSessionNew(): void {
   chatSessionsPersist()
   state.rerender()
 }
-export function chatSessionClose(id: string): void {
-  const idx = state.chatSessions.findIndex(s => s.id === id)
+const chatScopeCloseRequests = new Map<string, Promise<boolean>>()
+
+function removeChatSessionLocally(projectId: string, id: string): void {
+  if (chatContextProjectId !== projectId) {
+    try {
+      const snapshot = loadChatProjectSnapshot(localStorage, projectId)
+      const idx = snapshot.sessions.findIndex(session => session.id === id && session.project_id === projectId)
+      if (idx < 0) return
+      snapshot.sessions.splice(idx, 1)
+      if (snapshot.activeId === id) snapshot.activeId = snapshot.sessions[Math.min(idx, snapshot.sessions.length - 1)]?.id ?? null
+      if (snapshot.quoteTarget?.session_id === id) snapshot.quoteTarget = null
+      saveChatProjectSnapshot(localStorage, snapshot)
+    } catch { /* outbox retry remains authoritative */ }
+    return
+  }
+  const idx = state.chatSessions.findIndex(session => session.id === id && session.project_id === projectId)
   if (idx < 0) return
+  if (state.chatQuoteTarget?.session_id === id) state.chatQuoteTarget = null
   state.chatSessions.splice(idx, 1)
   if (state.chatSessions.length === 0) chatSessionEnsure()
   if (state.chatActiveId === id) {
@@ -358,6 +409,85 @@ export function chatSessionClose(id: string): void {
   chatSyncActive()
   chatSessionsPersist()
   state.rerender()
+}
+
+function requestChatScopeClose(projectId: string, sessionId: string): Promise<boolean> {
+  const key = `${projectId}\u0000${sessionId}`
+  const existing = chatScopeCloseRequests.get(key)
+  if (existing !== undefined) return existing
+  const request = (async (): Promise<boolean> => {
+    const result = await apiResult<{ ok: true }>(
+      `/v1/projects/${encodeURIComponent(projectId)}/chat-scopes/${encodeURIComponent(sessionId)}/tombstone`,
+      { method: 'POST', body: '{}' },
+    )
+    // A deleted project is a stronger tombstone; no retry is needed.
+    if (!result.ok && result.status !== 404) return false
+    try { chatScopeCloseStore.complete(localStorage, projectId, sessionId) } catch { /* stale outbox replays idempotently */ }
+    removeChatSessionLocally(projectId, sessionId)
+    return true
+  })().finally(() => { chatScopeCloseRequests.delete(key) })
+  chatScopeCloseRequests.set(key, request)
+  return request
+}
+
+export async function flushChatScopeCloseOutbox(projectId?: string): Promise<void> {
+  try { chatScopeCloseStore.hydrate(localStorage) } catch { /* page-lifetime entries remain */ }
+  await Promise.all(chatScopeCloseStore.entries(projectId).map(item => requestChatScopeClose(item.projectId, item.sessionId)))
+}
+
+export function chatSessionClose(id: string): void {
+  const projectId = chatContextProjectId
+  if (projectId === null || !state.chatSessions.some(session => session.id === id && session.project_id === projectId)) return
+  // Publish every page-lifetime tombstone before any asynchronous close I/O.
+  const discarded = chatUploadStore.clear(projectId, id)
+  chatAttachmentFlightStore.cancel(projectId, id)
+  chatTurnFlightStore.cancel(projectId, id)
+  chatVisionTurnStore.clear(projectId, id)
+  let durable = false
+  try { durable = chatScopeCloseStore.enqueue(localStorage, projectId, id) } catch { /* keep the visible session until server ACK */ }
+  if (durable) removeChatSessionLocally(projectId, id)
+  void requestChatScopeClose(projectId, id)
+  const transport = browserTransport()
+  for (const item of discarded) {
+    if (item.uploadId === null || item.intakeId === null || item.projectId !== projectId) continue
+    void transport.abort({ project_id: projectId, intake_id: item.intakeId, upload_id: item.uploadId }).catch(() => {})
+  }
+}
+
+/** Exact project/session liveness fence for delayed model, Intake and upload
+ * continuations. Project switches persist the session; explicit close makes
+ * it disappear and therefore rejects all late writes. */
+export function chatSessionExists(projectId: string, sessionId: string): boolean {
+  if (discardedChatProjects.has(projectId)) return false
+  if (chatContextProjectId === projectId) {
+    return state.chatSessions.some(session => session.project_id === projectId && session.id === sessionId)
+  }
+  try {
+    return loadChatProjectSnapshot(localStorage, projectId).sessions.some(
+      session => session.project_id === projectId && session.id === sessionId,
+    )
+  } catch {
+    return false
+  }
+}
+
+/** Explicit destructive cleanup; ordinary navigation deliberately retains
+ * the page-lifetime File handles and persisted queue metadata. */
+export function chatDiscardProject(projectId: string): void {
+  discardedChatProjects.add(projectId)
+  chatAttachmentFlightStore.cancelProject(projectId)
+  chatTurnFlightStore.cancelProject(projectId)
+  chatVisionTurnStore.clearProject(projectId)
+  // Project deletion is authoritative in the Kernel, which removes every
+  // open server-side stage before the project becomes unreadable. The browser
+  // only owns its local queue and must not issue doomed post-tombstone aborts.
+  chatUploadStore.clearProject(projectId)
+  try { chatScopeCloseStore.clearProject(localStorage, projectId) } catch { /* project authority already deleted */ }
+  try { deleteChatProjectSnapshot(localStorage, projectId) } catch { /* private mode */ }
+  if (chatContextProjectId === projectId) {
+    chatContextProjectId = null
+    resetChatContext()
+  }
 }
 export function chatSessionSelect(id: string): void {
   if (state.chatSessions.some(s => s.id === id)) {
@@ -469,6 +599,18 @@ export function historyPush(line: string): void {
   chatSessionsPersist()
 }
 
+export function historyPushToProject(projectId: string, line: string): boolean {
+  if (chatContextProjectId === projectId) {
+    historyPush(line)
+    return true
+  }
+  try {
+    return appendStoredChatHistory(localStorage, projectId, line)
+  } catch {
+    return false
+  }
+}
+
 /** Restore transcripts persisted in localStorage (dsh-web session tabs). */
 export function chatLoad(projectId?: string): void {
   if (projectId !== undefined) chatActivateProject(projectId)
@@ -511,6 +653,26 @@ export function chatPushToProjectSession(projectId: string, sessionId: string | 
     return true
   }
   try { return appendStoredChatMessage(localStorage, projectId, sessionId, message, markUnread) } catch { return false }
+}
+
+/** Clear a quote only after its exact project/session turn was accepted. */
+export function consumeChatQuoteForProjectSession(
+  projectId: string,
+  sessionId: string,
+  expected: ChatQuoteTarget | null,
+): boolean {
+  if (expected === null || expected.session_id !== sessionId) return false
+  if (chatContextProjectId === projectId) {
+    const current = state.chatQuoteTarget
+    if (
+      current === null || current.session_id !== sessionId
+      || current.index !== expected.index || current.text !== expected.text
+    ) return false
+    state.chatQuoteTarget = null
+    chatSessionsPersist()
+    return true
+  }
+  try { return consumeStoredChatQuote(localStorage, projectId, sessionId, expected) } catch { return false }
 }
 
 export function chatUpsertAttachmentForProjectSession(projectId: string, sessionId: string | null, message: ChatMessage): boolean {

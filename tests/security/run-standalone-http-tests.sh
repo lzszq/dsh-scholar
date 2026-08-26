@@ -166,20 +166,24 @@ R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$WEB_PORT/a
 # ── model preference seat (/api/model): catalog + persist + authz ──────────
 R=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/api/model")
 [ "$R" = "401" ] && ok "MODEL: /api/model without token -> 401" || fail "MODEL: no-token /api/model -> $R"
+printf '%s\n' '{"model":"obsolete-unqualified-model"}' > "$DATA/model.json"
 M=$(curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$WEB_PORT/api/model")
-if echo "$M" | grep -q 'deepseek-v4-flash' && echo "$M" | grep -q '"ok":true'; then
-  ok "MODEL: GET /api/model with token -> catalog + current preference"
+if echo "$M" | grep -q '"available":false' && echo "$M" | grep -q '"models":\[\]' && echo "$M" | grep -q '"model":""' && echo "$M" | grep -q '"ok":true'; then
+  ok "MODEL: GET without DSH bridge -> unavailable catalog and obsolete preference is inert"
 else
   fail "MODEL: GET /api/model payload -> $M"
 fi
 R=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$WEB_PORT/api/model" \
   -H "Authorization: Bearer $TOKEN" -H "Origin: http://127.0.0.1:$WEB_PORT" -H "x-csrf-token: $CSRF" -H 'content-type: application/json' -d '{"model":"deepseek-v4-pro"}')
-[ "$R" = "200" ] && ok "MODEL: PUT /api/model persists (deepseek-v4-pro)" || fail "MODEL: PUT persist -> $R"
+[ "$R" = "503" ] && ok "MODEL: model selection without live DSH catalog -> 503" || fail "MODEL: unavailable catalog selection -> $R"
 M=$(curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$WEB_PORT/api/model")
-echo "$M" | grep -q '"model":"deepseek-v4-pro"' && ok "MODEL: preference re-read after persist" || fail "MODEL: re-read -> $M"
+echo "$M" | grep -q '"model":""' && ok "MODEL: unavailable selection leaves preference unchanged" || fail "MODEL: re-read -> $M"
 R=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$WEB_PORT/api/model" \
   -H "Authorization: Bearer $TOKEN" -H "Origin: http://127.0.0.1:$WEB_PORT" -H "x-csrf-token: $CSRF" -H 'content-type: application/json' -d '{"model":"gpt-unknown"}')
-[ "$R" = "422" ] && ok "MODEL: unknown model -> 422" || fail "MODEL: unknown model -> $R"
+[ "$R" = "503" ] && ok "MODEL: unknown model cannot bypass unavailable live catalog -> 503" || fail "MODEL: unknown model -> $R"
+R=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$WEB_PORT/api/model" \
+  -H "Authorization: Bearer $TOKEN" -H "Origin: http://127.0.0.1:$WEB_PORT" -H "x-csrf-token: $CSRF" -H 'content-type: application/json' -d '{"model":"auto"}')
+[ "$R" = "200" ] && ok "MODEL: auto reset remains available without model bridge" || fail "MODEL: auto reset -> $R"
 R=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$WEB_PORT/api/model" \
   -H "Authorization: Bearer $TOKEN" -H "x-csrf-token: $CSRF" -H 'Origin: http://evil.example' -H 'content-type: application/json' -d '{"model":"deepseek-v4-flash"}')
 [ "$R" = "403" ] && ok "MODEL: foreign-origin PUT + valid csrf -> 403" || fail "MODEL: foreign origin -> $R"
