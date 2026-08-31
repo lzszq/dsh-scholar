@@ -8,7 +8,7 @@
 import type {
   AdoptionReceipt, ArtifactRecord, AssuranceAudit, AssuranceSemanticReviewReceipt, ChildExecutionIdentity, Claim, CorpusSnapshot, Decision, DirectionAdoption, DirectionProposal,
   EvidenceItem, ExperimentContract, Gate,
-  GrillAnswerInput, GrillAnswerView, HumanPrincipal, IdeaCard, IntakeArtifact, IntakeProjection, IntakeSession,
+  GrillAnswerView, IdeaCard, IntakeArtifact, IntakeProjection, IntakeSession,
   JobRecord, KernelEvent, KnowledgeActivationIntent, KnowledgeActivationRequest, KnowledgeCapability, KnowledgePackageEvaluation, KnowledgePackageRecord, ObservedPhase,
   PaperRef, PaperReproductionSpec, PhaseProposal, ProjectDeletionReceipt, ProtocolRevision,
   FrozenProtocolPin, JobSpecBound, ResearchIntent,
@@ -21,6 +21,9 @@ import type {
   WritingPatchProposal, WritingPatchProposalWrite, WritingPatchApplication, WritingPatchApplyInput,
   WritingAssuranceAuditKind,
   MethodologyRolloutMode, MethodologyRolloutPolicy, ProjectMethodologyRolloutPin,
+  OcrRequest, OcrRequestCreateInput, OcrRequestView,
+  ConfigEffectiveSafeView, ConfigLayerSafeView, ConfigWriteScope,
+  SettingsWriteTransactionInput, SettingsWriteTransactionReceipt,
 } from '@dsh-scholar/research-schemas'
 
 export class KernelUnavailableError extends Error {
@@ -452,6 +455,36 @@ export class ResearchClient {
 
   health(): Promise<{ ok: boolean; instance: string }> {
     return this.request('GET', '/v1/health')
+  }
+
+  // ── canonical Settings transaction (REVIEW-CONFIG-WRITE-03) ────────────
+
+  configEffective(context: { project_id?: string } = {}): Promise<ConfigEffectiveSafeView> {
+    const query = new URLSearchParams()
+    if (context.project_id !== undefined) query.set('project_id', context.project_id)
+    const suffix = query.size === 0 ? '' : `?${query.toString()}`
+    return this.request('GET', `/v1/config/effective${suffix}`)
+  }
+
+  configLayer(scope: ConfigWriteScope, scopeId: string): Promise<ConfigLayerSafeView> {
+    return this.request('GET', `/v1/config/layers/${encodeURIComponent(scope)}/${encodeURIComponent(scopeId)}`)
+  }
+
+  configRevisions(scope: ConfigWriteScope, scopeId: string): Promise<Array<{
+    revision_id: string
+    scope: ConfigWriteScope
+    scope_id: string
+    revision: number
+    changes: Record<string, unknown>
+    config_pin: string
+    updated_by: string
+    updated_at: string
+  }>> {
+    return this.request('GET', `/v1/config/revisions/${encodeURIComponent(scope)}/${encodeURIComponent(scopeId)}`)
+  }
+
+  writeSettingsTransaction(input: SettingsWriteTransactionInput): Promise<SettingsWriteTransactionReceipt> {
+    return this.request('POST', '/v1/settings/transactions', input)
   }
 
   // ── methodology / knowledge (api-contracts.md §24) ──────────────────────
@@ -990,7 +1023,6 @@ export class ResearchClient {
     jobs: Array<{ job_id: string; kind: string; status: string }>
     budget: Record<string, unknown>
     counts: Record<string, number>
-    next_actions: string[]
     /** GUIDE-01: structured next-step projection (kernel-authoritative). */
     next_actions_v2: Array<{
       id: string
@@ -1090,6 +1122,21 @@ export class ResearchClient {
     return this.request('GET', `/v1/projects/${projectId}/intake/${encodeURIComponent(intakeId)}`)
   }
 
+  /** Create one exact, pinned asynchronous OCR request. */
+  createOcrRequest(intakeId: string, input: OcrRequestCreateInput, idempotencyKey: string): Promise<OcrRequest> {
+    return this.request('POST', `/v2/intakes/${encodeURIComponent(intakeId)}/ocr-requests`, input, { 'idempotency-key': idempotencyKey })
+  }
+
+  /** Read durable OCR status and safe result/error refs. */
+  getOcrRequest(intakeId: string, requestId: string): Promise<OcrRequestView> {
+    return this.request('GET', `/v2/intakes/${encodeURIComponent(intakeId)}/ocr-requests/${encodeURIComponent(requestId)}`)
+  }
+
+  /** Cancel queued/running OCR; terminal cancellation replay is idempotent. */
+  cancelOcrRequest(intakeId: string, requestId: string): Promise<OcrRequest> {
+    return this.request('DELETE', `/v2/intakes/${encodeURIComponent(intakeId)}/ocr-requests/${encodeURIComponent(requestId)}`)
+  }
+
   /**
    * Stage ONE file into the isolated intake staging CAS (multipart, ≤32 MiB,
    * server-computed sha256; identical bytes are content-addressed idempotent).
@@ -1128,11 +1175,6 @@ export class ResearchClient {
   /** Deterministic Grill Me question set for the session's target phase. */
   intakeQuestions(projectId: string, intakeId: string): Promise<{ questions: GrillAnswerView[] }> {
     return this.request('GET', `/v1/projects/${projectId}/intake/${encodeURIComponent(intakeId)}/questions`)
-  }
-
-  /** Record Grill Me answers (provenance recorded server-side per principal). */
-  submitIntakeAnswers(projectId: string, intakeId: string, answers: GrillAnswerInput[], principal: HumanPrincipal): Promise<IntakeProjection> {
-    return this.request('POST', `/v1/projects/${projectId}/intake/${encodeURIComponent(intakeId)}/answers`, { answers, principal })
   }
 
   /** Deterministic PhaseProposal; the intake then waits for a Human PI. */

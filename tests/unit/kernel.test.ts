@@ -22,12 +22,15 @@ import { signManifest as signRunnerManifest } from '../../workers/runner-gateway
 const NODE_IMAGE_DIGEST = 'node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32'
 const TEXLIVE_IMAGE_DIGEST = 'texlive/texlive@sha256:8957c916b8160049f89c24d362a6d86c09d8a04095acde37e88404c4afed85b4'
 
-function freshKernel(): ResearchKernel {
+function freshKernel(options: { serviceToken?: string } = {}): ResearchKernel {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-kernel-test-'))
   // RUN-01: signed manifests are the production default; unit tests that do
   // not exercise the signature path opt out explicitly (the signature path
   // itself is covered by run-manifest-tests.sh + the manifest unit cases).
-  return new ResearchKernel({ dbPath: join(dir, 'kernel.db'), casRoot: join(dir, 'cas'), requireSignedManifest: false })
+  return new ResearchKernel({
+    dbPath: join(dir, 'kernel.db'), casRoot: join(dir, 'cas'), requireSignedManifest: false,
+    serviceToken: options.serviceToken,
+  })
 }
 
 /** Register a minimal valid §11.3 code-snapshot archive artifact. */
@@ -78,6 +81,9 @@ function createConfiguredProject(
 ) {
   return kernel.createProject({
     ...input,
+    ...(input.session_id !== undefined && input.session_id !== null && input.creator_principal_id === undefined
+      ? { creator_principal_id: 'test-session-owner', creator_tenant_id: 'test-tenant', session_issuer: 'kernel' as const }
+      : {}),
     execution: {
       runner_profile_id: RUNNER_PROFILE_IDS.localDockerCpu,
       ...(input.execution ?? {}),
@@ -247,8 +253,7 @@ function fencePair(kernel: ResearchKernel, jobId: string): [number | null, strin
 function secureManifest(kernel: ResearchKernel, job: { job_id: string; project_id: string }, metricsArtifact: string, seed?: number | null): Record<string, unknown> {
   const bound = kernel.getJob(job.job_id)
   return {
-    run_id: bound.run_id ?? 'run_x',
-    job_id: job.job_id,
+    ...identityManifest(kernel, job),
     code_commit: 'c',
     code_snapshot_id: bound.code_snapshot_id ?? null,
     container_digest: bound.image_digest !== '' ? `docker:${bound.image_digest}` : '',
@@ -292,12 +297,22 @@ function signManifest(manifest: Record<string, unknown>, privateKey: KeyObject, 
  * container_digest/data_hash (kernel verifySecureRunFacts enforces them for
  * secure kinds).
  */
-function makeManifest(kernel: ResearchKernel, job: { job_id: string; project_id: string }, metricsArtifact: string): Record<string, unknown> {
+function identityManifest(kernel: ResearchKernel, job: { job_id: string; project_id: string }): Record<string, unknown> {
   const bound = kernel.getJob(job.job_id)
   return {
     run_id: bound.run_id ?? 'run_test_1',
     job_id: job.job_id,
     project_id: job.project_id,
+    contract_id: bound.contract_id,
+    config_pin: bound.payload.project_config_pin,
+    lease: { generation: bound.lease_generation },
+  }
+}
+
+function makeManifest(kernel: ResearchKernel, job: { job_id: string; project_id: string }, metricsArtifact: string): Record<string, unknown> {
+  const bound = kernel.getJob(job.job_id)
+  return {
+    ...identityManifest(kernel, job),
     code_commit: 'abc123',
     code_snapshot_id: bound.code_snapshot_id ?? null,
     container_digest: bound.image_digest !== '' ? `docker:${bound.image_digest}` : '',
@@ -747,7 +762,7 @@ describe('durable jobs', () => {
     // Manifest referencing a missing artifact must be rejected.
     expect(() => kernel.completeJob({
       job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded',
-      run_manifest: { metrics_artifact: 'sha256:' + 'a'.repeat(64) },
+      run_manifest: { ...identityManifest(kernel, job), metrics_artifact: 'sha256:' + 'a'.repeat(64) },
     })).toThrow(/missing artifacts/)
     kernel.close()
   })
@@ -849,7 +864,9 @@ describe('§11.2 recovery & concurrency cases', () => {
     const kernel = freshKernel()
     const project = createConfiguredProject(kernel, { name: 't', workspace: '/w', brief: makeBrief(), session_id: 'session-old' })
     // Resume = a fresh DSH session continues the project via explicit link.
-    const link = kernel.linkSession('session-new', project.project_id)
+    const link = kernel.linkSession('session-new', project.project_id, {
+      principal_id: 'test-session-owner', tenant_id: 'test-tenant', issuer: 'kernel',
+    })
     expect(link.project_id).toBe(project.project_id)
     expect(kernel.getProjectBySession('session-old')?.project_id).toBe(project.project_id)
     expect(kernel.getProjectBySession('session-new')?.project_id).toBe(project.project_id)
@@ -1149,22 +1166,35 @@ describe('CONFIG-01 canonical Config Registry integration', () => {
 
   it('GET /v1/config/effective serves the redacted deployment config with its pin', async () => {
     const { startKernelServer } = await import('../../packages/research-kernel/lib/server.js')
-    const kernel = freshKernel()
-    const deploymentRedacted = { 'kernel.port': 7413, 'kernel.token': '<redacted>', 'kernel.service_token': '<redacted>' }
-    const deploymentPin = 'sha256:' + 'a'.repeat(64)
-    const { server, port } = await startKernelServer({
-      kernel, port: 0, configPinHash: deploymentPin, configRedacted: deploymentRedacted,
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-kernel-config-http-'))
+    const kernel = new ResearchKernel({
+      dbPath: join(dir, 'kernel.db'), casRoot: join(dir, 'cas'), requireSignedManifest: false,
+      serviceToken: 'service-secret',
+      runtimeConfig: {
+        'kernel.port': 7413,
+        'kernel.token': 'Bearer-secret',
+        'kernel.service_token': 'service-secret',
+      },
     })
+    const { server, port } = await startKernelServer({ kernel, port: 0, token: 'Bearer-secret' })
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/v1/config/effective`)
+      const res = await fetch(`http://127.0.0.1:${port}/v1/config/effective`, {
+        headers: { authorization: 'Bearer Bearer-secret' },
+      })
       expect(res.status).toBe(200)
       const body = await res.json() as { config_pin?: string; config?: Record<string, unknown> }
-      expect(body.config_pin).toBe(deploymentPin)
-      expect(body.config).toEqual(deploymentRedacted)
+      expect(body.config_pin).toBe(kernel.configPinHash)
+      expect(body.config).toMatchObject({
+        'kernel.port': 7413,
+        'kernel.token': '<redacted>',
+        'kernel.service_token': '<redacted>',
+      })
       // secrets are redacted in the plaintext surface
       expect(JSON.stringify(body)).not.toContain('Bearer')
       // unknown config sub-resources 404
-      const nope = await fetch(`http://127.0.0.1:${port}/v1/config/whatever`)
+      const nope = await fetch(`http://127.0.0.1:${port}/v1/config/whatever`, {
+        headers: { authorization: 'Bearer Bearer-secret' },
+      })
       expect(nope.status).toBe(404)
     } finally {
       server.close()
@@ -1377,7 +1407,10 @@ describe('corpus + ideas + manuscript', () => {
   it('CAS-fences an automatic corpus snapshot by project revision', () => {
     const kernel = freshKernel()
     const project = createConfiguredProject(kernel, { name: 'cas-survey', workspace: '/w', brief: makeBrief(), session_id: 'session_a' })
-    const other = createConfiguredProject(kernel, { name: 'other', workspace: '/other', brief: makeBrief() })
+    const other = createConfiguredProject(kernel, {
+      name: 'other', workspace: '/other', brief: makeBrief(),
+      creator_principal_id: 'test-session-owner', creator_tenant_id: 'test-tenant',
+    })
     const corpus = fixtureCorpus(project.project_id)
     expect(() => kernel.snapshotCorpus({
       project_id: project.project_id,
@@ -1386,7 +1419,9 @@ describe('corpus + ideas + manuscript', () => {
       papers: corpus.papers,
     })).toThrow(/expected revision/)
     expect(kernel.listCorpusSnapshots(project.project_id)).toHaveLength(0)
-    kernel.linkSession('session_a', other.project_id)
+    kernel.linkSession('session_a', other.project_id, {
+      principal_id: 'test-session-owner', tenant_id: 'test-tenant', issuer: 'kernel',
+    })
     expect(() => kernel.snapshotCorpus({
       project_id: project.project_id,
       expected_revision: project.revision,
@@ -1395,7 +1430,9 @@ describe('corpus + ideas + manuscript', () => {
       papers: corpus.papers,
     })).toThrow(/no longer linked/)
     expect(kernel.listCorpusSnapshots(project.project_id)).toHaveLength(0)
-    kernel.linkSession('session_a', project.project_id)
+    kernel.linkSession('session_a', project.project_id, {
+      principal_id: 'test-session-owner', tenant_id: 'test-tenant', issuer: 'kernel',
+    })
     const snapshot = kernel.snapshotCorpus({
       project_id: project.project_id,
       expected_revision: project.revision,
@@ -1548,22 +1585,20 @@ describe('§12.6 lease fencing (SCH-JOB-001)', () => {
     kernel.close()
   })
 
-  it('STORE-06: fencing compares sha256(token) against the hash column — old rows with an EMPTY hash still fence via the legacy payload token', () => {
+  it('STORE-06: missing hashes and obsolete plaintext payload keys fail closed', () => {
     const kernel = freshKernel()
     const project = createConfiguredProject(kernel, { name: 't', workspace: '/w', brief: makeBrief() })
     const job = submitTestJob(kernel, { project_id: project.project_id, idempotency_key: 'hash2', kind: 'smoke' })
     const [claimed] = kernel.claimJobs('runner-1', 60, 8)
-    // Simulate a legacy row (claimed by the pre-0014 release): hash column
-    // empty, plaintext token recorded in payload.__lease_token.
-    kernel.db.prepare('UPDATE jobs SET lease_token_hash = NULL, payload = ? WHERE job_id = ?')
-      .run(JSON.stringify({ __lease_token: claimed!.lease_token, note: 'legacy' }), claimed!.job_id)
-    // Heartbeat + complete with the token still pass through the legacy path.
-    const h = kernel.heartbeatJob(job.job_id, 'runner-1', ...fencePair(kernel, job.job_id))
-    expect(h.heartbeat_at).not.toBeNull()
-    // A WRONG token is still rejected on the legacy path (fail-closed).
-    expectKernelError(() => kernel.heartbeatJob(job.job_id, 'runner-1', claimed!.lease_generation ?? 0, 'wrong-token'), 409, 'lease_stale')
-    const done = kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded' })
-    expect(done.status).toBe('succeeded')
+    kernel.db.prepare('UPDATE jobs SET lease_token_hash = NULL WHERE job_id = ?').run(claimed!.job_id)
+    expectKernelError(
+      () => kernel.heartbeatJob(job.job_id, 'runner-1', claimed!.lease_generation ?? 0, claimed!.lease_token ?? ''),
+      409,
+      'lease_stale',
+    )
+    kernel.db.prepare('UPDATE jobs SET payload = ? WHERE job_id = ?')
+      .run(JSON.stringify({ __lease_token: claimed!.lease_token, note: 'obsolete' }), claimed!.job_id)
+    expect(() => kernel.getJob(job.job_id)).toThrow(/obsolete plaintext lease storage/)
     kernel.close()
   })
 
@@ -1673,7 +1708,7 @@ describe('§12.7 manifest signature (SCH-MANIFEST-001)', () => {
     kernel.close()
   })
 
-  it('binds nested resources and lease facts into the Runner manifest signature', () => {
+  it('binds nested resources and lease generation into the signature and rejects persisted lease secrets', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-nested-manifest-sig-'))
     const kernel = new ResearchKernel({
       dbPath: join(dir, 'kernel.db'), casRoot: join(dir, 'cas'), requireSignedManifest: true,
@@ -1690,14 +1725,11 @@ describe('§12.7 manifest signature (SCH-MANIFEST-001)', () => {
     })
     const bound = kernel.getJob(job.job_id)
     const signed = signRunnerManifest({
-      run_id: claimed!.run_id,
-      job_id: job.job_id,
-      project_id: project.project_id,
+      ...identityManifest(kernel, job),
       exit_code: 0,
       resources: { cpu: 8, memory_gb: 32 },
       environment: { image: 'fixture@sha256:' + 'a'.repeat(64), variables: { LC_ALL: 'C.UTF-8' } },
       outputs: { metrics: { artifact_id: 'sha256:' + 'b'.repeat(64), rows: 1 } },
-      lease: { generation: bound.lease_generation, token: bound.lease_token },
     }, { privateKey, keyId })
 
     const resourceTamper = structuredClone(signed)
@@ -1712,15 +1744,24 @@ describe('§12.7 manifest signature (SCH-MANIFEST-001)', () => {
     expect(kernel.getJob(job.job_id).status).toBe('running')
 
     const leaseTamper = structuredClone(signed)
-    ;(leaseTamper.lease as { token: string }).token = 'lt_nested_tamper'
+    ;(leaseTamper.lease as { generation: number }).generation = 99
     expectKernelError(
       () => kernel.completeJob({
         job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id),
         status: 'succeeded', run_manifest: leaseTamper,
       }),
-      422, 'manifest_hash_mismatch',
+      422, 'manifest_lease_mismatch',
     )
     expect(kernel.getJob(job.job_id).status).toBe('running')
+
+    const leakedLease = { ...signed, lease: { generation: bound.lease_generation, token: bound.lease_token } }
+    expectKernelError(
+      () => kernel.completeJob({
+        job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id),
+        status: 'succeeded', run_manifest: leakedLease,
+      }),
+      422, 'manifest_lease_secret',
+    )
 
     const done = kernel.completeJob({
       job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id),
@@ -1766,9 +1807,9 @@ describe('§12.7 manifest signature (SCH-MANIFEST-001)', () => {
   })
 
   it('requireSignedManifest (kernel option) rejects unsigned manifests', () => {
-    const { kernel, job } = signedJobSetup({ requireSignedManifest: true })
+    const { kernel, job, metrics } = signedJobSetup({ requireSignedManifest: true })
     expectKernelError(
-      () => kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded', run_manifest: { run_id: 'run_x', exit_code: 0 } }),
+      () => kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded', run_manifest: makeManifest(kernel, job, metrics.artifact_id) }),
       422, 'manifest_signature_required',
     )
     kernel.close()
@@ -1792,7 +1833,7 @@ describe('§12.7 manifest signature (SCH-MANIFEST-001)', () => {
     kernel.close()
   })
 
-  it('RUN-01: requireSignedManifest:false explicitly accepts unsigned manifests (compat path)', () => {
+  it('RUN-01: requireSignedManifest:false explicitly accepts an unsigned current manifest', () => {
     const { kernel, job, metrics } = signedJobSetup({ requireSignedManifest: false })
     const done = kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded', run_manifest: makeManifest(kernel, job, metrics.artifact_id) })
     expect(done.status).toBe('succeeded')
@@ -1801,12 +1842,12 @@ describe('§12.7 manifest signature (SCH-MANIFEST-001)', () => {
   })
 
   it('project integrity require_signed_manifest rejects unsigned manifests', () => {
-    const { kernel, job } = signedJobSetup()
+    const { kernel, job, metrics } = signedJobSetup()
     // Flag stored on the project's integrity record (raw JSON, read verbatim).
     kernel.db.prepare('UPDATE projects SET integrity = ? WHERE project_id = ?')
       .run(JSON.stringify({ require_signed_manifest: true }), job.project_id)
     expectKernelError(
-      () => kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded', run_manifest: { run_id: 'run_x', exit_code: 0 } }),
+      () => kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded', run_manifest: makeManifest(kernel, job, metrics.artifact_id) }),
       422, 'manifest_signature_required',
     )
     kernel.close()
@@ -1819,6 +1860,17 @@ describe('§12.7 manifest signature (SCH-MANIFEST-001)', () => {
     expectKernelError(
       () => kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded', run_manifest: manifest }),
       422, 'manifest_job_mismatch',
+    )
+    kernel.close()
+  })
+
+  it('manifest config pin must match the durable Job project pin', () => {
+    const { kernel, job, metrics } = signedJobSetup()
+    const manifest = makeManifest(kernel, job, metrics.artifact_id)
+    manifest.config_pin = `sha256:${'f'.repeat(64)}`
+    expectKernelError(
+      () => kernel.completeJob({ job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded', run_manifest: manifest }),
+      422, 'manifest_config_mismatch',
     )
     kernel.close()
   })
@@ -1908,14 +1960,14 @@ describe('RUN-REMOTE-01 §5 两行：secure kinds run_id 全链 + required facts
     kernel.close()
   })
 
-  it('非 secure kinds（analysis/smoke/echo）不受 facts 强制——缺 run_id/metrics 仍接受（legacy 兼容）', () => {
+  it('non-secure kinds can omit scientific facts but still require exact current identity', () => {
     const kernel = freshKernel()
     const project = createConfiguredProject(kernel, { name: 'fixture-facts', workspace: '/w', brief: makeBrief() })
     const job = submitTestJob(kernel, { project_id: project.project_id, idempotency_key: 'fx1', kind: 'analysis', payload: { metric: 'm' } })
     kernel.claimJobs('runner-1', 60, 8)
     const done = kernel.completeJob({
       job_id: job.job_id, owner: 'runner-1', ...fenceArgs(kernel, job.job_id), status: 'succeeded',
-      run_manifest: { run_id: 'run_fake_fx', job_id: job.job_id, exit_code: 0 },
+      run_manifest: { ...identityManifest(kernel, job), exit_code: 0 },
     })
     expect(done.status).toBe('succeeded')
     kernel.close()
@@ -2519,13 +2571,13 @@ describe('RUN-01 runs ledger + GOV-01 principal + v2 roles', () => {
     kernel.completeJob({
       job_id: job.job_id, owner: 'runner-1', status: 'succeeded',
       lease_generation: claimed!.lease_generation!, lease_token: claimed!.lease_token!,
-      run_manifest: { run_id: 'run_x', job_id: job.job_id, code_commit: 'c', started_at: new Date().toISOString(), finished_at: new Date().toISOString(), exit_code: 0 },
+      run_manifest: { ...identityManifest(kernel, job), code_commit: 'c', started_at: new Date().toISOString(), finished_at: new Date().toISOString(), exit_code: 0 },
     })
     runs = kernel.listRuns(project.project_id)
     expect(runs.length).toBe(1)
     expect(runs[0]!.signature_status).toBe('unsigned')
     expect(runs[0]!.finished_at).not.toBeNull()
-    expect((runs[0]!.manifest_json as Record<string, unknown> | null)?.run_id).toBe('run_x')
+    expect((runs[0]!.manifest_json as Record<string, unknown> | null)?.run_id).toBe(claimed!.run_id)
     expect(runs[0]!.run_id).toMatch(/^run_[a-z2-7]{16,}$/)
     kernel.close()
   })
@@ -2706,7 +2758,8 @@ describe('GOV-01 Human Gate HTTP boundary', () => {
 
   it('internal contract approve route keeps actor-only semantics (orchestrator channel)', async () => {
     const { startKernelServer } = await import('../../packages/research-kernel/lib/server.js')
-    const kernel = freshKernel()
+    const serviceToken = 'contract-approval-service-token'
+    const kernel = freshKernel({ serviceToken })
     const project = createConfiguredProject(kernel, { name: 'gov-approve', workspace: '/w', brief: makeBrief() })
     const contract = kernel.registerContract({
       project_id: project.project_id, idea_id: 'idea_x', data: { dataset_id: 'd' }, methods: { baseline: 'b', treatment: 'a' },
@@ -2715,7 +2768,7 @@ describe('GOV-01 Human Gate HTTP boundary', () => {
     const { server, port } = await startKernelServer({ kernel, port: 0 })
     try {
       const res = await fetch(`http://127.0.0.1:${port}/v1/projects/${project.project_id}/contracts/${contract.contract_id}/approve`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-service-token': serviceToken },
         body: JSON.stringify({ actor: 'orchestrator-1' }),
       })
       expect(res.status).toBe(200)
@@ -2817,7 +2870,8 @@ describe('v2 x-principal-role capability checks (API-01)', () => {
 describe('v1 PI-only intake adopt / archive / unarchive (GOV-01/ONBOARD-01 §5 P1)', () => {
   it('kernel second layer: researcher/viewer 403 role_forbidden, non-member 404, missing principal 422, pi succeeds', async () => {
     const { startKernelServer } = await import('../../packages/research-kernel/lib/server.js')
-    const kernel = freshKernel()
+    const serviceToken = 'intake-human-service-token'
+    const kernel = freshKernel({ serviceToken })
     const project = createConfiguredProject(kernel, {
       name: 'p1', workspace: '/w', brief: makeBrief(), creator_principal_id: 'ops-1',
     } as never)
@@ -2828,8 +2882,14 @@ describe('v1 PI-only intake adopt / archive / unarchive (GOV-01/ONBOARD-01 §5 P
     const { server, port } = await startKernelServer({ kernel, port: 0 })
     try {
       const base = `http://127.0.0.1:${port}`
-      const H = (principalId: string): Record<string, string> => ({ 'content-type': 'application/json', 'x-principal-id': principalId })
-      const adoptBody = JSON.stringify({ principal: { principal_id: 'ops-1' }, expected_proposal_revision: 1 })
+      const H = (principalId: string): Record<string, string> => ({
+        'content-type': 'application/json',
+        'x-service-token': serviceToken,
+        'x-service-principal': 'standalone-human-bff',
+        'x-principal-id': principalId,
+        'x-principal-session': `session-${principalId}`,
+      })
+      const adoptBody = JSON.stringify({ expected_proposal_revision: 1 })
       // The kernel resolves the role from its OWN project_members table: a
       // researcher-role principal is 403 role_forbidden on all three routes.
       for (const [path, body] of [
@@ -2841,13 +2901,24 @@ describe('v1 PI-only intake adopt / archive / unarchive (GOV-01/ONBOARD-01 §5 P
         expect(r.status).toBe(403)
         expect((await r.json() as { error: { code: string } }).error.code).toBe('role_forbidden')
       }
+      const strangerAdopt = await fetch(`${base}/v1/projects/${projectId}/intake/${intake.intake_id}/adopt`, {
+        method: 'POST', headers: H('stranger-1'), body: adoptBody,
+      })
+      expect(strangerAdopt.status).toBe(404)
+      expect((await strangerAdopt.json() as { error: { code: string } }).error.code).toBe('project_not_found')
       // viewer: read-only role is 403 too.
       const v = await fetch(`${base}/v1/projects/${projectId}/archive`, { method: 'POST', headers: H('viewer-1') })
       expect(v.status).toBe(403)
       // Missing principal (no header AND no body principal) -> 422
       // principal_required (GOV-01 fail-closed).
       const noPr = await fetch(`${base}/v1/projects/${projectId}/intake/${intake.intake_id}/adopt`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ expected_proposal_revision: 1 }),
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-service-token': serviceToken,
+          'x-service-principal': 'standalone-human-bff',
+        },
+        body: JSON.stringify({ expected_proposal_revision: 1 }),
       })
       expect(noPr.status).toBe(422)
       expect((await noPr.json() as { error: { code: string } }).error.code).toBe('principal_required')
@@ -3101,7 +3172,7 @@ describe('P0 hardening round (§4: RUN-01/TERM-01/GOV-02/STAT-01/TEX-02)', () =>
     // the completion succeeds and finalizes the runs row.
     const done = kernel.completeJob({
       job_id: job.job_id, owner: 'runner-p0', ...fenceArgs(kernel, job.job_id), status: 'succeeded',
-      run_manifest: { run_id: 'run_p0_1', job_id: job.job_id, exit_code: 0 },
+      run_manifest: { ...identityManifest(kernel, job), exit_code: 0 },
     })
     expect(done.status).toBe('succeeded')
     expect(kernel.listRuns(project.project_id)[0]!.finished_at).not.toBeNull()
@@ -3448,13 +3519,110 @@ describe('service token auth on internal routes (hardening §4 P0 API-01/EVID-01
     }
   })
 
-  it('server: a kernel WITHOUT a serviceToken keeps internal routes open (dev compatibility)', async () => {
+  it('does not let trailing path segments bypass any service-route token gate or alias an Intake write', async () => {
     const { startKernelServer } = await import('../../packages/research-kernel/lib/server.js')
-    const kernel = freshKernel()
+    const kernel = tokenKernel()
+    const project = createConfiguredProject(kernel, {
+      name: 'service-route-shape', workspace: '/w', brief: makeBrief(), creator_principal_id: 'pi-svc',
+    } as never)
+    const artifact = kernel.registerArtifact({ project_id: project.project_id, kind: 'analysis', content: '{}' })
+    const acceptedCandidate = kernel.ingestVerifiedEvidence({
+      project_id: project.project_id, ...evidenceBody(artifact.artifact_id),
+    })
+    const contract = kernel.registerContract({
+      project_id: project.project_id, idea_id: 'idea_shape', data: { dataset_id: 'd' },
+      methods: { baseline: 'b', treatment: 'a' }, metrics: { primary: 'm' },
+    })
+    const intake = kernel.beginIntake({ project_id: project.project_id, source_label: 'shape' })
+    const target = kernel.listRunnerTargets()[0]!
     const { server, port } = await startKernelServer({ kernel, port: 0 })
     try {
-      const res = await post(port, '/v1/jobs-claim/run', claimBody())
-      expect(res.status).toBe(200)
+      const probes: Array<{ method: string; path: string; body: unknown; headers?: Record<string, string> }> = [
+        { method: 'POST', path: '/v1/jobs-claim/run/extra', body: claimBody() },
+        { method: 'POST', path: '/v1/recover/leases/extra', body: {} },
+        {
+          method: 'PATCH', path: `/v1/runner-targets/${target.target_id}/extra`,
+          headers: { 'x-principal-id': 'pi-svc' }, body: { expected_revision: target.revision, display_name: 'forged alias' },
+        },
+        { method: 'POST', path: `/v1/runner-targets/${target.target_id}/heartbeat/extra`, body: { expected_revision: target.revision, health: 'online' } },
+        {
+          method: 'POST', path: `/v1/projects/${project.project_id}/evidence/verified/extra`,
+          headers: { 'x-service-principal': 'analysis-worker' }, body: evidenceBody(artifact.artifact_id),
+        },
+        {
+          method: 'POST', path: `/v1/projects/${project.project_id}/evidence/${acceptedCandidate.evidence_id}/unexpected/accept`,
+          headers: { 'x-service-principal': 'verifier' }, body: { request_id: 'req_shape_accept' },
+        },
+        {
+          method: 'POST', path: `/v1/projects/${project.project_id}/contracts/${contract.contract_id}/unexpected/approve`,
+          body: { actor: 'svc-shape' },
+        },
+      ]
+      for (const probe of probes) {
+        const response = await fetch(`http://127.0.0.1:${port}${probe.path}`, {
+          method: probe.method,
+          headers: { 'content-type': 'application/json', ...probe.headers },
+          body: JSON.stringify(probe.body),
+        })
+        expect(response.status, `${probe.method} ${probe.path}`).toBe(404)
+        expect((await response.json() as { error: { code: string } }).error.code, probe.path).toBe('not_found')
+      }
+
+      const intakeAlias = await fetch(`http://127.0.0.1:${port}/v1/projects/${project.project_id}/intake/${intake.intake_id}/reject/extra`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-service-token': SERVICE_TOKEN,
+          'x-service-principal': 'standalone-human-bff',
+          'x-principal-id': 'pi-svc',
+          'x-principal-session': 'session-shape',
+        },
+        body: '{}',
+      })
+      expect(intakeAlias.status).toBe(404)
+      expect((await intakeAlias.json() as { error: { code: string } }).error.code).toBe('not_found')
+    } finally {
+      server.close()
+      kernel.close()
+    }
+  })
+
+  it.each([
+    ['unset', undefined],
+    ['blank', '   '],
+  ] as const)('server: a kernel with %s serviceToken fails closed for every service and /internal route', async (_label, serviceToken) => {
+    const { startKernelServer } = await import('../../packages/research-kernel/lib/server.js')
+    const kernel = freshKernel({ serviceToken })
+    const { server, port } = await startKernelServer({ kernel, port: 0 })
+    try {
+      const probes = [
+        ['POST', '/v1/jobs-claim/run'],
+        ['POST', '/v1/runner-keys'],
+        ['POST', '/v1/recover/leases'],
+        ['POST', '/v1/runner-targets/target-a/heartbeat'],
+        ['POST', '/v1/projects/project-a/evidence/verified'],
+        ['POST', '/v1/projects/project-a/evidence/evidence-a/accept'],
+        ['POST', '/v1/projects/project-a/contracts/contract-a/approve'],
+        ['POST', '/v1/projects/project-a/intake/intake-a/answers'],
+        ['POST', '/v1/projects/project-a/intake/intake-a/adopt'],
+        ['POST', '/v1/projects/project-a/intake/intake-a/reject'],
+        ['POST', '/internal/reproduction-attempts/attempt-a/reports'],
+        ['POST', '/internal/projects/project-a/topology/children'],
+        ['PATCH', '/internal/topology/node-a/state'],
+        ['POST', '/internal/dsh-sessions/session-a/knowledge-activations'],
+        ['POST', '/internal/dsh-sessions/session-a/assurance-executions'],
+        ['GET', '/internal/metrics'],
+        ['GET', '/internal/unknown'],
+      ] as const
+      for (const [method, path] of probes) {
+        const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method,
+          headers: { 'content-type': 'application/json' },
+          body: method === 'GET' ? undefined : '{}',
+        })
+        expect(response.status, `${method} ${path}`).toBe(403)
+        expect((await response.json() as { error: { code: string } }).error.code, `${method} ${path}`).toBe('service_token_required')
+      }
     } finally {
       server.close()
       kernel.close()
@@ -3495,6 +3663,52 @@ describe('service token auth on internal routes (hardening §4 P0 API-01/EVID-01
       await expect(bearerOnly.claimJobs('svc-unit', 1)).rejects.toBeInstanceOf(KernelApiError)
       await expect(bearerOnly.claimJobs('svc-unit', 1)).rejects.toMatchObject({ status: 403 })
       await expect(bearerOnly.claimJobs('svc-unit', 1)).rejects.toThrow(/x-service-token/)
+    } finally {
+      server.close()
+      kernel.close()
+    }
+  })
+})
+
+describe('HTTP unknown-error redaction', () => {
+  it('returns a stable generic envelope without leaking the thrown message', async () => {
+    const { startKernelServer } = await import('../../packages/research-kernel/lib/server.js')
+    const kernel = freshKernel()
+    const canary = 'secret=/srv/private/kernel.db SQL=SELECT * FROM credentials'
+    Object.defineProperty(kernel, 'listProjects', { value: () => { throw new Error(canary) } })
+    const { server, port } = await startKernelServer({ kernel, port: 0 })
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/v1/projects`)
+      expect(response.status).toBe(500)
+      const text = await response.text()
+      expect(text).not.toContain(canary)
+      expect(JSON.parse(text)).toMatchObject({
+        error: { code: 'internal_error', message: 'internal error', retryable: false },
+      })
+    } finally {
+      server.close()
+      kernel.close()
+    }
+  })
+
+  it('uses the same stable generic envelope for unknown v2 exceptions', async () => {
+    const { startKernelServer } = await import('../../packages/research-kernel/lib/server.js')
+    const kernel = freshKernel()
+    const canary = 'private=/srv/tenant/kernel.db SQL=SELECT token FROM secrets'
+    Object.defineProperty(kernel, 'listProjectsPage', { value: () => { throw new Error(canary) } })
+    const { server, port } = await startKernelServer({ kernel, port: 0 })
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/v2/projects`, {
+        headers: { 'x-request-id': 'req_v2_redaction' },
+      })
+      expect(response.status).toBe(500)
+      const text = await response.text()
+      expect(text).not.toContain(canary)
+      expect(JSON.parse(text)).toEqual({
+        error: {
+          code: 'internal_error', message: 'internal error', request_id: 'req_v2_redaction', retryable: false,
+        },
+      })
     } finally {
       server.close()
       kernel.close()
@@ -3552,7 +3766,10 @@ describe('§5 P0-1 bearer enforcement on token-configured kernels (hardening API
       // /internal/metrics stays behind the bearer (loopback is not enough
       // when a token is configured).
       expect((await request(port, '/internal/metrics')).status).toBe(401)
-      expect((await request(port, '/internal/metrics', 'GET', { authorization: `Bearer ${KERNEL_TOKEN}` })).status).toBe(200)
+      expect((await request(port, '/internal/metrics', 'GET', {
+        authorization: `Bearer ${KERNEL_TOKEN}`,
+        'x-service-token': SERVICE_TOKEN,
+      })).status).toBe(200)
       // Wrong bearer on health is still accepted (exempt surface).
       expect((await request(port, '/v1/health', 'GET', { authorization: 'Bearer wrong' })).status).toBe(200)
     } finally {
@@ -3640,7 +3857,7 @@ describe('opaque RunnerProfile 注册表固定（domain-model.md §2/§9.1，审
     kernel.close()
   })
 
-  it('submitJob 对 secure kinds 注入 opaque runner_profile_id + profile_config_hash（与注册表一致，read-back 保留）', () => {
+  it('submitJob pins the opaque runner profile for every executable Job', () => {
     const kernel = freshKernel()
     const project = createConfiguredProject(kernel, { name: 't', workspace: '/w', brief: makeBrief() })
     const code = codeArtifact(kernel, project.project_id)
@@ -3663,10 +3880,11 @@ describe('opaque RunnerProfile 注册表固定（domain-model.md §2/§9.1，审
     expect(reloaded.runner_profile_id).toBe(cpu.profile_id)
     expect(reloaded.profile_config_hash).toBe(cpu.config_hash)
     expect(reloaded.payload.profile_config_hash).toBe(cpu.config_hash)
-    // 非 secure kind（echo）不需要正式运行环境 pin。
+    // Fixture jobs still use the same current claim envelope and therefore
+    // carry an exact profile pin rather than relying on runner defaults.
     const echo = submitTestJob(kernel, { project_id: project.project_id, idempotency_key: 'profile-pin-echo', kind: 'echo', payload: { message: 'hi' } })
-    expect(echo.payload.runner_profile_id).toBeUndefined()
-    expect(echo.runner_profile_id).toBeNull()
+    expect(echo.payload.runner_profile_id).toBe(cpu.profile_id)
+    expect(echo.runner_profile_id).toBe(cpu.profile_id)
     kernel.close()
   })
 

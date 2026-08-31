@@ -88,7 +88,6 @@ function projection(input: {
     jobs: [],
     budget: { project_id: p.project_id, model_cost_usd: 0, gpu_hours: 0, api_requests: 0, storage_bytes: 0, updated_at: p.updated_at },
     counts: { ideas: 0, contracts: 0, claims: 0, evidence: 0, artifacts: 0, corpus_snapshots: 0 },
-    next_actions: actions.map(item => item.label),
     next_actions_v2: actions,
   }
 }

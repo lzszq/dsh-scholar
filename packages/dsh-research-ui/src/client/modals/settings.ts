@@ -8,6 +8,7 @@ import { tokenProvider } from '../api'
 import { RADII, TEXTURES } from '../state'
 import {
   configPinChanged, settingsConfigModel, settingsConfigPin, settingsConfigWrite,
+  mapSettingsServerErrors, SettingsConfigInputError, settingsConfigTransaction,
   settingsFieldDisplay, settingsKey, settingsSectionsForData,
 } from '../settings-model'
 import type { SettingsConfigField, SettingsEffectiveWire, SettingsSchemaWire } from '../settings-model'
@@ -15,6 +16,7 @@ import {
   DEFAULT_DOCKER_IMAGE_DIGEST,
   runnerTargetRuntimeDraft,
   runnerTargetRuntimePayload,
+  runnerTargetSettingsOperation,
   runnerTargetSecretRefDraft,
   runnerTargetSecretRefPayload,
   type RunnerTargetSecretRefPayload,
@@ -22,10 +24,8 @@ import {
 } from '../runner-target-settings-model'
 import {
   MINERU_MODEL_IDS,
-  mineruBindingWrite,
   mineruProvider,
-  mineruProviderCreate,
-  mineruProviderUpdate,
+  mineruSettingsOperation,
   mineruSettingsErrorKey,
   mineruSettingsDraft,
   type MineruModelId,
@@ -47,10 +47,11 @@ import { budgetPageVisible, writeBudgetPageVisible } from '../navigation-prefere
  * hot-reload verdict, security-floor marker and validation metadata.
  * Secrets are never echoed (the server effective view is already redacted;
  * the client only renders the set-but-hidden mask, never a plaintext). The
- * effective config pin is shown with a change hint; the write surface does
- * not exist in this revision, so the submit button is disabled with the
- * honest read-only note. When the registry data is unavailable the honest
- * placeholder sections remain (settingsSectionsForData(false)). Rows
+ * effective config pin is shown with a change hint. Writable fields use the
+ * registry's exact write scope and submit one revision-CAS Settings
+ * transaction; unavailable revision context removes the save action. When
+ * registry data is unavailable the honest placeholder sections remain
+ * (settingsSectionsForData(false)). Rows
  * without a static value are dynamic slots filled below with live controls
  * (kernel health, selects, toggles). All copy goes through t()/settingsKey()
  * — no hardcoded chrome (i18n §8).
@@ -86,10 +87,12 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
   // One kernel health probe serves the connection section; the CONFIG-01
   // surface (schema + effective) drives the dynamic config sections.
   const activeProjectId = state.projectId
+  const effectiveQuery = new URLSearchParams()
+  if (activeProjectId !== undefined) effectiveQuery.set('project_id', activeProjectId)
   const [health, schema, effective, runnerTargets, providerRead, activeProjectRead, modelBindingRead] = await Promise.all([
-    api<{ ok?: boolean; instance?: string; config_pin?: string }>('/v1/health'),
+    api<{ ok?: boolean; instance?: string }>('/v1/health'),
     api<SettingsSchemaWire>('/v1/config/schema'),
-    api<SettingsEffectiveWire>('/v1/config/effective'),
+    api<SettingsEffectiveWire>(`/v1/config/effective?${effectiveQuery.toString()}`),
     api<RunnerTargetSafeViewLite[]>('/v1/runner-targets'),
     apiResult<ProviderSafeViewLite[]>('/v1/providers'),
     activeProjectId === undefined
@@ -307,41 +310,15 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
             setError(t('shell', 'shell.settings.ocr.bindingLoadFailed'))
             return
           }
-          const providerPayload = currentProvider === undefined
-            ? mineruProviderCreate(draft)
-            : mineruProviderUpdate(draft, currentProvider.revision)
-          // Validate the binding before the Provider mutation. The revision is
-          // replaced with the actual Provider write response below.
-          const bindingPayload = activeProject !== null && draft.enabled
-            ? mineruBindingWrite(draft, modelBinding, currentProvider?.revision ?? 1)
-            : null
-          const providerResult = currentProvider === undefined
-            ? await apiResult<ProviderSafeViewLite>('/v1/providers', {
-              method: 'POST', body: JSON.stringify(providerPayload),
-            })
-            : await apiResult<ProviderSafeViewLite>('/v1/providers/mineru', {
-              method: 'PATCH', body: JSON.stringify(providerPayload),
-            })
-          if (!providerResult.ok) {
-            setError(t('shell', mineruSettingsErrorKey(providerResult.error.code)))
+          const operation = mineruSettingsOperation(
+            draft, currentProvider, modelBinding, activeProject?.project_id,
+          )
+          const result = await apiResult<{ operations: unknown[] }>('/v1/settings/transactions', {
+            method: 'POST', body: JSON.stringify({ operations: [operation] }),
+          })
+          if (!result.ok) {
+            setError(t('shell', mineruSettingsErrorKey(result.error.code)))
             return
-          }
-          if (activeProject !== null && bindingPayload !== null) {
-            const bindingResult = await apiResult<ProjectModelBindingLite>(
-              `/v1/projects/${encodeURIComponent(activeProject.project_id)}/model-binding`, {
-                method: 'PUT',
-                body: JSON.stringify({
-                  ...bindingPayload,
-                  expected_provider_revision: providerResult.data.revision,
-                }),
-              },
-            )
-            if (!bindingResult.ok) {
-              setError(t('shell', 'shell.settings.ocr.providerSavedBindingFailed', {
-                reason: t('shell', mineruSettingsErrorKey(bindingResult.error.code)),
-              }))
-              return
-            }
           }
           overlay.remove()
           void openSettingsModal(root)
@@ -443,29 +420,36 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
         option.disabled = !target.enabled || target.draining || target.health === 'offline'
         select.appendChild(option)
       }
-      const saveDefault = el('button', 'hbtn', t('shell', 'shell.settings.targets.saveProjectDefault')) as HTMLButtonElement
-      saveDefault.onclick = async () => {
-        setError('')
-        saveDefault.disabled = true
-        const result = await apiResult<ProjectExecutionSettingsLite>(
-          `/v2/projects/${encodeURIComponent(activeProject.project_id)}/execution`, {
-            method: 'PATCH',
-            body: JSON.stringify({
-              expected_revision: activeProject.revision,
-              runner_target_id: select.value,
-            }),
-          },
-        )
-        saveDefault.disabled = false
-        if (!result.ok) {
-          setError(result.error.message ?? t('shell', 'shell.settings.targets.projectDefaultFailed'))
-          return
+      const projectConfigRevision = effective?.revisions?.project
+      projectTarget.appendChild(select)
+      if (typeof projectConfigRevision === 'number') {
+        const saveDefault = el('button', 'hbtn', t('shell', 'shell.settings.targets.saveProjectDefault')) as HTMLButtonElement
+        saveDefault.onclick = async () => {
+          setError('')
+          saveDefault.disabled = true
+          const result = await apiResult<{ operations: unknown[] }>('/v1/settings/transactions', {
+            method: 'POST',
+            body: JSON.stringify({ operations: [{
+              kind: 'config',
+              scope: 'project',
+              scope_id: activeProject.project_id,
+              expected_revision: projectConfigRevision,
+              changes: { 'execution.runner_target_id': select.value },
+            }] }),
+          })
+          saveDefault.disabled = false
+          if (!result.ok) {
+            setError(result.error.message ?? t('shell', 'shell.settings.targets.projectDefaultFailed'))
+            return
+          }
+          overlay.remove()
+          void state.rerender()
+          void openSettingsModal(root)
         }
-        overlay.remove()
-        void state.rerender()
-        void openSettingsModal(root)
+        projectTarget.appendChild(saveDefault)
+      } else {
+        projectTarget.appendChild(el('div', 'settings-readonly-note', t('shell', 'shell.settings.writeUnavailable')))
       }
-      projectTarget.append(select, saveDefault)
       body.appendChild(projectTarget)
     } else {
       const noProject = el('div', 'settings-readonly-note', t('shell', 'shell.settings.targets.noActiveProject'))
@@ -635,12 +619,16 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
           setError(t('shell', 'shell.settings.targets.serviceIdentityInvalid'))
           return
         }
-        const connection = targetKind === 'remote-ssh'
-          ? { endpoint: endpoint.payload(), credential: credential.payload(), known_hosts: knownHosts.payload() }
-          : undefined
-        if (targetKind === 'remote-ssh' && (connection?.endpoint === null || connection?.credential === null || connection?.known_hosts === null)) {
-          setError(t('shell', 'shell.settings.targets.secretRefInvalid'))
-          return
+        let connection: { endpoint: RunnerTargetSecretRefPayload; credential: RunnerTargetSecretRefPayload; known_hosts: RunnerTargetSecretRefPayload } | undefined
+        if (targetKind === 'remote-ssh') {
+          const endpointRef = endpoint.payload()
+          const credentialRef = credential.payload()
+          const knownHostsRef = knownHosts.payload()
+          if (endpointRef === null || credentialRef === null || knownHostsRef === null) {
+            setError(t('shell', 'shell.settings.targets.secretRefInvalid'))
+            return
+          }
+          connection = { endpoint: endpointRef, credential: credentialRef, known_hosts: knownHostsRef }
         }
         save.disabled = true
         const shared = {
@@ -655,13 +643,24 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
             : { ...(target?.runtime !== undefined ? { runtime: null } : {}) }),
           ...(connection !== undefined ? { connection } : { ...(target?.connection !== undefined ? { connection: null } : {}) }),
         }
-        const result = target === undefined
-          ? await apiResult<RunnerTargetSafeViewLite>('/v1/runner-targets', {
-            method: 'POST', body: JSON.stringify({ target_id: id.value.trim(), ...shared }),
+        const operation = target === undefined
+          ? runnerTargetSettingsOperation({
+            action: 'create',
+            input: {
+              target_id: id.value.trim(), display_name: shared.display_name, kind: shared.kind,
+              enabled: shared.enabled, draining: shared.draining, capabilities: shared.capabilities,
+              service_identity: shared.service_identity,
+              ...(runtimeResult.runtime === undefined ? {} : { runtime: runtimeResult.runtime }),
+              ...(connection === undefined ? {} : { connection }),
+            },
           })
-          : await apiResult<RunnerTargetSafeViewLite>(`/v1/runner-targets/${encodeURIComponent(target.target_id)}`, {
-            method: 'PATCH', body: JSON.stringify({ expected_revision: target.revision, ...shared }),
+          : runnerTargetSettingsOperation({
+            action: 'update', target_id: target.target_id,
+            patch: { expected_revision: target.revision, ...shared },
           })
+        const result = await apiResult<{ operations: unknown[] }>('/v1/settings/transactions', {
+          method: 'POST', body: JSON.stringify({ operations: [operation] }),
+        })
         save.disabled = false
         if (!result.ok) {
           setError(result.error?.message ?? t('shell', 'shell.settings.targets.saveFailed'))
@@ -740,6 +739,9 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
   // from /v1/config/schema + /v1/config/effective (replaces the runner /
   // workspace / terminal / tex / agent placeholders) ──
   if (dynamicSections.length > 0) {
+    const configEdits = new Map<string, string>()
+    const configFieldErrors = new Map<string, HTMLElement>()
+    const allConfigFields = dynamicSections.flatMap(section => section.fields)
     /** One schema field row: label + value (secret-masked) + meta + desc. */
     const renderConfigField = (field: SettingsConfigField): HTMLElement => {
       const row = el('div', 'settings-row settings-row-stack')
@@ -766,6 +768,52 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
         } else {
           slot.appendChild(valueEl)
         }
+      }
+      const writeScope = field.writeScopes.length === 1 ? field.writeScopes[0] : undefined
+      const editable = effective?.revisions !== undefined && (
+        writeScope === 'global'
+        || (writeScope === 'project' && activeProject !== null)
+        || writeScope === 'runtime'
+      )
+      if (editable) {
+        let control: HTMLInputElement | HTMLSelectElement
+        if (field.kind === 'enum') {
+          control = document.createElement('select')
+          for (const member of field.enumValues) {
+            const option = document.createElement('option')
+            option.value = String(member)
+            option.textContent = String(member)
+            option.selected = member === field.value
+            control.appendChild(option)
+          }
+        } else if (field.kind === 'boolean') {
+          control = document.createElement('select')
+          for (const member of ['true', 'false']) {
+            const option = document.createElement('option')
+            option.value = member
+            option.textContent = member
+            option.selected = String(field.value) === member
+            control.appendChild(option)
+          }
+        } else {
+          control = document.createElement('input')
+          control.type = field.kind === 'number' ? 'number' : 'text'
+          if (field.minimum !== undefined) control.min = String(field.minimum)
+          if (field.maximum !== undefined) control.max = String(field.maximum)
+          control.value = field.secret ? '' : field.value === null ? 'null' : String(field.value ?? field.default ?? '')
+          if (field.secret) control.placeholder = t('shell', 'shell.settings.secretRefPlaceholder')
+        }
+        control.className = 'field-input mono'
+        control.dataset.configKey = field.key
+        const remember = (): void => { configEdits.set(field.key, control.value) }
+        control.addEventListener('input', remember)
+        control.addEventListener('change', remember)
+        slot.appendChild(control)
+        const fieldError = el('div', 'settings-field-error')
+        fieldError.style.cssText = 'display:none;color:var(--tone-red);font-size:11px'
+        fieldError.setAttribute('aria-live', 'polite')
+        configFieldErrors.set(field.key, fieldError)
+        slot.appendChild(fieldError)
       }
       // meta chips: scope · sources · reload verdict · floor · env
       const meta = el('div', 'settings-field-meta')
@@ -801,15 +849,73 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
       for (const field of section.fields) body.appendChild(renderConfigField(field))
       holder.appendChild(acc)
     }
-    // Read-only footer: no PUT /v1/config (or project PATCH) in this
-    // revision — submit is disabled with the honest note.
     const write = settingsConfigWrite()
     const footer = el('div', 'settings-readonly-note')
     footer.appendChild(el('span', '', settingsKey(write.noteKey)))
-    const saveBtn = el('button', 'hbtn', t('common', 'common.action.save'))
-    saveBtn.disabled = true
-    saveBtn.style.cssText = 'padding:2px 10px;opacity:.5;cursor:not-allowed'
-    footer.appendChild(saveBtn)
+    const writeStatus = el('span', 'muted')
+    writeStatus.setAttribute('aria-live', 'polite')
+    footer.appendChild(writeStatus)
+    const writeEndpoint = write.endpoint
+    if (effective?.revisions === undefined) {
+      writeStatus.textContent = t('shell', 'shell.settings.writeUnavailable')
+    } else {
+      const saveBtn = el('button', 'hbtn', t('common', 'common.action.save')) as HTMLButtonElement
+      saveBtn.style.cssText = 'padding:2px 10px'
+      saveBtn.onclick = async () => {
+        writeStatus.textContent = ''
+        for (const error of configFieldErrors.values()) {
+          error.textContent = ''
+          error.style.display = 'none'
+        }
+        if (configEdits.size === 0) {
+          writeStatus.textContent = t('shell', 'shell.settings.noChanges')
+          return
+        }
+        let transaction: ReturnType<typeof settingsConfigTransaction>
+        try {
+          transaction = settingsConfigTransaction(allConfigFields, configEdits, effective, {
+            projectId: activeProject?.project_id,
+          })
+        } catch (error) {
+          if (error instanceof SettingsConfigInputError) {
+            const fieldError = configFieldErrors.get(error.key)
+            if (fieldError !== undefined) {
+              fieldError.textContent = t('shell', 'shell.settings.configSaveFailed')
+              fieldError.style.display = 'block'
+            }
+          }
+          writeStatus.textContent = t('shell', 'shell.settings.configSaveFailed')
+          return
+        }
+        saveBtn.disabled = true
+        const result = await apiResult<{
+          config: null | { verdict: { restart_required: boolean; restart_required_keys: string[] } }
+          operations: unknown[]
+        }>(writeEndpoint, {
+          method: 'POST', body: JSON.stringify(transaction),
+        })
+        saveBtn.disabled = false
+        if (!result.ok) {
+          const mapped = mapSettingsServerErrors(allConfigFields, result.error)
+          for (const [key] of mapped.byKey) {
+            const fieldError = configFieldErrors.get(key)
+            if (fieldError !== undefined) {
+              fieldError.textContent = t('shell', 'shell.settings.configSaveFailed')
+              fieldError.style.display = 'block'
+            }
+          }
+          writeStatus.textContent = result.error.message ?? t('shell', 'shell.settings.configSaveFailed')
+          return
+        }
+        overlay.remove()
+        const verdict = result.data.config?.verdict
+        showToast(root, verdict?.restart_required === true
+          ? t('shell', 'shell.settings.configSavedRestart', { keys: verdict.restart_required_keys.join(', ') })
+          : t('shell', 'shell.settings.configSavedHot'))
+        void openSettingsModal(root)
+      }
+      footer.appendChild(saveBtn)
+    }
     holder.appendChild(footer)
     if (configSectionEl !== null) modal.insertBefore(holder, configSectionEl)
     else modal.appendChild(holder)
@@ -1048,7 +1154,7 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
         `- Corpus snapshots: ${counts.corpus_snapshots ?? 0} · Ideas: ${counts.ideas ?? 0} · Contracts: ${counts.contracts ?? 0}`,
         `- Claims: ${counts.claims ?? 0} · Evidence: ${counts.evidence ?? 0} · Artifacts: ${counts.artifacts ?? 0}`,
         `- Pending gates: ${(p.pending_gates ?? []).map(g => `${g.type} (${g.status})`).join(', ') || 'none'}`,
-        `- Next: ${(p.next_actions ?? []).join('; ') || '—'}`,
+        `- Next: ${(p.next_actions_v2 ?? []).filter(action => action.state !== 'done').map(action => action.label ?? action.code ?? 'unknown').join('; ') || '—'}`,
       ]
       await navigator.clipboard.writeText(lines.join('\n'))
       summaryBtn.textContent = t('common', 'common.action.copied')
@@ -1077,13 +1183,13 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
     }
   }
 
-  // ── config provenance: effective config pin from the CONFIG-01 surface
-  // (fallback: kernel health config_pin) with a change hint vs the last
+  // ── config provenance: exact-scope effective config pin from CONFIG-01,
+  // with a change hint vs the last
   // seen pin (persisted locally — the pin changes with ANY config change,
   // including secrets, so a change means the running config moved) ──
   const pinSlot = slot('config', 'config.pin')
   if (pinSlot !== null) {
-    const pin = effective !== null ? settingsConfigPin(effective) : health?.config_pin
+    const pin = effective !== null ? settingsConfigPin(effective) : undefined
     if (pin !== undefined) {
       pinSlot.appendChild(el('span', 'mono', t('shell', 'shell.settings.configPinValue', { pin })))
       const PIN_KEY = 'dsh-scholar-ui-config-pin'

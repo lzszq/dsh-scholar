@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "DSH Scholar fixture-only automation runtime: durably approves Kernel-authorized Gate allowlists, records typed parks, and reconciles exact receipts across restarts.",
   "type": "module",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "bin": {

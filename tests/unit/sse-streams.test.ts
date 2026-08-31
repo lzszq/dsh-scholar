@@ -3,7 +3,7 @@
  * 轮询", api-contracts.md §22) — replay / heartbeat / end semantics over
  * REAL text/event-stream HTTP:
  *
- *   GET /v1/pty/sessions/{id}/frames/stream?after_seq=N   (PTY-01)
+ *   GET /v1/pty/sessions/{id}/frames/stream?after_seq=N&expected_generation=G (PTY-01)
  *   GET /v1/projects/{id}/workspaces/{wid}/watch/stream?after_revision=N (WORK-01)
  *   GET /v1/projects/{id}/trajectory/stream?after_seq=N&lane=…  (TRAJ-01)
  *
@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ResearchKernel } from '@dsh-scholar/research-kernel'
+import { ResearchKernel, type PtyAdapter, type PtyResolvedContext } from '@dsh-scholar/research-kernel'
 import { PtyOpenRequest } from '@dsh-scholar/research-schemas'
 import { startKernelServer, sseStreamTiming } from '../../packages/research-kernel/lib/server.js'
 
@@ -148,16 +148,64 @@ function makeBrief(): Record<string, unknown> {
   }
 }
 
-function openRequest(projectId: string, workspaceId: string, overrides: Record<string, unknown> = {}): PtyOpenRequest {
+const PTY_PRINCIPAL = 'pi-1'
+
+const inertPtyAdapter: PtyAdapter = {
+  id: 'local-pty',
+  spawn: () => ({ ok: true }),
+  write: () => {},
+  resize: () => {},
+  signal: () => {},
+  kill: () => {},
+}
+
+function ptyFixture(kernel: ResearchKernel): {
+  projectId: string
+  workspaceId: string
+  context: PtyResolvedContext
+} {
+  kernel.setPtyAdapter(inertPtyAdapter)
+  const project = kernel.createProject({
+    name: 'p',
+    workspace: '/w',
+    creator_principal_id: PTY_PRINCIPAL,
+    execution: {
+      runner_profile_id: 'profile_isolated_subprocess_v1',
+      runner_target_id: 'target_local_process_v1',
+      network_policy: 'none',
+      artifact_store: 'local-cas',
+      fixture_id: null,
+    },
+    brief: makeBrief(),
+  } as never)
+  const workspace = kernel.workspaceEnsure(project.project_id, 'scratch', 's')
+  const contextProjection = kernel.ptyContexts(project.project_id, PTY_PRINCIPAL)
+    .find(candidate => candidate.context_kind === 'research')!
+  return {
+    projectId: project.project_id,
+    workspaceId: workspace.workspace_id,
+    context: kernel.ptyResolveContext(contextProjection.context_id, PTY_PRINCIPAL),
+  }
+}
+
+function openRequest(contextId: string, workspaceId: string, overrides: Record<string, unknown> = {}): PtyOpenRequest {
   return PtyOpenRequest.parse({
-    project_id: projectId,
+    context_id: contextId,
     workspace_id: workspaceId,
-    profile: 'local-docker-cpu',
-    target: 'target-1',
+    label: 'SSE shell',
+    purpose: 'exercise terminal frame streaming',
     preset: 'bash',
-    cwd: 'scratch',
+    cwd: '.',
     ...overrides,
   })
+}
+
+function ptyStreamUrl(base: string, afterSeq: number, generation: number): string {
+  return `${base}?after_seq=${afterSeq}&expected_generation=${generation}`
+}
+
+function ptyHeaders(lease: string, principal = PTY_PRINCIPAL): Record<string, string> {
+  return { 'x-principal-id': principal, 'x-pty-lease': lease }
 }
 
 /** Negative assertion: a JSON error (never SSE bytes) before any stream. */
@@ -178,9 +226,8 @@ afterEach(() => {
 describe('SSE stream: GET /v1/pty/sessions/{id}/frames/stream (PTY-01)', () => {
   it('replays frames after after_seq without duplicates and ends on the exit frame', async () => {
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 'p', workspace: '/w', brief: makeBrief(), creator_principal_id: 'pi-1' } as never)
-    const ws = kernel.workspaceEnsure(project.project_id, 'scratch', 's')
-    const session = kernel.ptyOpen(openRequest(project.project_id, ws.workspace_id), { principal: { principal_id: 'pi-1' } })
+    const fixture = ptyFixture(kernel)
+    const session = kernel.ptyOpen(openRequest(fixture.context.context_id, fixture.workspaceId), { context: fixture.context })
     kernel.ptyAppendOutput(session.pty_session_id, [
       { type: 'output', text: 'one', byte_length: 3 },
       { type: 'output', text: 'two', byte_length: 3 },
@@ -189,9 +236,9 @@ describe('SSE stream: GET /v1/pty/sessions/{id}/frames/stream (PTY-01)', () => {
     const { server, port } = await startKernelServer({ kernel, port: 0 })
     try {
       const base = `http://127.0.0.1:${port}/v1/pty/sessions/${session.pty_session_id}/frames/stream`
-      const auth = { 'x-principal-id': 'pi-1' }
+      const auth = ptyHeaders(session.lease_token!)
       // Replay from seq 0: subscribed + frames 1..3 in order.
-      const c1 = await SseClient.open(`${base}?after_seq=0`, auth)
+      const c1 = await SseClient.open(ptyStreamUrl(base, 0, session.generation), auth)
       const evs1 = await c1.until(evs => evs.filter(e => e.event === 'frame').length >= 3)
       expect(c1.response.status).toBe(200)
       expect(c1.response.headers.get('content-type')).toContain('text/event-stream')
@@ -204,13 +251,13 @@ describe('SSE stream: GET /v1/pty/sessions/{id}/frames/stream (PTY-01)', () => {
       expect(frames1[0]?.data.payload).toMatchObject({ text: 'one', byte_length: 3, channel: 'stdout' })
       c1.close()
       // Resume from seq 2: only frame 3 (no duplicate, no missing).
-      const c2 = await SseClient.open(`${base}?after_seq=2`, auth)
+      const c2 = await SseClient.open(ptyStreamUrl(base, 2, session.generation), auth)
       const evs2 = await c2.until(evs => evs.some(e => e.event === 'frame'))
       expect(evs2.filter(e => e.event === 'frame').map(f => f.data.seq)).toEqual([3])
       c2.close()
       // Exit frame ends the stream (authoritative terminal state).
       kernel.ptyAppendOutput(session.pty_session_id, [{ type: 'exit', exit_code: 0, signal: null }])
-      const c3 = await SseClient.open(`${base}?after_seq=3`, auth)
+      const c3 = await SseClient.open(ptyStreamUrl(base, 3, session.generation), auth)
       const evs3 = await c3.until(evs => evs.some(e => e.event === 'exit'))
       const exit = evs3.find(e => e.event === 'exit')
       expect(exit?.data).toMatchObject({ session_id: session.pty_session_id, seq: 4, exit_code: 0, signal: null })
@@ -224,15 +271,14 @@ describe('SSE stream: GET /v1/pty/sessions/{id}/frames/stream (PTY-01)', () => {
 
   it('pushes live frames appended after connect and reports retention gaps', async () => {
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 'p', workspace: '/w', brief: makeBrief(), creator_principal_id: 'pi-1' } as never)
-    const ws = kernel.workspaceEnsure(project.project_id, 'scratch', 's')
-    const session = kernel.ptyOpen(openRequest(project.project_id, ws.workspace_id), { principal: { principal_id: 'pi-1' } })
+    const fixture = ptyFixture(kernel)
+    const session = kernel.ptyOpen(openRequest(fixture.context.context_id, fixture.workspaceId), { context: fixture.context })
     const { server, port } = await startKernelServer({ kernel, port: 0 })
     try {
       const base = `http://127.0.0.1:${port}/v1/pty/sessions/${session.pty_session_id}/frames/stream`
-      const auth = { 'x-principal-id': 'pi-1' }
+      const auth = ptyHeaders(session.lease_token!)
       // Live tail: subscribe to the empty session, then append while open.
-      const live = await SseClient.open(`${base}?after_seq=0`, auth)
+      const live = await SseClient.open(ptyStreamUrl(base, 0, session.generation), auth)
       await live.until(evs => evs.some(e => e.event === 'subscribed'))
       expect(live.events[0]?.data.last_seq).toBe(0)
       kernel.ptyAppendOutput(session.pty_session_id, [
@@ -246,14 +292,18 @@ describe('SSE stream: GET /v1/pty/sessions/{id}/frames/stream (PTY-01)', () => {
       live.close()
       // Gap: a reader starting at 0 on an evicted window must see the gap
       // event (seq = first dropped seq) followed by the retained frames.
-      const small = kernel.ptyOpen(openRequest(project.project_id, ws.workspace_id, { retention_bytes: 16 }), { principal: { principal_id: 'pi-1' } })
+      const small = kernel.ptyOpen(openRequest(fixture.context.context_id, fixture.workspaceId, { label: 'bounded SSE shell' }), { context: fixture.context })
+      kernel.db.prepare('UPDATE pty_sessions SET retention_bytes = 16 WHERE pty_session_id = ?').run(small.pty_session_id)
       kernel.ptyAppendOutput(small.pty_session_id, [
         { type: 'output', text: 'aaaaaaa\n', byte_length: 8 },
         { type: 'output', text: 'bbbbbbb\n', byte_length: 8 },
         { type: 'output', text: 'ccccccc\n', byte_length: 8 },
         { type: 'output', text: 'ddddddd\n', byte_length: 8 },
       ])
-      const gapc = await SseClient.open(`${base.replace(session.pty_session_id, small.pty_session_id)}?after_seq=0`, auth)
+      const gapc = await SseClient.open(
+        ptyStreamUrl(base.replace(session.pty_session_id, small.pty_session_id), 0, small.generation),
+        ptyHeaders(small.lease_token!),
+      )
       // gap and the retained frames are written in order, but fetch/SSE may
       // surface them in separate network chunks. Wait for both observable
       // contract events instead of assuming the first gap chunk contains
@@ -278,23 +328,28 @@ describe('SSE stream: GET /v1/pty/sessions/{id}/frames/stream (PTY-01)', () => {
   it('emits named heartbeat events and answers 422/403/404 like the polling frames route', async () => {
     sseStreamTiming.heartbeatMs = 60
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 'p', workspace: '/w', brief: makeBrief(), creator_principal_id: 'pi-1' } as never)
-    const ws = kernel.workspaceEnsure(project.project_id, 'scratch', 's')
-    const session = kernel.ptyOpen(openRequest(project.project_id, ws.workspace_id), { principal: { principal_id: 'pi-1' } })
+    const fixture = ptyFixture(kernel)
+    const session = kernel.ptyOpen(openRequest(fixture.context.context_id, fixture.workspaceId), { context: fixture.context })
     const { server, port } = await startKernelServer({ kernel, port: 0 })
     try {
       const base = `http://127.0.0.1:${port}/v1/pty/sessions/${session.pty_session_id}/frames/stream`
-      const hb = await SseClient.open(`${base}?after_seq=0`, { 'x-principal-id': 'pi-1' })
+      const validUrl = ptyStreamUrl(base, 0, session.generation)
+      const hb = await SseClient.open(validUrl, ptyHeaders(session.lease_token!))
       await hb.until(evs => evs.some(e => e.event === 'heartbeat'), 4000)
       expect(hb.events.filter(e => e.event === 'heartbeat').length).toBeGreaterThan(0)
       hb.close()
       // Auth matrix mirrors the polling frames route exactly.
-      await expectSseError(`${base}?after_seq=0`, {}, 422, 'principal_required')
-      await expectSseError(`${base}?after_seq=0`, { 'x-principal-id': 'evil' }, 403, 'pty_principal_mismatch')
-      await expectSseError(`${base.replace(session.pty_session_id, 'pty_unknown')}?after_seq=0`, { 'x-principal-id': 'pi-1' }, 404, 'pty_session_not_found')
-      await expectSseError(`${base}?after_seq=-1`, { 'x-principal-id': 'pi-1' }, 422, 'pty_after_seq_invalid')
-      // A wrong OPTIONAL lease is still 403 (never "wrong lease = pass").
-      await expectSseError(`${base}?after_seq=0`, { 'x-principal-id': 'pi-1', 'x-pty-lease': 'lease_wrong' }, 403, 'lease_invalid')
+      await expectSseError(validUrl, {}, 422, 'principal_required')
+      await expectSseError(validUrl, ptyHeaders(session.lease_token!, 'evil'), 403, 'pty_principal_mismatch')
+      await expectSseError(
+        ptyStreamUrl(base.replace(session.pty_session_id, 'pty_unknown'), 0, session.generation),
+        ptyHeaders(session.lease_token!),
+        404,
+        'pty_session_not_found',
+      )
+      await expectSseError(ptyStreamUrl(base, -1, session.generation), ptyHeaders(session.lease_token!), 422, 'pty_after_seq_invalid')
+      // The lease is mandatory and an incorrect value always fails closed.
+      await expectSseError(validUrl, ptyHeaders('lease_wrong'), 403, 'lease_invalid')
     } finally {
       server.close()
       kernel.close()

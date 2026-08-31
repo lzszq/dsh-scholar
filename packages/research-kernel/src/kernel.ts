@@ -25,6 +25,8 @@ import {
   type ProjectDeletionReceipt,
   SecretRef as SecretRefSchema,
   type ProviderDescriptor, type ProviderCreateInput, type ProviderUpdateInput, type SecretRef,
+  OcrRequestCreateInput, type OcrRequest, type OcrRequestCreateInput as OcrRequestCreateInputValue, type OcrResult, type OcrRequestView,
+  type OcrNormalizedObservation, type OcrSafeError,
   type RunnerTargetCreateInput, type RunnerTargetDescriptor, type RunnerTargetUpdateInput,
   type ProjectModelBinding, type ProjectModelBindingInput, type BindingPurpose,
   type IdeaDraft,
@@ -44,17 +46,21 @@ import {
   MethodTriadWrite, SectionGuideActivationWrite, WritingReviewerPanelWrite,
   WritingPatchProposalWrite, WritingPatchApplyInput, HumanWritingPrincipal,
   type WritingCompilePin, type WritingInputPin, type WritingPatchApplication,
+  type ConfigEffectiveSafeView, type ConfigLayerSafeView, type ConfigWriteScope,
+  type OcrMineruSettingsOperation, type RunnerTargetSettingsOperation, type SettingsWriteTransactionReceipt,
 } from '@dsh-scholar/research-schemas'
 import { ArtifactCas } from './cas.js'
 import { reproductionCanonicalJson, reproductionSha256 } from './reproduction.js'
 import { mkdirMode } from './fs-modes.js'
 import { openDatabase, type GateRow, type JobRow, type ProjectRow, type RunnerKeyRow } from './store.js'
 import { openPtySessionStore, NullPtyAdapter, PtyError, type PtyAdapter, type PtyAppendResult, type PtyControlResult, type PtySessionStore } from './pty-session.js'
+import type { PtyResolvedContext } from './pty-context.js'
+import { PtyContextAuthority } from './pty-context-authority.js'
 import { normalizeWorkspacePath, openWorkspaceStore, WorkspaceError, type WorkspaceExpected, type WorkspaceStore } from './workspace-store.js'
 import { TexWorkspaceFacade } from './tex-facade.js'
 import { WorkspaceModule } from './workspace-module.js'
-import { computePairedAnalysis } from '@dsh-scholar/analysis-worker'
-import { nextActionProjection, legacyNextActionStrings, type NextActionJob } from './next-action.js'
+import { deterministicAnalysisPort, type AnalysisPort } from './analysis-port.js'
+import { nextActionProjection, type NextActionJob } from './next-action.js'
 import { getLockedDigest, IMAGES_LOCK } from './images-lock.js'
 import { STAGED_UPLOAD_TTL_MS as STAGED_TTL, UPLOAD_MAX_FILE_BYTES as UPLOAD_LIMIT_BYTES } from './upload-limits.js'
 import {
@@ -80,6 +86,10 @@ import {
 } from './provider.js'
 import { uploadStagedPath, intakeQuotaCheck } from './chunked-upload.js'
 import { RunnerTargetRegistry } from './runner-target-registry.js'
+import { OcrStore, OcrStoreError } from './ocr-store.js'
+import type { OcrSourceBytes } from './ocr-worker.js'
+import { ConfigWriteStore, ConfigWriteStoreError, readRuntimeConfigForOwner } from './config-write-store.js'
+import { SettingsWriteCoordinator } from './settings-write-coordinator.js'
 import { assessRunnerEnvironment } from './runner-environment-readiness.js'
 import { dshOperatorPrincipal } from './dsh-principal.js'
 import { AssuranceStore } from './assurance-store.js'
@@ -285,7 +295,7 @@ export interface KernelOptions {
   casRoot?: string
   /** Kernel identity used for leases. */
   instanceId?: string
-  /** §12.7: reject unsigned run manifests at job completion (default: compatible, accept). */
+  /** §12.7: reject unsigned run manifests at job completion (default: true). */
   requireSignedManifest?: boolean
   /**
    * §4 P0 (hardening API-01/EVID-01): service identity token for INTERNAL
@@ -321,7 +331,7 @@ export interface KernelOptions {
   /**
    * PTY-01: idle-TTL sweep cadence in ms (default 30s). The kernel owns the
    * sweep timer so sessions close even when no client ever reconnects; the
-   * per-session idle_ttl_s (resolved from the Config Schema / request at
+   * per-session idle_ttl_s (pinned from the effective Config Registry at
    * open) decides each session's deadline. 0 disables the timer.
    */
   ptyIdleSweepMs?: number
@@ -358,6 +368,14 @@ export interface KernelOptions {
    * closed). Defaults: https only, DNS hosts must be allowlisted.
    */
   providerUrlAllowlist?: ProviderUrlAllowlist
+  /** Deterministic statistics adapter. The Kernel depends on this narrow
+   * port, never on the process-oriented analysis worker package. */
+  analysisPort?: AnalysisPort
+  /** Canonical process-start config resolved by the owning launcher. Runtime
+   * secrets stay in memory and are always redacted by public views. The
+   * Kernel overwrites DB/CAS/service-token/signature fields with the values
+   * it actually uses, so a launcher cannot publish a dishonest config pin. */
+  runtimeConfig?: Readonly<Record<string, unknown>>
 }
 
 const WritingPatchIntentSchema = z.object({
@@ -376,10 +394,12 @@ type WritingPatchIntent = z.infer<typeof WritingPatchIntentSchema>
 export class KernelError extends Error {
   readonly status: number
   readonly code: string
-  constructor(status: number, code: string, message: string) {
+  readonly key: string | undefined
+  constructor(status: number, code: string, message: string, key?: string) {
     super(message)
     this.status = status
     this.code = code
+    this.key = key
   }
 }
 
@@ -469,16 +489,12 @@ function gateFromRow(row: GateRow): Gate {
 
 function jobFromRow(row: JobRow, db: DatabaseSync, tokenOverride?: string | null): JobSpecBound & { run_id: string | null } {
   const payload = jsonParse(row.payload, {} as Record<string, unknown>)
-  // §12.6 / STORE-06 (storage-migrations.md §4): the opaque lease token is
-  // NEVER persisted — new claims store only sha256(token) in
-  // jobs.lease_token_hash and keep the plaintext in kernel memory (returned
-  // to the runner on the claim response). `tokenOverride` is that in-memory
-  // plaintext. Legacy rows claimed by the pre-0014 release still carry the
-  // plaintext inside payload.__lease_token (hash column NULL); they are
-  // surfaced the same way for backward-compatible fencing.
-  const legacyToken = typeof payload.__lease_token === 'string' ? payload.__lease_token : null
-  if (legacyToken !== null) delete payload.__lease_token
-  const leaseToken = tokenOverride ?? legacyToken
+  // 0038 makes plaintext lease storage an invalid current shape. The token is
+  // returned only from the process-local claim map; persisted rows are hash-only.
+  if (Object.prototype.hasOwnProperty.call(payload, '__lease_token')) {
+    throw new Error(`job ${row.job_id} contains obsolete plaintext lease storage`)
+  }
+  const leaseToken = tokenOverride ?? null
   // §3.1 / RUN-01 (P0): the durable per-attempt run identity — the runs row
   // of the CURRENT attempt (`attempts`). Runners that only hold the job
   // record (claim response / GET job) can use run_id for manifest, terminal
@@ -543,7 +559,7 @@ export interface RunRecord {
   contract_id: string | null
   snapshot_sha256: string | null
   manifest_json: Record<string, unknown> | null
-  signature_status: 'pending' | 'signed' | 'unsigned'
+  signature_status: 'pending' | 'signed' | 'unsigned' | 'credential_redacted'
   started_at: string
   finished_at: string | null
 }
@@ -769,13 +785,16 @@ interface GateDecisionInput {
 
 /** Run `fn` inside a single SQLite transaction (v2 §7.6 transactional kernel). */
 export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
-  db.exec('BEGIN IMMEDIATE')
+  const ownsTransaction = !db.isTransaction
+  if (ownsTransaction) db.exec('BEGIN IMMEDIATE')
   try {
     const result = fn()
-    db.exec('COMMIT')
+    if (ownsTransaction) db.exec('COMMIT')
     return result
   } catch (error) {
-    try { db.exec('ROLLBACK') } catch { /* already rolled back */ }
+    if (ownsTransaction) {
+      try { db.exec('ROLLBACK') } catch { /* already rolled back */ }
+    }
     throw error
   }
 }
@@ -949,10 +968,10 @@ export class ResearchKernel {
   readonly configPinHash: string
   /**
    * CONFIG-01: the REDACTED view of this kernel's effective config (secret
-   * values replaced with `<redacted>` by the registry) — the safe plaintext
-   * for the `/v1/config/effective` HTTP surface. The deployment-level
-   * effective config (computed by the CLI with host/port/token/endpoint-file
-   * included) overrides this via startKernelServer({ configRedacted }).
+   * values replaced with `<redacted>` by the registry) — the sole safe
+   * plaintext for the `/v1/config/effective` HTTP surface. The launcher feeds
+   * its canonical process-start values through KernelOptions.runtimeConfig;
+   * the HTTP server has no second config override.
    */
   readonly configRedacted: Record<string, unknown>
   /** §12.1 (TEX-03): debounce window for live preview builds. */
@@ -969,6 +988,12 @@ export class ResearchKernel {
   readonly providerUrlAllowlist: ProviderUrlAllowlist
   /** EXEC-ENV-02: authoritative configurable local/Docker/remote-SSH targets. */
   readonly runnerTargets: RunnerTargetRegistry
+  /** Intake-scoped OCR request authority and normalized unverified results. */
+  readonly ocr: OcrStore
+  /** Canonical layered Settings CAS/history projection. */
+  readonly configWrites: ConfigWriteStore
+  /** Single atomic Settings write boundary for Config/OCR/Runner resources. */
+  readonly settingsWrites: SettingsWriteCoordinator
   /** Append-only methodology assurance stream on the Kernel connection. */
   readonly assurance: AssuranceStore
   /** Append-only Protocol/Synthesis/Knowledge/Writing methodology streams. */
@@ -1005,6 +1030,7 @@ export class ResearchKernel {
   private readonly knowledgeMethodology: KnowledgeMethodologyCoordinator
   private readonly synthesisMethodology: SynthesisMethodologyCoordinator
   private readonly writingMethodology: WritingMethodologyCoordinator
+  private readonly analysisPort: AnalysisPort
 
   /**
    * STORE-06 (storage-migrations.md §4): in-memory plaintext lease tokens,
@@ -1036,6 +1062,7 @@ export class ResearchKernel {
     // final log Artifact row) instead of phantom references.
     const casRoot = options.casRoot ?? join(process.cwd(), '.research-cas')
     this.db = openDatabase(options.dbPath ?? ':memory:', undefined, casRoot)
+    const persistedKernelRuntime = readRuntimeConfigForOwner(this.db, 'kernel')
     this.cas = new ArtifactCas(casRoot)
     this.stagedUploadsRoot = join(this.cas.root, 'staged-uploads')
     // WORK-01 §5: staging dirs carry an explicit 0700 (private staging for
@@ -1075,11 +1102,15 @@ export class ResearchKernel {
     this.metrics = new MetricsStore()
     this.rollout = new MethodologyRolloutStore(this.db)
     this.methodologyTelemetry = new MethodologyTelemetry(this.metrics)
+    this.analysisPort = options.analysisPort ?? deterministicAnalysisPort
     // RUN-01 (§4): signed run manifests are REQUIRED BY DEFAULT — the runner
     // registers an ephemeral Ed25519 key and signs every completion, so the
     // default only affects callers that never sign. Unit tests that exercise
     // unrelated paths opt out explicitly (freshKernel passes false).
-    this.requireSignedManifest = options.requireSignedManifest ?? true
+    const persistedRequireSignedManifest = persistedKernelRuntime['kernel.require_signed_manifest']
+    this.requireSignedManifest = typeof persistedRequireSignedManifest === 'boolean'
+      ? persistedRequireSignedManifest
+      : options.requireSignedManifest ?? true
     // §12.1 (TEX-03): preview scheduling knobs. Defaults keep the explicit
     // preview-builds hook as the canonical trigger; the pending rows are
     // durable, so any request that survived a restart is re-armed below.
@@ -1105,6 +1136,7 @@ export class ResearchKernel {
       ref => serviceIdentityAvailable(ref, this.secretRoot),
       (ref, provided) => serviceIdentityTokenMatches(ref, this.secretRoot, provided),
     )
+    this.ocr = new OcrStore(this.db)
     this.assurance = new AssuranceStore(this.db)
     this.methodology = new MethodologyStore(this.db)
     this.writingReview = new WritingReviewStore(this.db)
@@ -1163,16 +1195,36 @@ export class ResearchKernel {
     // registry validates the values (unknown keys / floor violations throw
     // here — fail fast at construction) and returns the one-way sha256 pin.
     const pinned = validateConfig({
+      ...(options.runtimeConfig ?? {}),
       'kernel.db': options.dbPath ?? ':memory:',
       'kernel.cas': options.casRoot ?? join(process.cwd(), '.research-cas'),
       'kernel.require_signed_manifest': this.requireSignedManifest,
       'kernel.service_token': this.serviceToken ?? '',
+      'kernel.secret_root': this.secretRoot ?? '',
     }, {
       scopes: ['global', 'project', 'kernel'],
       imagesLock: { node_fixture: IMAGES_LOCK.node_fixture, texlive: IMAGES_LOCK.texlive },
     })
-    this.configPinHash = pinned.pinHash
-    this.configRedacted = pinned.redacted
+    const { __images_lock: _trustedImagesLock, ...baseConfig } = pinned.effective
+    this.configWrites = new ConfigWriteStore(this.db, {
+      baseConfig,
+      imagesLock: { node_fixture: IMAGES_LOCK.node_fixture, texlive: IMAGES_LOCK.texlive },
+      projectAuthority: {
+        read: projectId => this.projectConfigSnapshot(projectId),
+        list: () => this.listProjects().map(project => ({
+          project_id: project.project_id,
+          config: this.projectConfigSnapshot(project.project_id)!,
+        })),
+        apply: input => this.applyProjectConfigChanges(input),
+      },
+    })
+    this.settingsWrites = new SettingsWriteCoordinator(this.db, this.configWrites, {
+      writeOcr: (operation, actor) => this.writeOcrSettings(operation, actor),
+      writeRunnerTarget: (operation, actor) => this.writeRunnerTargetSettings(operation, actor),
+    })
+    const effectiveConfig = this.configWrites.effective()
+    this.configPinHash = effectiveConfig.config_pin
+    this.configRedacted = effectiveConfig.config
     // WRITE-RECOVERY-01: a patch crosses the Kernel event connection and the
     // TeX workspace connection. Reconcile every journaled intent before the
     // server can accept work, completing either the TeX mutation or its
@@ -1215,7 +1267,7 @@ export class ResearchKernel {
     this.previewTimers.clear()
     // PTY-01: tear down every live real tty before the stores close (the
     // adapter processes are children of this kernel — no orphans).
-    for (const session of this.pty.listSessions()) {
+    for (const session of this.pty.listAllSessionsForShutdown()) {
       if (session.state !== 'closed') this.ptyNotifyClosed(session.pty_session_id)
     }
     this.tex.close()
@@ -1388,7 +1440,14 @@ export class ResearchKernel {
     session_id?: string | null
     dsh_workspace_id?: string | null
     brief_status?: 'collecting' | 'confirmed'
+    creator_principal_id?: string
+    creator_tenant_id?: string
+    session_issuer?: 'standalone' | 'dsh-plugin' | 'kernel'
   }): ResearchProject {
+    if (input.session_id !== undefined && input.session_id !== null
+      && (input.creator_principal_id === undefined || input.creator_principal_id.trim() === '')) {
+      throw new KernelError(422, 'principal_required', 'a project session link requires an authenticated creator principal')
+    }
     // hardening: store the PARSED brief (defaults applied), never the raw
     // caller object — projection and ledger stay consistent.
     const brief = ResearchBrief.parse(input.brief)
@@ -1488,14 +1547,20 @@ export class ResearchKernel {
       JSON.stringify(project.integrity), project.session_id, project.dsh_workspace_id,
       project.created_at, project.updated_at, JSON.stringify(project.history),
     )
-    if (project.session_id !== null) this.linkSession(project.session_id, project.project_id)
     // API-01 foundation: the creator becomes the first PI member
     // (reconstruction-contracts.md §7: "Project creator 成为 pi").
-    const creator = (input as { creator_principal_id?: string }).creator_principal_id
+    const creator = input.creator_principal_id
     if (creator !== undefined && creator !== '') {
       this.db.prepare(`INSERT INTO project_members (project_id, principal_id, tenant_id, role, created_at, updated_at)
         VALUES (?, ?, ?, 'pi', ?, ?)`)
-        .run(project.project_id, creator, (input as { creator_tenant_id?: string }).creator_tenant_id ?? '', project.created_at, project.created_at)
+        .run(project.project_id, creator, input.creator_tenant_id ?? '', project.created_at, project.created_at)
+    }
+    if (project.session_id !== null) {
+      this.linkSession(project.session_id, project.project_id, {
+        principal_id: creator!,
+        tenant_id: input.creator_tenant_id ?? '',
+        issuer: input.session_issuer ?? 'kernel',
+      })
     }
     this.emit(project.project_id, 'project.created', { project_id: project.project_id, name: project.name })
     return project
@@ -1584,10 +1649,11 @@ export class ResearchKernel {
         }
         const project = this.getProject(existing.project_id)
         if (sessionId !== undefined) {
-          const rawLink = this.db.prepare('SELECT session_id, project_id, linked_at FROM session_links WHERE session_id = ?')
+          const rawLink = this.db.prepare('SELECT session_id, project_id, principal_id, tenant_id, issuer, linked_at FROM session_links WHERE session_id = ?')
             .get(sessionId) as SessionLink | undefined
           const membership = this.listProjectMembers(project.project_id)
           if (rawLink?.project_id !== project.project_id || project.session_id !== sessionId
+            || rawLink.principal_id !== input.creator_principal_id
             || !membership.some(member => member.principal_id === input.creator_principal_id && member.role === 'pi')) {
             throw new KernelError(409, 'session_link_conflict', 'idempotent DSH project receipt is not bound to this session and creator')
           }
@@ -1629,7 +1695,11 @@ export class ResearchKernel {
         creator_tenant_id: input.creator_tenant_id,
       } as Parameters<ResearchKernel['createProject']>[0] & { creator_principal_id: string; creator_tenant_id?: string })
       if (sessionId !== undefined) {
-        this.linkSessionExclusive(sessionId, project.project_id)
+        this.linkSessionExclusive(sessionId, project.project_id, {
+          principal_id: input.creator_principal_id,
+          tenant_id: input.creator_tenant_id ?? '',
+          issuer: 'dsh-plugin',
+        })
         this.db.prepare('UPDATE projects SET session_id = ? WHERE project_id = ?').run(sessionId, project.project_id)
         project.session_id = sessionId
       }
@@ -1661,7 +1731,7 @@ export class ResearchKernel {
     }
     const creatorPrincipal = dshOperatorPrincipal(this.dshPluginToken)
     const out = this.createProjectForGrill({ ...input, creator_principal_id: creatorPrincipal })
-    const link = this.db.prepare('SELECT session_id, project_id, linked_at FROM session_links WHERE session_id = ?')
+    const link = this.db.prepare('SELECT session_id, project_id, principal_id, tenant_id, issuer, linked_at FROM session_links WHERE session_id = ?')
       .get(input.session_id) as SessionLink | undefined
     if (link === undefined || link.project_id !== out.project.project_id) {
       throw new KernelError(409, 'session_link_conflict', 'DSH session link was not committed with the created project')
@@ -1688,13 +1758,18 @@ export class ResearchKernel {
       if (project.status === 'ARCHIVED') {
         throw new KernelError(409, 'project_archived', 'an archived project cannot be linked to a DSH session')
       }
-      const existing = this.db.prepare('SELECT session_id, project_id, linked_at FROM session_links WHERE session_id = ?')
+      const existing = this.db.prepare('SELECT session_id, project_id, principal_id, tenant_id, issuer, linked_at FROM session_links WHERE session_id = ?')
         .get(input.session_id) as SessionLink | undefined
       if (existing !== undefined) {
-        if (existing.project_id === project.project_id) return existing
+        if (existing.project_id === project.project_id && existing.principal_id === principal) return existing
         throw new KernelError(409, 'session_link_conflict', 'DSH session already has an authoritative link')
       }
-      return this.linkSessionExclusive(input.session_id, project.project_id)
+      const member = this.listProjectMembers(project.project_id).find(candidate => candidate.principal_id === principal)!
+      return this.linkSessionExclusive(input.session_id, project.project_id, {
+        principal_id: principal,
+        tenant_id: member.tenant_id,
+        issuer: 'dsh-plugin',
+      })
     })
   }
 
@@ -2203,26 +2278,42 @@ export class ResearchKernel {
   }
 
   /** Link a DSH session to a project (design RSP-006). */
-  private linkSessionExclusive(sessionId: string, projectId: string): SessionLink {
+  private linkSessionExclusive(sessionId: string, projectId: string, authority: {
+    principal_id: string
+    tenant_id: string
+    issuer: SessionLink['issuer']
+  }): SessionLink {
     this.getProject(projectId)
     const existing = this.db.prepare('SELECT project_id FROM session_links WHERE session_id = ?')
       .get(sessionId) as { project_id: string } | undefined
     if (existing !== undefined) {
       throw new KernelError(409, 'session_link_conflict', 'DSH session already has an authoritative link')
     }
-    const link: SessionLink = { session_id: sessionId, project_id: projectId, linked_at: nowIso() }
-    this.db.prepare('INSERT INTO session_links (session_id, project_id, linked_at) VALUES (?, ?, ?)')
-      .run(link.session_id, link.project_id, link.linked_at)
+    const link: SessionLink = { session_id: sessionId, project_id: projectId, ...authority, linked_at: nowIso() }
+    this.db.prepare(`INSERT INTO session_links
+      (session_id, project_id, principal_id, tenant_id, issuer, linked_at) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(link.session_id, link.project_id, link.principal_id, link.tenant_id, link.issuer, link.linked_at)
     this.emit(projectId, 'session.linked', { session_id: sessionId })
     return link
   }
 
   /** Link a DSH session to a project (design RSP-006). */
-  linkSession(sessionId: string, projectId: string): SessionLink {
+  linkSession(sessionId: string, projectId: string, authority: {
+    principal_id: string
+    tenant_id: string
+    issuer: SessionLink['issuer']
+  }): SessionLink {
     this.getProject(projectId)
-    const link: SessionLink = { session_id: sessionId, project_id: projectId, linked_at: nowIso() }
-    this.db.prepare('INSERT INTO session_links (session_id, project_id, linked_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET project_id = excluded.project_id, linked_at = excluded.linked_at')
-      .run(link.session_id, link.project_id, link.linked_at)
+    if (!this.listProjectMembers(projectId).some(member => member.principal_id === authority.principal_id && member.tenant_id === authority.tenant_id)) {
+      throw new KernelError(404, 'project_not_found', 'project not found or access denied')
+    }
+    const link: SessionLink = { session_id: sessionId, project_id: projectId, ...authority, linked_at: nowIso() }
+    this.db.prepare(`INSERT INTO session_links
+      (session_id, project_id, principal_id, tenant_id, issuer, linked_at) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET project_id = excluded.project_id,
+        principal_id = excluded.principal_id, tenant_id = excluded.tenant_id,
+        issuer = excluded.issuer, linked_at = excluded.linked_at`)
+      .run(link.session_id, link.project_id, link.principal_id, link.tenant_id, link.issuer, link.linked_at)
     this.emit(projectId, 'session.linked', { session_id: sessionId })
     return link
   }
@@ -4475,58 +4566,164 @@ export class ResearchKernel {
     return this.runnerTargets.observe(targetId, input)
   }
 
-  /** Configure the active project's default execution target with revision
-   * CAS. The compatible built-in profile follows the target kind so changing
-   * to local-process cannot leave a Docker profile (or vice versa). Job-level
-   * runner_target_id/runner_profile_id remain explicit one-shot overrides. */
-  configureProjectRunnerTarget(input: {
+  // ── Canonical Settings writes (REVIEW-CONFIG-WRITE-03) ────────────────
+
+  private projectConfigSnapshot(projectId: string): Readonly<Record<string, unknown>> | null {
+    const row = this.db.prepare('SELECT * FROM projects WHERE project_id = ? AND deleted_at IS NULL')
+      .get(projectId) as ProjectRow | undefined
+    if (row === undefined) return null
+    const project = projectFromRow(row)
+    return {
+      'execution.runner_profile_id': project.execution.runner_profile_id,
+      'execution.runner_target_id': project.execution.runner_target_id,
+      'execution.network_policy': project.execution.network_policy,
+      'execution.artifact_store': project.execution.artifact_store,
+      'execution.fixture_id': project.execution.fixture_id,
+      'integrity.require_baseline_reproduction': project.integrity.require_baseline_reproduction,
+      'integrity.require_experiment_contract': project.integrity.require_experiment_contract,
+      'integrity.require_claim_evidence_links': project.integrity.require_claim_evidence_links,
+      'integrity.require_clean_room_rerun': project.integrity.require_clean_room_rerun,
+      'integrity.allow_automatic_public_release': project.integrity.allow_automatic_public_release,
+      'integrity.require_signed_manifest': project.integrity.require_signed_manifest,
+    }
+  }
+
+  /** Apply the exact project-scoped config projection to the sole business
+   * authority (`projects.execution`/`projects.integrity`). The surrounding
+   * ConfigWriteStore transaction owns CAS/history atomicity. */
+  private applyProjectConfigChanges(input: {
     project_id: string
-    runner_target_id: string
-    expected_revision: number
-  }): ResearchProject {
+    changes: Readonly<Record<string, unknown>>
+    actor: string
+  }): Readonly<Record<string, unknown>> {
     const project = this.getProject(input.project_id)
-    if (project.revision !== input.expected_revision) {
-      throw new KernelError(409, 'revision_conflict', `expected revision ${input.expected_revision}, got ${project.revision}`)
+    const executionInput: Record<string, unknown> = { ...project.execution }
+    const integrityInput: Record<string, unknown> = { ...project.integrity }
+    for (const [key, value] of Object.entries(input.changes)) {
+      if (key.startsWith('execution.')) executionInput[key.slice('execution.'.length)] = value
+      else if (key.startsWith('integrity.')) integrityInput[key.slice('integrity.'.length)] = value
+      else throw new KernelError(422, 'config_scope_forbidden', `project config key ${key} is not project-owned`)
     }
-    const target = this.listRunnerTargets().find(candidate => candidate.target_id === input.runner_target_id)
-    if (target === undefined) {
-      throw new KernelError(422, 'runner_target_unknown', `runner target '${input.runner_target_id}' is not registered`)
+
+    const targetChanged = Object.hasOwn(input.changes, 'execution.runner_target_id')
+    if (targetChanged) {
+      const targetId = String(executionInput.runner_target_id ?? '')
+      const target = this.listRunnerTargets().find(candidate => candidate.target_id === targetId)
+      if (target === undefined) throw new KernelError(422, 'runner_target_unknown', `runner target '${targetId}' is not registered`)
+      if (!target.enabled || target.draining) {
+        throw new KernelError(409, target.draining ? 'runner_target_draining' : 'runner_target_disabled',
+          `runner target ${target.target_id} is not accepting new jobs`)
+      }
+      const requestedProfile = executionInput.runner_profile_id
+      if (!Object.hasOwn(input.changes, 'execution.runner_profile_id') || requestedProfile === null) {
+        const currentProfileId = project.execution.runner_profile_id === null
+          ? null
+          : resolveRunnerProfileId(project.execution.runner_profile_id)
+        const currentProfile = currentProfileId === null ? null : getRunnerProfile(currentProfileId)
+        executionInput.runner_profile_id = target.kind === 'local-process'
+          ? RUNNER_PROFILE_IDS.isolatedSubprocess
+          : currentProfile?.runner_mode === 'local-docker'
+            ? currentProfile.profile_id
+            : RUNNER_PROFILE_IDS.localDockerCpu
+      }
     }
-    if (!target.enabled || target.draining) {
-      throw new KernelError(409, target.draining ? 'runner_target_draining' : 'runner_target_disabled',
-        `runner target ${target.target_id} is not accepting new jobs`)
+
+    const execution = ExecutionConfig.parse(executionInput)
+    const integrity = IntegrityConfig.parse(integrityInput)
+    if (targetChanged || Object.hasOwn(input.changes, 'execution.runner_profile_id')) {
+      const target = this.getRunnerTarget(execution.runner_target_id)
+      if (execution.runner_profile_id !== null) {
+        const profileId = resolveRunnerProfileId(execution.runner_profile_id)
+        const profile = profileId === null ? null : getRunnerProfile(profileId)
+        if (profile === null || !profile.enabled) {
+          throw new KernelError(422, 'runner_profile_unknown', `runner profile '${execution.runner_profile_id}' is unavailable`)
+        }
+        const compatible = target.kind === 'local-process'
+          ? profile.runner_mode === 'isolated-subprocess'
+          : profile.runner_mode === 'local-docker'
+        if (!compatible) {
+          throw new KernelError(422, 'runner_profile_target_mismatch',
+            `runner profile '${profile.profile_id}' is incompatible with target '${target.target_id}'`)
+        }
+        execution.runner_profile_id = profile.profile_id
+      }
     }
-    const currentProfileId = project.execution.runner_profile_id === null
+
+    const changed = canonicalJsonDeep(execution) !== canonicalJsonDeep(project.execution)
+      || canonicalJsonDeep(integrity) !== canonicalJsonDeep(project.integrity)
+    if (changed) {
+      const now = nowIso()
+      const keys = Object.keys(input.changes).sort()
+      const history = [...project.history, `settings config by ${input.actor}: ${keys.join(', ')}`]
+      const result = this.db.prepare(
+        `UPDATE projects SET execution = ?, integrity = ?, revision = revision + 1, updated_at = ?, history = ?
+         WHERE project_id = ? AND revision = ? AND deleted_at IS NULL`,
+      ).run(
+        JSON.stringify(execution), JSON.stringify(integrity), now, JSON.stringify(history),
+        project.project_id, project.revision,
+      )
+      if (Number(result.changes) !== 1) throw new KernelError(409, 'revision_conflict', 'project changed during Settings update')
+      const updated = this.getProject(project.project_id)
+      this.emit(project.project_id, 'project.execution.configured', {
+        project_id: project.project_id,
+        runner_target_id: updated.execution.runner_target_id,
+        runner_profile_id: updated.execution.runner_profile_id,
+        revision: updated.revision,
+        config_keys: keys,
+      })
+    }
+    return this.projectConfigSnapshot(project.project_id)!
+  }
+
+  private writeOcrSettings(operation: OcrMineruSettingsOperation, actor: string): unknown {
+    const provider = operation.provider.action === 'create'
+      ? this.registerProvider({ ...operation.provider.input, created_by: actor })
+      : this.updateProvider(operation.provider.provider_id, {
+          ...operation.provider.patch,
+          expected_revision: operation.provider.expected_revision,
+          updated_by: actor,
+        })
+    const binding = operation.binding === undefined
       ? null
-      : resolveRunnerProfileId(project.execution.runner_profile_id)
-    const currentProfile = currentProfileId === null ? null : getRunnerProfile(currentProfileId)
-    const profileId = target.kind === 'local-process'
-      ? RUNNER_PROFILE_IDS.isolatedSubprocess
-      : currentProfile?.runner_mode === 'local-docker'
-        ? currentProfile.profile_id
-        : RUNNER_PROFILE_IDS.localDockerCpu
-    const profile = getRunnerProfile(profileId)
-    if (profile === null || !profile.enabled) {
-      throw new KernelError(422, 'runner_profile_unknown', `runner profile '${profileId}' is unavailable`)
+      : this.setProjectModelBinding(operation.binding.project_id, {
+          purpose: 'ocr',
+          provider_id: provider.provider_id,
+          model_id: operation.binding.model_id,
+          expected_provider_revision: operation.binding.expected_provider_revision,
+          expected_revision: operation.binding.expected_revision,
+          updated_by: actor,
+        })
+    return { provider: this.providerView(provider), binding }
+  }
+
+  private writeRunnerTargetSettings(operation: RunnerTargetSettingsOperation, actor: string): unknown {
+    const target = operation.action === 'create'
+      ? this.registerRunnerTarget(operation.input, actor)
+      : this.updateRunnerTarget(operation.target_id, operation.patch)
+    return this.runnerTargetView(target)
+  }
+
+  private configWriteCall<T>(work: () => T): T {
+    try { return work() } catch (error) {
+      if (error instanceof ConfigWriteStoreError) throw new KernelError(error.status, error.code, error.message, error.key)
+      throw error
     }
-    const execution = ExecutionConfig.parse({
-      ...project.execution,
-      runner_target_id: target.target_id,
-      runner_profile_id: profile.profile_id,
-    })
-    const now = nowIso()
-    const history = [...project.history, `runner target -> ${target.target_id} (profile ${profile.profile_id})`]
-    const result = this.db.prepare(
-      'UPDATE projects SET execution = ?, revision = revision + 1, updated_at = ?, history = ? WHERE project_id = ? AND revision = ?',
-    ).run(JSON.stringify(execution), now, JSON.stringify(history), project.project_id, input.expected_revision)
-    if (result.changes !== 1) throw new KernelError(409, 'revision_conflict', 'project revision changed during runner target update')
-    const updated = this.getProject(project.project_id)
-    this.emit(project.project_id, 'project.execution.configured', {
-      runner_target_id: target.target_id,
-      runner_profile_id: profile.profile_id,
-      revision: updated.revision,
-    })
-    return updated
+  }
+
+  configLayer(scope: ConfigWriteScope, scopeId: string): ConfigLayerSafeView {
+    return this.configWriteCall(() => this.configWrites.readLayer(scope, scopeId))
+  }
+
+  configRevisions(scope: ConfigWriteScope, scopeId: string): ReturnType<ConfigWriteStore['listRevisions']> {
+    return this.configWriteCall(() => this.configWrites.listRevisions(scope, scopeId))
+  }
+
+  configEffective(projectId?: string): ConfigEffectiveSafeView {
+    return this.configWriteCall(() => this.configWrites.effective({ projectId }))
+  }
+
+  writeSettingsTransaction(raw: unknown, actor: string): SettingsWriteTransactionReceipt {
+    return this.configWriteCall(() => this.settingsWrites.execute(raw, actor))
   }
 
   // ── Model Provider registry (MODEL-01, init-grill-upload-models.md §4) ──
@@ -4817,6 +5014,120 @@ export class ResearchKernel {
       binding.provider_config_hash, binding.revision, binding.updated_by, binding.updated_at, projectId,
     )
     return binding
+  }
+
+  // ── REVIEW-OCR-03: intake-scoped OCR lifecycle ─────────────────────────
+
+  private ocrStoreCall<T>(work: () => T): T {
+    try { return work() } catch (error) {
+      if (error instanceof OcrStoreError) throw new KernelError(error.status, error.code, error.message)
+      throw error
+    }
+  }
+
+  /**
+   * Create a durable OCR request from one exact, clean Intake artifact and
+   * the project's exact OCR binding. Provider/model/config pins are copied
+   * into the request; no provider or model fallback exists.
+   */
+  createOcrRequest(intakeId: string, raw: OcrRequestCreateInputValue, idempotencyKey: string): OcrRequest {
+    if (idempotencyKey.trim() === '') throw new KernelError(422, 'idempotency_key_required', 'OCR request requires an Idempotency-Key')
+    const input = OcrRequestCreateInput.parse(raw)
+    const row = this.getIntakeSessionRow(intakeId)
+    const session = this.intakeSessionFromRow(row)
+    if (row.project_id === null) throw new KernelError(422, 'ocr_project_required', 'OCR request requires a project-scoped intake')
+    const pages = [...new Set(input.pages)].sort((a, b) => a - b)
+    const requestSha256 = sha256Hex(canonicalJsonDeep({
+      project_id: row.project_id, intake_id: intakeId, source_artifact_id: input.source_artifact_id,
+      provider_id: input.provider_id, model_id: input.model_id, pages, language: input.language,
+    }))
+    const replay = this.ocr.findByIdempotency(idempotencyKey)
+    if (replay !== null) {
+      if (replay.request_sha256 !== requestSha256) throw new KernelError(409, 'idempotency_conflict', 'OCR idempotency key was used for a different request')
+      return replay
+    }
+    this.assertIntakeMutable(session)
+    this.assertIntakeNotExpired(session)
+    const artifact = this.db.prepare(
+      'SELECT artifact_id, sha256, media_type, file_name, quarantine FROM intake_artifacts WHERE intake_id = ? AND artifact_id = ?',
+    ).get(intakeId, input.source_artifact_id) as {
+      artifact_id: string; sha256: string; media_type: string; file_name: string; quarantine: string
+    } | undefined
+    if (artifact === undefined) throw new KernelError(404, 'intake_artifact_not_found', 'OCR source artifact was not found in this intake')
+    if (artifact.quarantine !== 'clean') throw new KernelError(422, 'ocr_source_not_clean', 'OCR source artifact must pass the intake scan')
+    const binding = this.getProjectModelBinding(row.project_id)
+    if (binding === null || binding.purpose !== 'ocr') throw new KernelError(422, 'ocr_binding_required', 'project has no OCR model binding')
+    if (binding.provider_id !== input.provider_id || binding.model_id !== input.model_id) {
+      throw new KernelError(409, 'ocr_binding_mismatch', 'requested provider/model does not match the project OCR binding')
+    }
+    const provider = this.getProvider(binding.provider_id)
+    if (!provider.enabled) throw new KernelError(422, 'provider_disabled', 'bound OCR provider is disabled')
+    const model = provider.models.find(candidate => candidate.model_id === binding.model_id)
+    if (model === undefined || !model.capabilities.includes('ocr')) throw new KernelError(422, 'provider_capability_missing', 'bound model does not provide OCR')
+    const currentHash = this.providerHash(provider)
+    if (provider.revision !== binding.provider_revision || currentHash !== binding.provider_config_hash) {
+      throw new KernelError(409, 'ocr_binding_stale', 'OCR binding must be refreshed after provider configuration changes')
+    }
+    if (provider.kind === 'mineru' && model.model_id !== 'flash' && (provider.credential === undefined || !this.secretRefAvailable(provider.credential))) {
+      throw new KernelError(422, 'provider_credential_unavailable', 'bound MinerU model requires an available server-side SecretRef')
+    }
+    return this.ocrStoreCall(() => this.ocr.create({
+      request_id: randomId('ocr'), project_id: row.project_id!, intake_id: intakeId,
+      source_artifact_id: artifact.artifact_id, source_sha256: artifact.sha256,
+      source_media_type: artifact.media_type, source_file_name: artifact.file_name,
+      provider_id: binding.provider_id, model_id: binding.model_id, provider_revision: binding.provider_revision,
+      provider_config_sha256: binding.provider_config_hash, binding_revision: binding.revision,
+      pages, language: input.language, idempotency_key: idempotencyKey, request_sha256: requestSha256,
+    }))
+  }
+
+  getOcrRequest(intakeId: string, requestId: string): OcrRequest {
+    this.getIntakeSessionRow(intakeId)
+    return this.ocrStoreCall(() => this.ocr.get(intakeId, requestId))
+  }
+
+  cancelOcrRequest(intakeId: string, requestId: string): OcrRequest {
+    this.getIntakeSessionRow(intakeId)
+    return this.ocrStoreCall(() => this.ocr.cancel(intakeId, requestId))
+  }
+
+  getOcrResult(intakeId: string, requestId: string): OcrResult | null {
+    this.getIntakeSessionRow(intakeId)
+    return this.ocrStoreCall(() => this.ocr.result(intakeId, requestId))
+  }
+
+  readOcrRequest(intakeId: string, requestId: string): OcrRequestView {
+    return { request: this.getOcrRequest(intakeId, requestId), result: this.getOcrResult(intakeId, requestId) }
+  }
+
+  /** Worker-only lease-free single-consumer claim. SQLite serializes claims;
+   * a restart requeues any `running` request in OcrStore construction. */
+  claimNextOcrRequest(): OcrRequest | null {
+    return this.ocrStoreCall(() => this.ocr.claimNext())
+  }
+
+  /** Load and re-hash the exact pinned Intake source, never a newer path. */
+  loadOcrSource(request: OcrRequest): OcrSourceBytes {
+    const row = this.db.prepare(
+      'SELECT sha256, media_type, file_name, size_bytes FROM intake_artifacts WHERE intake_id = ? AND artifact_id = ?',
+    ).get(request.intake_id, request.source_artifact_id) as { sha256: string; media_type: string; file_name: string; size_bytes: number } | undefined
+    if (row === undefined || row.sha256 !== request.source_sha256) throw new KernelError(422, 'ocr_source_unavailable', 'pinned OCR source no longer matches its request')
+    let content: Buffer
+    try { content = readFileSync(this.intakeStagedPath(request.intake_id, request.source_sha256)) } catch {
+      throw new KernelError(422, 'ocr_source_unavailable', 'pinned OCR source bytes are unavailable')
+    }
+    if (content.byteLength !== row.size_bytes || createHash('sha256').update(content).digest('hex') !== request.source_sha256) {
+      throw new KernelError(422, 'ocr_source_unavailable', 'pinned OCR source bytes failed integrity verification')
+    }
+    return { artifact_id: request.source_artifact_id, sha256: request.source_sha256, media_type: row.media_type, file_name: row.file_name, content }
+  }
+
+  completeOcrRequest(requestId: string, markdown: string, observations: OcrNormalizedObservation[]): OcrRequest {
+    return this.ocrStoreCall(() => this.ocr.complete(requestId, markdown, observations))
+  }
+
+  failOcrRequest(requestId: string, code: OcrSafeError['code']): OcrRequest {
+    return this.ocrStoreCall(() => this.ocr.fail(requestId, code))
   }
 
   // ── CHUNK-01: batch chunked upload sessions (init-grill-upload-models.md §3) ──
@@ -6355,7 +6666,7 @@ export class ResearchKernel {
         boundImageDigest = validateImageDigest(input.kind as SecureJobKind, digestInput)
       }
     } else {
-      boundImageDigest = input.image_digest ?? runnerTarget.runtime?.image_digest ?? ''
+      boundImageDigest = input.image_digest ?? runnerTarget.runtime?.image_digest ?? runnerProfile.image
     }
 
     // METH-01 Protocol-before-run: formal jobs and every confirmatory job
@@ -6440,6 +6751,10 @@ export class ResearchKernel {
     }
     const payload = {
       ...(input.payload ?? {}),
+      // Config writes are project-scoped. Pin the exact effective Project
+      // projection used for this submission; the instance pin alone omits
+      // execution/integrity changes and cannot reproduce admission later.
+      project_config_pin: this.configEffective(project.project_id).config_pin,
       // §12.5 (P0): the Runner validates the metrics FILE against the bound
       // contract's metric names (primary + secondary) — injected here so the
       // runner never trusts client-supplied names.
@@ -6447,10 +6762,8 @@ export class ResearchKernel {
       // domain-model.md §9.1: secure kinds 固定 opaque runner profile id +
       // profile 记录 config_hash（与 image digest 同一 pin 语义）——runner
       // executeJob 按注册表复算比对，不一致 → environment 失败（不执行）。
-      ...(SECURE_KINDS.includes(input.kind) ? {
-        runner_profile_id: runnerProfile.profile_id,
-        profile_config_hash: runnerProfile.config_hash,
-      } : {}),
+      runner_profile_id: runnerProfile.profile_id,
+      profile_config_hash: runnerProfile.config_hash,
       runner_target_id: runnerTarget.target_id,
       runner_target_kind: runnerTarget.kind,
       runner_target_revision: runnerTarget.revision,
@@ -6646,9 +6959,7 @@ export class ResearchKernel {
   getJob(jobId: string): JobSpecBound & { run_id: string | null } {
     const row = this.db.prepare('SELECT * FROM jobs WHERE job_id = ?').get(jobId) as JobRow | undefined
     if (row === undefined) throw new KernelError(404, 'job_not_found', `job ${jobId} not found`)
-    // STORE-06: the in-memory plaintext token (when the lease is live in
-    // this process) rides on the returned record; legacy rows fall back to
-    // their payload.__lease_token.
+    // STORE-06: only a live process-local claim may expose plaintext.
     return jobFromRow(row, this.db, this.leaseTokens.get(jobId) ?? null)
   }
 
@@ -7101,8 +7412,7 @@ export class ResearchKernel {
 
   /**
    * STORE-06 (storage-migrations.md §4): the persisted lease credential of a
-   * job — the sha256 stored in jobs.lease_token_hash (NULL on legacy rows
-   * claimed before migration 0014).
+   * job — the sha256 stored in jobs.lease_token_hash.
    */
   private leaseHashOf(jobId: string): string | null {
     const row = this.db.prepare('SELECT lease_token_hash FROM jobs WHERE job_id = ?').get(jobId) as { lease_token_hash: string | null } | undefined
@@ -7112,17 +7422,13 @@ export class ResearchKernel {
 
   /**
    * STORE-06: fencing comparison for a caller-supplied lease token. The
-   * comparison object is the sha256 of the token (jobs.lease_token_hash) —
-   * the plaintext is never stored. Legacy rows with an empty hash column
-   * (claimed by the pre-0014 release, token recorded in
-   * payload.__lease_token) fall back to the legacy plaintext comparison so
-   * fencing keeps working on rows that were not migrated/backfilled.
+   * comparison object is the sha256 of the token (jobs.lease_token_hash).
+   * Missing or malformed durable hashes fail closed.
    */
-  private leaseTokenMatches(jobId: string, job: JobRecord, provided: string | null | undefined): boolean {
+  private leaseTokenMatches(jobId: string, provided: string | null | undefined): boolean {
     if (provided === undefined || provided === null) return false
     const hash = this.leaseHashOf(jobId)
-    if (hash !== null) return hash === sha256Hex(provided)
-    return job.lease_token !== null && job.lease_token === provided
+    return hash !== null && hash === sha256Hex(provided)
   }
 
   /**
@@ -7131,7 +7437,7 @@ export class ResearchKernel {
    * both must match the CURRENT lease, otherwise 409 `lease_stale`.
    * Legacy callers that pass neither keep the old owner-only check.
    * STORE-06: the token half of the fence compares sha256(provided) against
-   * jobs.lease_token_hash (legacy rows fall back to the payload token).
+   * jobs.lease_token_hash; a missing hash fails closed.
    */
   heartbeatJob(jobId: string, owner: string, generation?: number | null, token?: string | null, leaseTtlSeconds = 300): JobRecord {
     const job = this.getJob(jobId)
@@ -7146,7 +7452,7 @@ export class ResearchKernel {
         `job ${jobId} heartbeat missing lease fencing fields: expected generation ${job.lease_generation ?? 'n/a'} token hash ${this.leaseHashOf(jobId) ?? 'n/a'}`)
     }
     if ((generation !== undefined && generation !== null) || (token !== undefined && token !== null)) {
-      if (job.lease_generation !== (generation ?? null) || !this.leaseTokenMatches(jobId, job, token)) {
+      if (job.lease_generation !== (generation ?? null) || !this.leaseTokenMatches(jobId, token)) {
         throw new KernelError(409, 'lease_stale',
           `job ${jobId} lease is stale: expected generation ${job.lease_generation ?? 'n/a'} token hash ${this.leaseHashOf(jobId) ?? 'n/a'}, got generation ${generation ?? 'n/a'} token ${token ?? 'n/a'}`)
       }
@@ -7205,13 +7511,12 @@ export class ResearchKernel {
     // §12.6 strict lease fencing (P0): completion of a leased job MUST carry
     // the current generation AND token — missing fields are rejected 409.
     // STORE-06: the token half of the fence compares sha256(provided)
-    // against jobs.lease_token_hash (legacy rows fall back to the payload
-    // token when the hash column is empty).
+    // against jobs.lease_token_hash; a missing hash fails closed.
     if ((input.lease_generation === undefined || input.lease_generation === null) || (input.lease_token === undefined || input.lease_token === null)) {
       throw new KernelError(409, 'lease_stale',
         `job ${input.job_id} completion missing lease fencing fields: expected generation ${job.lease_generation ?? 'n/a'} token hash ${this.leaseHashOf(input.job_id) ?? 'n/a'}`)
     }
-    if (job.lease_generation !== input.lease_generation || !this.leaseTokenMatches(input.job_id, job, input.lease_token)) {
+    if (job.lease_generation !== input.lease_generation || !this.leaseTokenMatches(input.job_id, input.lease_token)) {
       throw new KernelError(409, 'lease_stale',
         `job ${input.job_id} lease is stale: expected generation ${job.lease_generation ?? 'n/a'} token hash ${this.leaseHashOf(input.job_id) ?? 'n/a'}, got generation ${input.lease_generation ?? 'n/a'} token ${input.lease_token ?? 'n/a'}`)
     }
@@ -7373,36 +7678,57 @@ export class ResearchKernel {
   }
 
   /**
-   * §12.7: verify a run manifest against the job it claims to belong to.
-   *  - identity: job_id/project_id/contract_id/lease.generation must match the
-   *    job when present (422 manifest_*_mismatch);
+   * §12.7: verify a current run manifest against the exact claimed Job.
+   *  - identity: run_id/job_id/project_id/contract_id/config_pin and
+   *    lease.generation are required and must match (422 manifest_*_mismatch);
    *  - signature: when `signature` is present the runner key must be
    *    registered (422 manifest_key_unknown), the canonical payload hash must
    *    match `payload_sha256` when provided (422 manifest_hash_mismatch) and
    *    the Ed25519 signature must verify (422 manifest_signature_invalid);
-   *  - unsigned manifests are accepted by default (backward compatible) and
+   *  - unsigned manifests are accepted only when current policy allows and
    *    rejected only when the kernel or project requires signing
    *    (422 manifest_signature_required).
-   * Field-level checks only: partial manifests (legacy callers) keep working.
+   * Partial identity manifests are never accepted.
    */
   private verifyRunManifest(manifest: Record<string, unknown>, job: JobRecord): void {
-    // Job/Project/Contract matching (§12.7) — only when the fields are present.
-    if (manifest.job_id !== undefined && manifest.job_id !== job.job_id) {
+    const manifestLease = manifest.lease
+    if (typeof manifestLease === 'object' && manifestLease !== null
+      && Object.prototype.hasOwnProperty.call(manifestLease, 'token')) {
+      throw new KernelError(422, 'manifest_lease_secret', 'run manifest must not persist the lease token')
+    }
+    if (manifest.job_id !== job.job_id) {
       throw new KernelError(422, 'manifest_job_mismatch', `run manifest job_id ${String(manifest.job_id)} does not match job ${job.job_id}`)
     }
-    if (manifest.project_id !== undefined && manifest.project_id !== job.project_id) {
+    if (manifest.project_id !== job.project_id) {
       throw new KernelError(422, 'manifest_project_mismatch', `run manifest project_id ${String(manifest.project_id)} does not match project ${job.project_id}`)
     }
-    if (manifest.contract_id !== undefined && (job.contract_id === null || manifest.contract_id !== job.contract_id)) {
+    if (manifest.contract_id !== job.contract_id) {
       throw new KernelError(422, 'manifest_contract_mismatch',
         `run manifest contract_id ${String(manifest.contract_id)} does not match job contract ${job.contract_id ?? 'none'}`)
     }
-    // Lease fencing recorded inside the manifest (§12.6/§12.7).
-    const lease = manifest.lease
-    if (typeof lease === 'object' && lease !== null && typeof (lease as { generation?: unknown }).generation === 'number'
-      && job.lease_generation !== null && (lease as { generation: number }).generation !== job.lease_generation) {
+    const runRow = this.db.prepare('SELECT run_id FROM runs WHERE job_id = ? AND attempt_no = ?')
+      .get(job.job_id, job.attempts) as { run_id: string } | undefined
+    if (runRow === undefined || manifest.run_id !== runRow.run_id) {
+      throw new KernelError(422, 'manifest_run_mismatch',
+        `run manifest run_id ${String(manifest.run_id)} does not match the current claim ${runRow?.run_id ?? 'missing'}`)
+    }
+    const expectedConfigPin = job.payload.project_config_pin
+    if (typeof expectedConfigPin !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(expectedConfigPin)
+      || manifest.config_pin !== expectedConfigPin) {
+      throw new KernelError(422, 'manifest_config_mismatch',
+        `run manifest config_pin ${String(manifest.config_pin)} does not match the job project config pin`)
+    }
+    // Lease provenance is current-only: exactly one generation field, no
+    // token or extension keys that could become an accidental secret sink.
+    const lease = manifestLease
+    const leaseKeys = typeof lease === 'object' && lease !== null && !Array.isArray(lease)
+      ? Object.keys(lease)
+      : []
+    if (job.lease_generation === null || leaseKeys.length !== 1 || leaseKeys[0] !== 'generation'
+      || typeof (lease as { generation?: unknown } | null)?.generation !== 'number'
+      || (lease as { generation: number }).generation !== job.lease_generation) {
       throw new KernelError(422, 'manifest_lease_mismatch',
-        `run manifest lease generation ${String((lease as { generation: number }).generation)} does not match job lease generation ${job.lease_generation}`)
+        `run manifest lease ${JSON.stringify(lease)} does not match exact job lease generation ${job.lease_generation}`)
     }
 
     const signature = manifest.signature
@@ -7570,9 +7896,8 @@ export class ResearchKernel {
           `job ${input.jobId} terminal frames must carry BOTH lease owner and token (got owner=${String(input.owner)} token=${String(input.lease_token)})`)
       }
       // STORE-06: the token half of the fence compares sha256(provided)
-      // against jobs.lease_token_hash (legacy rows fall back to the payload
-      // token when the hash column is empty).
-      if (input.owner !== job.lease_owner || !this.leaseTokenMatches(input.jobId, job, input.lease_token)) {
+      // against jobs.lease_token_hash; a missing hash fails closed.
+      if (input.owner !== job.lease_owner || !this.leaseTokenMatches(input.jobId, input.lease_token)) {
         throw new KernelError(409, 'lease_stale',
           `job ${input.jobId} terminal frames lease mismatch: expected owner ${job.lease_owner ?? 'n/a'} token hash ${this.leaseHashOf(input.jobId) ?? 'n/a'}, got owner ${input.owner} token ${input.lease_token}`)
       }
@@ -8173,6 +8498,32 @@ export class ResearchKernel {
     return this.ptyAdapter ?? new NullPtyAdapter()
   }
 
+  /** Build the PTY authority against current durable state for every call.
+   * No context, membership, runner binding or adapter decision is cached. */
+  private currentPtyContextAuthority(): PtyContextAuthority {
+    return new PtyContextAuthority(this.db, {
+      getProject: projectId => this.getProject(projectId),
+      getProjectMember: (projectId, principalId) => {
+        const member = this.listProjectMembers(projectId).find(candidate => candidate.principal_id === principalId)
+        return member === undefined ? null : { tenant_id: member.tenant_id }
+      },
+      getRunnerTarget: targetId => {
+        try { return this.getRunnerTarget(targetId) } catch { return null }
+      },
+      activeAdapterId: () => this.ptyAdapter?.id ?? null,
+    })
+  }
+
+  /** Current principal's safe Research/Chat/Subagent context projection. */
+  ptyContexts(projectId: string, principalId: string): import('@dsh-scholar/research-schemas').PtyContext[] {
+    return this.currentPtyContextAuthority().list(projectId, principalId)
+  }
+
+  /** Resolve one opaque context id to server-owned authority. */
+  ptyResolveContext(contextId: string, principalId: string): PtyResolvedContext {
+    return this.currentPtyContextAuthority().resolve(contextId, principalId)
+  }
+
   /**
    * PTY-01: a session transitioned to CLOSED (explicit close control,
    * explicit close, idle TTL sweep, lease expiry) — the adapter must tear
@@ -8190,6 +8541,50 @@ export class ResearchKernel {
     }
   }
 
+  /** Re-validate a server-resolved context against current project/runner
+   * authority. A stale project target, disabled target or unavailable remote
+   * target never falls back to the host PTY adapter. */
+  private assertPtyContextCurrent(context: PtyResolvedContext): void {
+    const project = this.getProject(context.project_id)
+    if (!this.listProjectMembers(project.project_id).some(member => member.principal_id === context.principal_id)) {
+      throw new PtyError('pty_principal_mismatch', 'PTY context owner is no longer a project member')
+    }
+    if (project.execution.runner_profile_id !== context.profile
+      || project.execution.runner_target_id !== context.target) {
+      throw new PtyError('pty_context_stale', 'PTY context execution binding is stale')
+    }
+    const profile = getRunnerProfile(context.profile)
+    if (profile === null || !profile.enabled) {
+      throw new PtyError('pty_target_unsupported', `runner profile ${context.profile} is unavailable`)
+    }
+    const target = this.listRunnerTargets().find(candidate => candidate.target_id === context.target)
+    if (target === undefined || target.kind !== context.target_kind) {
+      throw new PtyError('pty_context_stale', 'PTY context target no longer matches the registered target')
+    }
+    if (!target.enabled || target.draining) {
+      throw new PtyError('pty_target_unavailable', `runner target ${target.target_id} is not accepting PTY sessions`)
+    }
+    if (target.kind === 'remote-ssh' && target.health !== 'online') {
+      throw new PtyError('pty_target_unavailable', `remote runner target ${target.target_id} is not online`)
+    }
+    const requiredAdapter = target.kind === 'local-process'
+      ? 'local-pty'
+      : (target.kind === 'local-docker' ? 'local-docker' : 'remote-runner')
+    if (this.ptyAdapter?.id !== requiredAdapter) {
+      throw new PtyError('pty_target_unsupported', `runner target ${target.target_id} has no compatible PTY adapter`)
+    }
+  }
+
+  /** PTY mutations are terminal_write capabilities. Read-only project
+   * roles may inspect safe context/session projections, but they cannot
+   * create, attach, detach, control or close an interactive process. */
+  private assertPtyTerminalWrite(context: PtyResolvedContext): void {
+    const role = this.getProjectMemberRole(context.project_id, context.principal_id)
+    if (role !== 'pi' && role !== 'operator' && role !== 'researcher') {
+      throw new KernelError(403, 'role_forbidden', 'terminal_write requires PI, operator or researcher role')
+    }
+  }
+
   /**
    * PTY-01 open: validate the pinned request (project, workspace, relative
    * cwd), create the durable session (state 'open', lease pinned) and hand
@@ -8199,16 +8594,33 @@ export class ResearchKernel {
    * (fail-closed — the HTTP layer injects the authenticated principal).
    */
   ptyOpen(request: import('@dsh-scholar/research-schemas').PtyOpenRequest, opts: {
-    principal: { principal_id: string; tenant_id?: string }
+    context: PtyResolvedContext
     adapter?: PtyAdapter | null
   }): import('@dsh-scholar/research-schemas').PtySession {
-    this.getProject(request.project_id)
-    this.resolveWorkspace(request.workspace_id)
+    const context = opts.context
+    this.assertPtyContextCurrent(context)
+    this.assertPtyTerminalWrite(context)
+    if (request.context_id !== context.context_id) {
+      throw new PtyError('pty_context_mismatch', 'PTY open request does not match the resolved context')
+    }
+    const workspace = this.resolveWorkspace(request.workspace_id)
+    if (workspace.project_id !== context.project_id) {
+      throw new PtyError('pty_context_mismatch', 'PTY workspace belongs to another context project')
+    }
     const cwd = validatePtyCwd(request.cwd)
-    const session = this.pty.createSession({ ...request, cwd }, opts.principal, {
-      config_hash: request.config_hash ?? this.configPinHash,
-      idle_ttl_s: request.idle_ttl_s,
-      retention_bytes: request.retention_bytes,
+    const effectiveConfig = this.configEffective(context.project_id)
+    const positiveInteger = (key: string): number => {
+      const value = effectiveConfig.config[key]
+      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+        throw new KernelError(500, 'config_effective_invalid', `effective config key ${key} is not a positive integer`)
+      }
+      return value
+    }
+    const session = this.pty.createContextSession({ ...request, cwd }, context, {
+      config_hash: effectiveConfig.config_pin,
+      idle_ttl_s: positiveInteger('kernel.pty_idle_ttl_s'),
+      retention_bytes: positiveInteger('kernel.pty_retention_bytes'),
+      lease_ttl_s: positiveInteger('kernel.pty_lease_ttl_s'),
       adapter_id: (opts.adapter ?? this.ptyAdapter)?.id ?? 'none',
     })
     const adapter = opts.adapter !== undefined ? opts.adapter : this.ptyAdapter
@@ -8224,9 +8636,8 @@ export class ResearchKernel {
         profile: session.profile,
         target: session.target,
         config_hash: session.config_hash,
-        // STORE-06: the spawn plan always receives the freshly-minted
-        // plaintext token (createSession pins it in memory; the fallback is
-        // unreachable for a just-created session).
+        // STORE-06: the spawn plan receives only the freshly-minted token
+        // returned by createContextSession in this process.
         lease_token: session.lease_token ?? '',
       })
       if (!result.ok) {
@@ -8237,35 +8648,56 @@ export class ResearchKernel {
     return session
   }
 
-  ptyGet(sessionId: string): import('@dsh-scholar/research-schemas').PtySession {
-    return this.pty.getSession(sessionId)
+  /** Owner-checked context discovery for the HTTP adapter. The adapter must
+   * resolve the returned id through its trusted context authority and then
+   * call one of the fully fenced methods below. */
+  ptyContextForOwner(sessionId: string, principal: { principal_id: string }): {
+    project_id: string
+    context_kind: import('@dsh-scholar/research-schemas').PtyContextKind
+    context_id: string
+    parent_session_id: string | null
+  } {
+    return this.pty.contextForOwner(sessionId, principal)
   }
 
-  ptyList(projectId?: string): import('@dsh-scholar/research-schemas').PtySession[] {
-    return this.pty.listSessions(projectId)
+  ptyGet(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): import('@dsh-scholar/research-schemas').PtySession {
+    this.assertPtyContextCurrent(context)
+    return this.pty.assertContextAccess(sessionId, context, expectedGeneration)
+  }
+
+  ptyListContext(context: PtyResolvedContext): import('@dsh-scholar/research-schemas').PtyContextSessions {
+    this.assertPtyContextCurrent(context)
+    return this.pty.listContextSessions(context)
   }
 
   /** Attach a wire (open|detached → attached); generation bumps for
    * reconnect fencing (generation + after_seq). */
-  ptyAttach(sessionId: string): import('@dsh-scholar/research-schemas').PtySession {
-    return this.pty.attach(sessionId)
+  ptyAttach(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): import('@dsh-scholar/research-schemas').PtySession {
+    this.assertPtyContextCurrent(context)
+    this.assertPtyTerminalWrite(context)
+    return this.pty.attachContext(sessionId, context, expectedGeneration)
   }
 
   /** Detach the wire — the process keeps running (a PTY disconnect never
    * ends the process, execution-runtime.md §6.1). */
-  ptyDetach(sessionId: string): import('@dsh-scholar/research-schemas').PtySession {
-    return this.pty.detach(sessionId)
+  ptyDetach(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): import('@dsh-scholar/research-schemas').PtySession {
+    this.assertPtyContextCurrent(context)
+    this.assertPtyTerminalWrite(context)
+    return this.pty.detachContext(sessionId, context, expectedGeneration)
   }
 
   /** Permission revocation: detach immediately (or no-op when already
    * detached); the session stays until close/TTL. */
-  ptyRevoke(sessionId: string): import('@dsh-scholar/research-schemas').PtySession {
-    return this.pty.revoke(sessionId)
+  ptyRevoke(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): import('@dsh-scholar/research-schemas').PtySession {
+    this.assertPtyContextCurrent(context)
+    return this.pty.revokeContext(sessionId, context, expectedGeneration)
   }
 
   /** Explicit close (idempotent) — the real process is torn down too. */
-  ptyClose(sessionId: string, reason: import('@dsh-scholar/research-schemas').PtyCloseReason = 'explicit'): import('@dsh-scholar/research-schemas').PtySession {
-    const session = this.pty.closeSession(sessionId, reason)
+  ptyClose(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): import('@dsh-scholar/research-schemas').PtySession {
+    this.assertPtyContextCurrent(context)
+    this.assertPtyTerminalWrite(context)
+    const session = this.pty.closeContext(sessionId, context, expectedGeneration)
     this.ptyNotifyClosed(sessionId)
     return session
   }
@@ -8277,9 +8709,11 @@ export class ResearchKernel {
    * adapter is attached (`delivered` in the result). A `close` control also
    * tears the real process down.
    */
-  ptyControl(sessionId: string, request: import('@dsh-scholar/research-schemas').PtyControlRequest, adapter?: PtyAdapter | null): PtyControlResult {
-    const result = this.pty.applyControl(sessionId, request, adapter !== undefined ? adapter : this.ptyAdapter)
-    if (request.type === 'close') this.ptyNotifyClosed(sessionId)
+  ptyControl(sessionId: string, request: import('@dsh-scholar/research-schemas').PtyControlRequest, context: PtyResolvedContext, adapter?: PtyAdapter | null): PtyControlResult {
+    this.assertPtyContextCurrent(context)
+    this.assertPtyTerminalWrite(context)
+    const result = this.pty.applyContextControl(sessionId, request, context, adapter !== undefined ? adapter : this.ptyAdapter)
+    if (request.type === 'close' && !result.idempotent) this.ptyNotifyClosed(sessionId)
     return result
   }
 
@@ -8291,8 +8725,9 @@ export class ResearchKernel {
 
   /** Read output frames after a cursor; gap=true when retention evicted
    * seqs the client missed (pty-reconnect-seq / retention-gap). */
-  ptyFrames(sessionId: string, afterSeq: number): ReturnType<PtySessionStore['frames']> {
-    return this.pty.frames(sessionId, afterSeq)
+  ptyFrames(sessionId: string, afterSeq: number, context: PtyResolvedContext, expectedGeneration: number): ReturnType<PtySessionStore['frames']> {
+    this.assertPtyContextCurrent(context)
+    return this.pty.framesContext(sessionId, afterSeq, context, expectedGeneration)
   }
 
   /** PTY-01 (hardening §5 P0-2): constant-time lease verification for
@@ -8303,8 +8738,8 @@ export class ResearchKernel {
     return this.pty.verifyLease(sessionId, token)
   }
 
-  /** Idle TTL sweep — closes every session idle longer than its
-   * idle_ttl_s (read from the Config Schema / session row) and tears the
+  /** Idle TTL sweep — closes every session idle longer than the
+   * idle_ttl_s pinned in its session row and tears the
    * real tty down. Runs on the kernel-owned timer plus explicit calls. */
   ptySweepIdle(now = Date.now()): string[] {
     const closed = this.pty.sweepIdle(now)
@@ -8313,7 +8748,9 @@ export class ResearchKernel {
   }
 
   /** Touch activity (a reconnecting wire resets the idle TTL). */
-  ptyTouch(sessionId: string): import('@dsh-scholar/research-schemas').PtySession {
+  ptyTouch(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): import('@dsh-scholar/research-schemas').PtySession {
+    this.assertPtyContextCurrent(context)
+    this.pty.assertContextAccess(sessionId, context, expectedGeneration)
     return this.pty.touch(sessionId)
   }
 
@@ -8842,7 +9279,7 @@ export class ResearchKernel {
       const hit = treatmentRuns.find(t => t.seed === s)!
       return hit.value
     })
-    const worker = computePairedAnalysis(
+    const worker = this.analysisPort.computePaired(
       {
         contract_id: contractId ?? 'auto',
         metric: { name: metric ?? 'auto', direction, aggregation: 'mean' },
@@ -10018,9 +10455,7 @@ export class ResearchKernel {
     jobs: Array<Pick<JobRecord, 'job_id' | 'kind' | 'status'>>
     budget: BudgetRecord
     counts: { ideas: number; contracts: number; claims: number; evidence: number; artifacts: number; corpus_snapshots: number }
-    /** GUIDE-01 legacy: labels of the non-done structured actions (stable derivation). */
-    next_actions: string[]
-    /** GUIDE-01 authoritative: structured next-step projection (code/label/reason/required/route/capability/revision/state). */
+    /** GUIDE-01 authoritative structured next-step projection. */
     next_actions_v2: NextAction[]
   } {
     const project = this.getProject(projectId)
@@ -10098,7 +10533,6 @@ export class ResearchKernel {
       run_outcome_observations: runOutcomeObservations.pending,
       synthesis_requests: synthesisRequests.pending,
     })
-    const nextActions = legacyNextActionStrings(nextActionsV2)
     return {
       project,
       pending_gates: pendingGates,
@@ -10108,7 +10542,6 @@ export class ResearchKernel {
         ideas: count('ideas'), contracts: count('contracts'), claims: count('claims'),
         evidence: count('evidence'), artifacts: count('artifacts'), corpus_snapshots: count('corpus_snapshots'),
       },
-      next_actions: nextActions,
       next_actions_v2: nextActionsV2,
     }
   }

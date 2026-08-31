@@ -15,6 +15,10 @@ export const zh = {
   // open form
   'pty.form.title': '打开交互终端',
   'pty.form.desc': '打开真实 PTY 会话(preset shell + 相对 cwd)。PTY 不是正式 Run,输出不能成为 Evidence。',
+  'pty.form.label': '终端标签',
+  'pty.form.labelPlaceholder': '例如 训练监控',
+  'pty.form.purpose': '用途',
+  'pty.form.purposePlaceholder': '说明这个终端要完成什么',
   'pty.form.workspace': '工作区',
   'pty.form.workspaceEmpty': '该项目没有工作区 — 请先在 Workspace 侧创建。',
   'pty.form.workspaceAria': '选择工作区',
@@ -28,6 +32,10 @@ export const zh = {
   'pty.form.target': 'Target',
   'pty.form.open': '打开终端',
   'pty.form.opening': '打开中…',
+  'pty.context.loading': '正在读取当前研究会话的终端上下文…',
+  'pty.context.none': '当前项目没有可用的研究、对话或子代理终端上下文。',
+  'pty.context.selectAria': '选择终端上下文',
+  'pty.context.newTerminal': '新建终端',
   // session toolbar
   'pty.action.resize': '调整大小',
   'pty.action.signal': '发送 {signal}',
@@ -79,6 +87,9 @@ export const zh = {
   'pty.error.network': '网络错误 — 自动重试中。',
   'pty.error.generic': '请求失败({code})。',
   'pty.error.control': '控制帧发送失败({code}) — 已保留排队,可重试。',
+  'pty.error.generation': '终端会话代际已变化 — 请重新选择或重新打开终端。',
+  'pty.error.context': '终端上下文或父会话已变化,已停止发送。',
+  'pty.error.target': '配置的实验目标离线或不支持交互终端,不会回退到本机。',
 } as const
 
 export type PtyKey = keyof typeof zh
@@ -92,6 +103,10 @@ export const en: Record<PtyKey, string> = {
   'pty.state.error': 'error',
   'pty.form.title': 'Open interactive terminal',
   'pty.form.desc': 'Opens a real PTY session (preset shell + relative cwd). A PTY is not a formal run; its output can never become Evidence.',
+  'pty.form.label': 'Terminal label',
+  'pty.form.labelPlaceholder': 'e.g. training monitor',
+  'pty.form.purpose': 'Purpose',
+  'pty.form.purposePlaceholder': 'What this terminal is for',
   'pty.form.workspace': 'Workspace',
   'pty.form.workspaceEmpty': 'This project has no workspaces — create one on the Workspace side first.',
   'pty.form.workspaceAria': 'select workspace',
@@ -105,6 +120,10 @@ export const en: Record<PtyKey, string> = {
   'pty.form.target': 'Target',
   'pty.form.open': 'Open terminal',
   'pty.form.opening': 'Opening…',
+  'pty.context.loading': 'Loading terminal contexts for the current research session…',
+  'pty.context.none': 'No Research, Chat, or Subagent terminal context is available for this project.',
+  'pty.context.selectAria': 'select terminal context',
+  'pty.context.newTerminal': 'New terminal',
   'pty.action.resize': 'Resize',
   'pty.action.signal': 'Send {signal}',
   'pty.action.detach': 'Detach',
@@ -151,4 +170,7 @@ export const en: Record<PtyKey, string> = {
   'pty.error.network': 'Network error — retrying.',
   'pty.error.generic': 'Request failed ({code}).',
   'pty.error.control': 'Control delivery failed ({code}) — kept queued, retry available.',
+  'pty.error.generation': 'The terminal generation changed — select or reopen the terminal.',
+  'pty.error.context': 'The terminal context or exact parent changed; input was stopped.',
+  'pty.error.target': 'The configured execution target is offline or lacks PTY support; no local fallback was used.',
 }

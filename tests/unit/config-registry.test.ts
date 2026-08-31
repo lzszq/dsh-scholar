@@ -17,7 +17,8 @@ describe('config registry — key coverage', () => {
     // ExecutionConfig + IntegrityConfig full field coverage.
     for (const key of Object.keys(ExecutionConfig.shape)) expect(keys.has(`execution.${key}`)).toBe(true)
     for (const key of Object.keys(IntegrityConfig.shape)) expect(keys.has(`integrity.${key}`)).toBe(true)
-    // kernel CLI (port/host/token/service-token/db/cas/endpoint-file).
+    // Kernel runtime config includes managed secrets, but its CLI exposes only
+    // non-secret process options.
     for (const key of ['kernel.host', 'kernel.port', 'kernel.token', 'kernel.service_token', 'kernel.db', 'kernel.cas', 'kernel.secret_root', 'kernel.endpoint_file']) {
       expect(keys.has(key)).toBe(true)
     }
@@ -29,7 +30,8 @@ describe('config registry — key coverage', () => {
     for (const key of ['orchestrator.kernel', 'orchestrator.db', 'orchestrator.poll_ms', 'orchestrator.once', 'orchestrator.dry_run']) {
       expect(keys.has(key)).toBe(true)
     }
-    // standalone CLI (--host/--port/--token/--principal/--data-dir/--kernel-port/--kernel-data-dir/--no-token).
+    // Standalone runtime config includes its managed token file, but the CLI
+    // exposes only non-secret process options (plus explicit --no-token).
     for (const key of ['standalone.host', 'standalone.port', 'standalone.token', 'standalone.principal', 'standalone.frame_ancestors', 'standalone.data_dir', 'standalone.kernel_port', 'standalone.kernel_data_dir', 'standalone.no_token']) {
       expect(keys.has(key)).toBe(true)
     }
@@ -42,6 +44,7 @@ describe('config registry — key coverage', () => {
     expect(envs.get('kernel.token')).toBe('DSH_SCHOLAR_KERNEL_TOKEN')
     expect(envs.get('kernel.service_token')).toBe('DSH_SCHOLAR_SERVICE_TOKEN')
     expect(envs.get('kernel.secret_root')).toBe('DSH_SCHOLAR_SECRET_ROOT')
+    expect(envs.get('runner.token')).toBe('DSH_SCHOLAR_KERNEL_TOKEN')
     expect(envs.get('runner.service_token')).toBe('DSH_SCHOLAR_SERVICE_TOKEN')
     expect(envs.get('runner.target_token')).toBe('DSH_SCHOLAR_RUNNER_TARGET_TOKEN')
     expect(envs.get('kernel.endpoint_file')).toBe('DSH_SCHOLAR_KERNEL_ENDPOINT_FILE')
@@ -135,6 +138,17 @@ describe('config registry — validateConfig', () => {
     expect(() => validateConfig({ 'runner.poll_ms': -5 })).toThrow(ConfigRegistryError)
     expect(() => validateConfig({ 'execution.runner_profile': 'local-docker-cpu' })).toThrow(/unknown config key/)
     expect(() => validateConfig({ 'kernel.port': 99999 })).toThrow(ConfigRegistryError)
+    expect(validateConfig({}, { scopes: ['kernel'] }).effective).toMatchObject({
+      'kernel.pty_idle_ttl_s': 900,
+      'kernel.pty_retention_bytes': 1024 * 1024,
+      'kernel.pty_lease_ttl_s': 3600,
+    })
+    expect(getConfigKey('kernel.pty_idle_ttl_s')?.write).toEqual({
+      allowedScopes: ['runtime'], apply: 'hot', securityMerge: 'replace',
+    })
+    expect(() => validateConfig({ 'kernel.pty_idle_ttl_s': 0 }, { scopes: ['kernel'] })).toThrow(ConfigRegistryError)
+    expect(() => validateConfig({ 'kernel.pty_retention_bytes': 1024 }, { scopes: ['kernel'] })).toThrow(ConfigRegistryError)
+    expect(() => validateConfig({ 'kernel.pty_lease_ttl_s': 86_401 }, { scopes: ['kernel'] })).toThrow(ConfigRegistryError)
   })
 
   it('rejects unknown keys (and out-of-scope keys)', () => {
@@ -172,16 +186,28 @@ describe('config registry — validateConfig', () => {
 })
 
 describe('config registry — parseCli (binary CLI parsing)', () => {
+  it('does not accept kernel, standalone, or runner secret credentials on argv', () => {
+    for (const [scope, flag] of [
+      ['kernel', '--token'],
+      ['kernel', '--service-token'],
+      ['standalone', '--token'],
+      ['runner-profile', '--token'],
+      ['runner-profile', '--service-token'],
+      ['runner-profile', '--target-token'],
+    ] as const) {
+      expect(() => parseCli([flag, 'argv-secret-canary'], scope)).toThrowError(/unknown CLI flag/)
+      expect(generateCliHelp(scope)).not.toContain(flag)
+    }
+  })
+
   it('kernel: every registry flag maps to its canonical key with typed values', () => {
     const parsed = parseCli(['--db', '/tmp/k.db', '--cas', '/tmp/cas', '--port', '7413', '--host', '0.0.0.0',
-      '--token', 't1', '--service-token', 's1', '--secret-root', '/tmp/secrets', '--endpoint-file', '/tmp/ep.json'], 'kernel')
+      '--secret-root', '/tmp/secrets', '--endpoint-file', '/tmp/ep.json'], 'kernel')
     expect(parsed).toEqual({
       'kernel.db': '/tmp/k.db',
       'kernel.cas': '/tmp/cas',
       'kernel.port': 7413,
       'kernel.host': '0.0.0.0',
-      'kernel.token': 't1',
-      'kernel.service_token': 's1',
       'kernel.secret_root': '/tmp/secrets',
       'kernel.endpoint_file': '/tmp/ep.json',
     })
@@ -195,7 +221,7 @@ describe('config registry — parseCli (binary CLI parsing)', () => {
   it('runner: every registry flag maps to its canonical key', () => {
     expect(parseCli(['--kernel', 'http://127.0.0.1:9999', '--mode', 'docker', '--poll-ms', '150',
       '--timeout-ms', '30000', '--heartbeat-ms', '1500', '--cancel-poll-ms', '1000', '--owner', 'x',
-      '--key-file', '/tmp/k.pem', '--token', 'rt', '--service-token', 'rs', '--target-token', 'target-rs'], 'runner-profile')).toEqual({
+      '--key-file', '/tmp/k.pem'], 'runner-profile')).toEqual({
       'runner.kernel': 'http://127.0.0.1:9999',
       'runner.mode': 'docker',
       'runner.poll_ms': 150,
@@ -204,21 +230,17 @@ describe('config registry — parseCli (binary CLI parsing)', () => {
       'runner.cancel_poll_ms': 1000,
       'runner.owner': 'x',
       'runner.key_file': '/tmp/k.pem',
-      'runner.token': 'rt',
-      'runner.service_token': 'rs',
-      'runner.target_token': 'target-rs',
     })
   })
 
   it('standalone: every registry flag maps to its canonical key (booleans included)', () => {
     expect(parseCli(['--host', '127.0.0.1', '--port', '18611', '--kernel-port', '17414',
-      '--kernel-data-dir', '/tmp/kernel', '--data-dir', '/tmp/d', '--token', 'st', '--principal', 'ops-1', '--frame-ancestors', 'http://127.0.0.1:3080'], 'standalone')).toEqual({
+      '--kernel-data-dir', '/tmp/kernel', '--data-dir', '/tmp/d', '--principal', 'ops-1', '--frame-ancestors', 'http://127.0.0.1:3080'], 'standalone')).toEqual({
       'standalone.host': '127.0.0.1',
       'standalone.port': 18611,
       'standalone.kernel_port': 17414,
       'standalone.kernel_data_dir': '/tmp/kernel',
       'standalone.data_dir': '/tmp/d',
-      'standalone.token': 'st',
       'standalone.principal': 'ops-1',
       'standalone.frame_ancestors': 'http://127.0.0.1:3080',
     })
@@ -287,11 +309,12 @@ describe('config registry — parseCli (binary CLI parsing)', () => {
     const tweaked = validateConfig(parseCli(['--port', '7413'], 'kernel'), { scopes: ['kernel'] })
     expect(tweaked.effective['kernel.port']).toBe(7413)
     expect(tweaked.pinHash).not.toBe(base.pinHash)
-    // a CLI-provided secret changes the pin one-way and stays redacted
-    const withSecret = validateConfig(parseCli(['--token', 'cli-secret'], 'kernel'), { scopes: ['kernel'] })
+    // A secret supplied through the managed env/file seam still changes the
+    // pin one-way and remains redacted; it is never parsed from argv.
+    const withSecret = validateConfig({ 'kernel.token': 'managed-secret' }, { scopes: ['kernel'] })
     expect(withSecret.pinHash).not.toBe(base.pinHash)
     expect(withSecret.redacted['kernel.token']).toBe('<redacted>')
-    expect(JSON.stringify(withSecret.redacted)).not.toContain('cli-secret')
+    expect(JSON.stringify(withSecret.redacted)).not.toContain('managed-secret')
   })
 
   it('every scope flag is unique and parseCli round-trips the registry flag list', () => {
@@ -531,16 +554,21 @@ describe('config registry — generated artifacts', () => {
   it('CLI help text is generated per scope from the registry flags', () => {
     const kernelHelp = generateCliHelp('kernel')
     expect(kernelHelp).toContain('--port')
-    expect(kernelHelp).toContain('--service-token')
+    expect(kernelHelp).not.toContain('--token')
+    expect(kernelHelp).not.toContain('--service-token')
     expect(kernelHelp).toContain('[secret]')
     const runnerHelp = generateCliHelp('runner-profile')
     for (const flag of ['--poll-ms', '--heartbeat-ms', '--timeout-ms', '--cancel-poll-ms', '--mode', '--owner']) {
       expect(runnerHelp).toContain(flag)
     }
+    for (const secretFlag of ['--token', '--service-token', '--target-token']) {
+      expect(runnerHelp).not.toContain(secretFlag)
+    }
     const standaloneHelp = generateCliHelp('standalone')
-    for (const flag of ['--host', '--port', '--token', '--principal', '--no-token']) {
+    for (const flag of ['--host', '--port', '--principal', '--no-token']) {
       expect(standaloneHelp).toContain(flag)
     }
+    expect(standaloneHelp).not.toContain('--token')
     const orchestratorHelp = generateCliHelp('orchestrator')
     for (const flag of ['--kernel', '--db', '--poll-ms', '--once', '--dry-run']) {
       expect(orchestratorHelp).toContain(flag)

@@ -27,10 +27,9 @@
  * kernel never routes pty frames into those tables. `pty-not-evidence`
  * (tests/unit/pty-session.test.ts) pins that invariant.
  *
- * The real tty adapter (node-pty / `docker exec -it`), the remote wire and
- * the browser TUI are NOT part of this round: `adapter_id` stays 'none'
- * (NullPtyAdapter), the HTTP open route answers 501 until an adapter
- * registers, and the state machine is exercised through the kernel API.
+ * The store is adapter-neutral: LocalPtyAdapter and remote adapters implement
+ * the same spawn/control contract, while browser rendering remains outside
+ * this durable authority module.
  * @module @dsh-scholar/research-kernel/pty-session
  */
 
@@ -38,17 +37,22 @@ import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { randomId } from '@dsh-scholar/research-schemas'
-import type {
-  PtyControlFrame, PtyControlRequest, PtyOpenRequest, PtyOutputFrame, PtySession, PtySignal,
+import {
+  PTY_DEFAULT_IDLE_TTL_S,
+  PTY_DEFAULT_LEASE_TTL_S,
+  PTY_DEFAULT_RETENTION_BYTES,
+  randomId,
 } from '@dsh-scholar/research-schemas'
+import type {
+  PtyContextSessions, PtyControlFrame, PtyControlRequest, PtyOpenRequest, PtyOutputFrame, PtySession, PtySignal,
+} from '@dsh-scholar/research-schemas'
+import { projectPtyContext, type PtyResolvedContext } from './pty-context.js'
 
-/** Defaults read from the Config Schema when a request omits them (registry
- * keys land with the adapter round — the session row always carries the
- * resolved values so adapters never re-derive policy). */
-export const PTY_DEFAULT_IDLE_TTL_S = 900 // 15 min without activity → close
-export const PTY_DEFAULT_RETENTION_BYTES = 1024 * 1024 // 1 MiB bounded output
-export const PTY_DEFAULT_LEASE_TTL_S = 3600 // session lease
+export {
+  PTY_DEFAULT_IDLE_TTL_S,
+  PTY_DEFAULT_LEASE_TTL_S,
+  PTY_DEFAULT_RETENTION_BYTES,
+} from '@dsh-scholar/research-schemas'
 
 /** Error raised by the PTY session store. `code` is the stable wire code. */
 export class PtyError extends Error {
@@ -139,21 +143,20 @@ export interface PtyAppendResult {
 const nowIso = (): string => new Date().toISOString()
 const nowMs = (): number => Date.now()
 
-/**
- * pty_sessions table DDL — exported so migration 0014 can rebuild the legacy
- * plaintext-token shape to THIS shape (STORE-06, storage-migrations.md §4):
- * the opaque lease token is persisted ONLY as its sha256
- * (`lease_token_hash`); `lease_token` is a nullable legacy column (rows
- * created by the pre-0014 release keep their values for audit; new sessions
- * store NULL and hold the plaintext token in kernel memory only).
- */
-export const PTY_SESSIONS_TABLE_DDL = `
+/** Current context-bound PTY session shape. There are no legacy defaults for
+ * authority-bearing context, parent, or label fields. */
+export const PTY_CONTEXT_SESSIONS_TABLE_DDL = `
 CREATE TABLE IF NOT EXISTS pty_sessions (
   pty_session_id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
   principal_id TEXT NOT NULL,
   tenant_id TEXT NOT NULL DEFAULT '',
+  context_kind TEXT NOT NULL,
+  context_id TEXT NOT NULL,
+  parent_session_id TEXT,
+  label TEXT NOT NULL,
+  purpose TEXT NOT NULL DEFAULT '',
   profile TEXT NOT NULL,
   target TEXT NOT NULL,
   preset TEXT NOT NULL,
@@ -179,19 +182,119 @@ CREATE TABLE IF NOT EXISTS pty_sessions (
   closed_at TEXT,
   close_reason TEXT,
   CHECK (state IN ('open','attached','detached','closed')),
-  CHECK (preset IN ('sh','bash','zsh','fish'))
+  CHECK (preset IN ('sh','bash','zsh','fish')),
+  CHECK (context_kind IN ('research','chat','subagent'))
+);
+`
+
+/** Current context-bound PTY shape. Lease credentials are hash-only. */
+export const PTY_CURRENT_CONTEXT_SESSIONS_TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS pty_sessions (
+  pty_session_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL DEFAULT '',
+  context_kind TEXT NOT NULL,
+  context_id TEXT NOT NULL,
+  parent_session_id TEXT,
+  label TEXT NOT NULL,
+  purpose TEXT NOT NULL DEFAULT '',
+  profile TEXT NOT NULL,
+  target TEXT NOT NULL,
+  preset TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  state TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  lease_token_hash TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  idle_ttl_s INTEGER NOT NULL,
+  retention_bytes INTEGER NOT NULL,
+  retained_from_seq INTEGER NOT NULL DEFAULT 0,
+  last_client_seq INTEGER NOT NULL DEFAULT 0,
+  last_event_seq INTEGER NOT NULL DEFAULT 0,
+  total_bytes INTEGER NOT NULL DEFAULT 0,
+  dropped_bytes INTEGER NOT NULL DEFAULT 0,
+  adapter_id TEXT NOT NULL DEFAULT 'none',
+  open_at TEXT NOT NULL,
+  last_activity_at TEXT NOT NULL,
+  closed_at TEXT,
+  close_reason TEXT,
+  CHECK (state IN ('open','attached','detached','closed')),
+  CHECK (preset IN ('sh','bash','zsh','fish')),
+  CHECK (context_kind IN ('research','chat','subagent'))
 );
 `
 
 /**
- * Table DDL — parity copy of migration 0011 (the store opens its own WAL
- * connection, exactly like tex-workspace.ts; CREATE IF NOT EXISTS keeps both
- * connections in sync on databases created by either path). Migration 0014
- * rebuilds legacy-shaped pty_sessions tables to this exact shape.
+ * Frozen post-0014/pre-context PTY shape. Released migration 0014 references
+ * this constant by name. Keeping it context-less lets a database that still
+ * has to run 0014 finish token hashing without inventing authority; migration
+ * 0036 immediately discards those transient rows and creates the current
+ * context-bound table above.
  */
+export const PTY_SESSIONS_TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS pty_sessions (
+  pty_session_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL DEFAULT '',
+  profile TEXT NOT NULL,
+  target TEXT NOT NULL,
+  preset TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  config_hash TEXT NOT NULL,
+  state TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  lease_token TEXT,
+  lease_token_hash TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT,
+  idle_ttl_s INTEGER NOT NULL,
+  retention_bytes INTEGER NOT NULL,
+  retained_from_seq INTEGER NOT NULL DEFAULT 0,
+  last_client_seq INTEGER NOT NULL DEFAULT 0,
+  last_event_seq INTEGER NOT NULL DEFAULT 0,
+  total_bytes INTEGER NOT NULL DEFAULT 0,
+  dropped_bytes INTEGER NOT NULL DEFAULT 0,
+  adapter_id TEXT NOT NULL DEFAULT 'none',
+  open_at TEXT NOT NULL,
+  last_activity_at TEXT NOT NULL,
+  closed_at TEXT,
+  close_reason TEXT,
+  CHECK (state IN ('open','attached','detached','closed')),
+  CHECK (preset IN ('sh','bash','zsh','fish'))
+);
+`
+
+/** Exact DDL embedded by released migration 0036. Do not edit. */
 export const PTY_DDL = `
-${PTY_SESSIONS_TABLE_DDL}
+${PTY_CONTEXT_SESSIONS_TABLE_DDL}
 CREATE INDEX IF NOT EXISTS idx_pty_sessions_project ON pty_sessions(project_id);
+CREATE INDEX IF NOT EXISTS idx_pty_sessions_context ON pty_sessions(project_id, context_kind, context_id, open_at);
+-- Append-only frame ledger: control frames (client_seq) + output frames
+-- (server_seq). client_seq is UNIQUE per session — the idempotency key.
+CREATE TABLE IF NOT EXISTS pty_frames (
+  pty_session_id TEXT NOT NULL,
+  server_seq INTEGER NOT NULL,
+  frame_kind TEXT NOT NULL CHECK (frame_kind IN ('control','output','exit','gap')),
+  client_seq INTEGER,
+  type TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  byte_length INTEGER,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (pty_session_id, server_seq)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pty_frames_client_seq ON pty_frames(pty_session_id, client_seq) WHERE client_seq IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pty_frames_session_seq ON pty_frames(pty_session_id, server_seq);
+`
+
+/** Current store and migration DDL. */
+export const PTY_CURRENT_DDL = `
+${PTY_CURRENT_CONTEXT_SESSIONS_TABLE_DDL}
+CREATE INDEX IF NOT EXISTS idx_pty_sessions_project ON pty_sessions(project_id);
+CREATE INDEX IF NOT EXISTS idx_pty_sessions_context ON pty_sessions(project_id, context_kind, context_id, open_at);
 -- Append-only frame ledger: control frames (client_seq) + output frames
 -- (server_seq). client_seq is UNIQUE per session — the idempotency key.
 CREATE TABLE IF NOT EXISTS pty_frames (
@@ -215,6 +318,11 @@ export interface PtySessionRow {
   workspace_id: string
   principal_id: string
   tenant_id: string
+  context_kind: PtySession['context_kind']
+  context_id: string
+  parent_session_id: string | null
+  label: string
+  purpose: string
   profile: string
   target: string
   preset: string
@@ -222,9 +330,6 @@ export interface PtySessionRow {
   config_hash: string
   state: string
   generation: number
-  /** Legacy plaintext lease token — NULL for sessions opened after 0014
-   * (the token then lives in kernel memory only; see STORE-06). */
-  lease_token: string | null
   /** sha256 of the opaque lease token (STORE-06); '' when unknown. */
   lease_token_hash: string
   lease_expires_at: string | null
@@ -255,7 +360,7 @@ export class PtySessionStore {
     if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true })
     this.db = new DatabaseSync(dbPath)
     this.db.exec('PRAGMA journal_mode = WAL')
-    this.db.exec(PTY_DDL)
+    this.db.exec(PTY_CURRENT_DDL)
   }
 
   close(): void {
@@ -270,6 +375,11 @@ export class PtySessionStore {
       tenant_id: row.tenant_id,
       project_id: row.project_id,
       workspace_id: row.workspace_id,
+      context_kind: row.context_kind,
+      context_id: row.context_id,
+      parent_session_id: row.parent_session_id,
+      label: row.label,
+      purpose: row.purpose,
       profile: row.profile,
       target: row.target,
       preset: row.preset as PtySession['preset'],
@@ -277,9 +387,9 @@ export class PtySessionStore {
       config_hash: row.config_hash,
       state: row.state as PtySession['state'],
       generation: row.generation,
-      // STORE-06: the plaintext token is only present on legacy rows; new
-      // sessions (hash-only storage) surface null after a kernel restart.
-      lease_token: row.lease_token ?? null,
+      // The plaintext lease exists only in createContextSession's immediate
+      // return value. Durable reads are hash-only.
+      lease_token: null,
       lease_expires_at: row.lease_expires_at,
       idle_ttl_s: row.idle_ttl_s,
       retention_bytes: row.retention_bytes,
@@ -306,41 +416,78 @@ export class PtySessionStore {
     return this.sessionFromRow(this.getRow(sessionId))
   }
 
-  /** Sessions of one project (UI projection; authz happens in the kernel). */
-  listSessions(projectId?: string): PtySession[] {
-    const rows = (projectId === undefined
-      ? this.db.prepare('SELECT * FROM pty_sessions ORDER BY open_at DESC').all()
-      : this.db.prepare('SELECT * FROM pty_sessions WHERE project_id = ? ORDER BY open_at DESC').all(projectId)) as unknown as PtySessionRow[]
+  /** Minimal owner-checked discovery used only to locate current context
+   * authority. It does not authorize read/control by itself. */
+  contextForOwner(sessionId: string, principal: { principal_id: string }): {
+    project_id: string
+    context_kind: PtySession['context_kind']
+    context_id: string
+    parent_session_id: string | null
+  } {
+    const session = this.getSession(sessionId)
+    if (session.principal_id !== principal.principal_id) {
+      throw new PtyError('pty_principal_mismatch', 'PTY session is owned by another principal')
+    }
+    return {
+      project_id: session.project_id,
+      context_kind: session.context_kind,
+      context_id: session.context_id,
+      parent_session_id: session.parent_session_id,
+    }
+  }
+
+  /** Internal lifecycle-only enumeration. UI/API discovery is exclusively
+   * listContextSessions(); this cannot express the removed project singleton
+   * projection and is used only to tear down child processes at shutdown. */
+  listAllSessionsForShutdown(): PtySession[] {
+    const rows = this.db.prepare('SELECT * FROM pty_sessions ORDER BY open_at DESC').all() as unknown as PtySessionRow[]
     return rows.map(r => this.sessionFromRow(r))
   }
 
-  /**
-   * PTY-01 open: create the durable session row in state 'open' with a
-   * pinned lease. cwd must already be validated root-relative by the caller.
-   * The adapter (if any) is spawned AFTER the row lands; a spawn failure
-   * closes the session with close_reason='adapter_failed' (the row stays for
-   * audit — never a silent no-op).
-   */
-  createSession(request: PtyOpenRequest, principal: { principal_id: string; tenant_id?: string }, opts: {
+  /** List the exact context's terminal tabs. Authority is server-derived;
+   * callers cannot widen the query with a project id. */
+  listContextSessions(context: PtyResolvedContext): PtyContextSessions {
+    const rows = this.db.prepare(`SELECT * FROM pty_sessions
+      WHERE project_id = ? AND context_kind = ? AND context_id = ?
+      ORDER BY open_at DESC, rowid DESC`)
+      .all(context.project_id, context.context_kind, context.context_id) as unknown as PtySessionRow[]
+    const sessions = rows.map(row => this.sessionFromRow(row))
+    for (const session of sessions) this.assertContextAccess(session.pty_session_id, context, session.generation, { allowExpired: true })
+    return {
+      context: projectPtyContext(context),
+      sessions,
+      active_hint: sessions.find(session => session.state !== 'closed')?.pty_session_id ?? null,
+    }
+  }
+
+  /** Current PTY open path. Project, owner, exact parent, profile and target
+   * all come from trusted context resolution; the wire request contributes
+   * only context id plus non-authoritative terminal presentation/options. */
+  createContextSession(request: PtyOpenRequest, context: PtyResolvedContext, opts: {
     config_hash: string
     idle_ttl_s?: number
     retention_bytes?: number
     lease_ttl_s?: number
     adapter_id?: string
   }): PtySession {
+    if (request.context_id !== context.context_id) {
+      throw new PtyError('pty_context_mismatch', 'PTY open context does not match the resolved authority')
+    }
     const at = nowIso()
-    // STORE-06 (storage-migrations.md §4): only the sha256 of the lease
-    // token is persisted; the plaintext token is returned to the caller and
-    // kept in kernel memory (legacy `lease_token` column stays NULL).
     const leaseToken = `lease_${randomBytes(16).toString('hex')}`
     const session: PtySession = {
       pty_session_id: randomId('pty'),
-      principal_id: principal.principal_id,
-      tenant_id: principal.tenant_id ?? '',
-      project_id: request.project_id,
+      principal_id: context.principal_id,
+      tenant_id: context.tenant_id,
+      project_id: context.project_id,
       workspace_id: request.workspace_id,
-      profile: request.profile,
-      target: request.target,
+      context_kind: context.context_kind,
+      context_id: context.context_id,
+      parent_session_id: context.parent_session_id,
+      label: request.label,
+      purpose: request.purpose,
+      profile: context.profile,
+      target: context.target,
       preset: request.preset,
       cwd: request.cwd,
       config_hash: opts.config_hash,
@@ -348,8 +495,8 @@ export class PtySessionStore {
       generation: 1,
       lease_token: leaseToken,
       lease_expires_at: new Date(nowMs() + (opts.lease_ttl_s ?? PTY_DEFAULT_LEASE_TTL_S) * 1000).toISOString(),
-      idle_ttl_s: opts.idle_ttl_s ?? request.idle_ttl_s ?? PTY_DEFAULT_IDLE_TTL_S,
-      retention_bytes: opts.retention_bytes ?? request.retention_bytes ?? PTY_DEFAULT_RETENTION_BYTES,
+      idle_ttl_s: opts.idle_ttl_s ?? PTY_DEFAULT_IDLE_TTL_S,
+      retention_bytes: opts.retention_bytes ?? PTY_DEFAULT_RETENTION_BYTES,
       retained_from_seq: 0,
       last_client_seq: 0,
       last_event_seq: 0,
@@ -362,18 +509,75 @@ export class PtySessionStore {
       close_reason: null,
     }
     this.db.prepare(`INSERT INTO pty_sessions (
-      pty_session_id, project_id, workspace_id, principal_id, tenant_id, profile, target, preset, cwd, config_hash,
-      state, generation, lease_token, lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes, retained_from_seq,
+      pty_session_id, project_id, workspace_id, principal_id, tenant_id,
+      context_kind, context_id, parent_session_id, label, purpose,
+      profile, target, preset, cwd, config_hash, state, generation,
+      lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes, retained_from_seq,
       last_client_seq, last_event_seq, total_bytes, dropped_bytes, adapter_id, open_at, last_activity_at, closed_at, close_reason)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(session.pty_session_id, session.project_id, session.workspace_id, session.principal_id, session.tenant_id,
-        session.profile, session.target, session.preset, session.cwd, session.config_hash,
-        session.state, session.generation, null, createHash('sha256').update(leaseToken).digest('hex'),
-        session.lease_expires_at, session.idle_ttl_s,
-        session.retention_bytes, session.retained_from_seq, session.last_client_seq, session.last_event_seq,
-        session.total_bytes, session.dropped_bytes, session.adapter_id, session.open_at, session.last_activity_at,
-        session.closed_at, session.close_reason)
+        session.context_kind, session.context_id, session.parent_session_id, session.label, session.purpose,
+        session.profile, session.target, session.preset, session.cwd, session.config_hash, session.state, session.generation,
+        createHash('sha256').update(leaseToken).digest('hex'), session.lease_expires_at,
+        session.idle_ttl_s, session.retention_bytes, session.retained_from_seq, session.last_client_seq,
+        session.last_event_seq, session.total_bytes, session.dropped_bytes, session.adapter_id, session.open_at,
+        session.last_activity_at, session.closed_at, session.close_reason)
     return session
+  }
+
+  /** Fail-closed owner/context/exact-parent/generation/lease-expiry fence.
+   * This consumes only server-derived authority. */
+  assertContextAccess(sessionId: string, context: PtyResolvedContext, expectedGeneration: number, opts: { allowExpired?: boolean } = {}): PtySession {
+    const session = this.getSession(sessionId)
+    if (session.principal_id !== context.principal_id || session.tenant_id !== context.tenant_id) {
+      throw new PtyError('pty_principal_mismatch', 'PTY session is owned by another principal')
+    }
+    if (session.project_id !== context.project_id
+      || session.context_kind !== context.context_kind
+      || session.context_id !== context.context_id) {
+      throw new PtyError('pty_context_mismatch', 'PTY session belongs to another context')
+    }
+    if (session.parent_session_id !== context.parent_session_id) {
+      throw new PtyError('pty_exact_parent_mismatch', 'PTY context is no longer attached to the exact parent session')
+    }
+    if (session.generation !== expectedGeneration) {
+      throw new PtyError('pty_generation_stale', `expected PTY generation ${session.generation}, got ${expectedGeneration}`)
+    }
+    if (opts.allowExpired !== true && session.lease_expires_at !== null
+      && new Date(session.lease_expires_at).getTime() <= nowMs()) {
+      throw new PtyError('pty_lease_expired', 'PTY lease has expired')
+    }
+    return session
+  }
+
+  attachContext(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): PtySession {
+    this.assertContextAccess(sessionId, context, expectedGeneration)
+    return this.attach(sessionId)
+  }
+
+  detachContext(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): PtySession {
+    this.assertContextAccess(sessionId, context, expectedGeneration)
+    return this.detach(sessionId)
+  }
+
+  revokeContext(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): PtySession {
+    this.assertContextAccess(sessionId, context, expectedGeneration)
+    return this.revoke(sessionId)
+  }
+
+  closeContext(sessionId: string, context: PtyResolvedContext, expectedGeneration: number): PtySession {
+    this.assertContextAccess(sessionId, context, expectedGeneration)
+    return this.closeSession(sessionId)
+  }
+
+  applyContextControl(sessionId: string, request: PtyControlRequest, context: PtyResolvedContext, adapter: PtyAdapter | null): PtyControlResult {
+    this.assertContextAccess(sessionId, context, request.expected_generation)
+    return this.applyControl(sessionId, request, adapter)
+  }
+
+  framesContext(sessionId: string, afterSeq: number, context: PtyResolvedContext, expectedGeneration: number): ReturnType<PtySessionStore['frames']> {
+    this.assertContextAccess(sessionId, context, expectedGeneration)
+    return this.frames(sessionId, afterSeq)
   }
 
   /**
@@ -590,26 +794,19 @@ export class PtySessionStore {
 
   /**
    * PTY-01 (hardening §5 P0-2): constant-time lease verification for
-   * read/control/frames. New sessions persist ONLY the sha256 of the opaque
-   * token (STORE-06 lease_token_hash); legacy pre-0014 rows fall back to the
-   * plaintext lease_token column. A row with NO verifiable lease material
-   * (hash '' and plaintext null) fails closed — a missing credential is
-   * never a pass. The token is compared via sha256+timingSafeEqual so the
-   * comparison never leaks timing information about the stored value.
+   * read/control/frames. Sessions persist ONLY the sha256 of the opaque token
+   * (STORE-06 lease_token_hash). There is deliberately no plaintext
+   * compatibility path. A missing hash fails closed. The token is
+   * compared via sha256+timingSafeEqual so the comparison never leaks timing
+   * information about the stored value.
    */
   verifyLease(sessionId: string, token: string): boolean {
     const row = this.getRow(sessionId)
-    if (row.lease_token_hash !== '') {
-      const expected = Buffer.from(row.lease_token_hash, 'hex')
-      const provided = createHash('sha256').update(token).digest()
-      return expected.length === provided.length && timingSafeEqual(expected, provided)
-    }
-    if (row.lease_token !== null) {
-      const a = createHash('sha256').update(token).digest()
-      const b = createHash('sha256').update(row.lease_token).digest()
-      return timingSafeEqual(a, b)
-    }
-    return false
+    if (row.lease_expires_at !== null && new Date(row.lease_expires_at).getTime() <= nowMs()) return false
+    if (!/^[0-9a-f]{64}$/.test(row.lease_token_hash)) return false
+    const expected = Buffer.from(row.lease_token_hash, 'hex')
+    const provided = createHash('sha256').update(token).digest()
+    return timingSafeEqual(expected, provided)
   }
 
   /** Touch activity (e.g. an attach heartbeats the idle TTL). */

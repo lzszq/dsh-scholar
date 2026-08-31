@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import { adoptLegacyKernelData } from '../../packages/research-kernel/src/data-upgrade.js'
 import { openDatabase } from '../../packages/research-kernel/src/store.js'
+import { defaultConfigForScopes, pinConfig } from '@dsh-scholar/research-schemas'
 
 const roots: string[] = []
 
@@ -110,6 +111,47 @@ function seedCurrentSchemaLedgers(db: DatabaseSync): string[] {
     VALUES ('full-auto:legacy', ?, ?, 'gate_legacy_budget', 0, 'decision_legacy_budget', '{}', ?)`)
     .run(SENTINEL_HASH, SENTINEL_PROJECT_ID, SENTINEL_AT)
 
+  const projectConfig = {
+    ...defaultConfigForScopes(['project']),
+    'integrity.require_clean_room_rerun': true,
+  }
+  const projectConfigPin = pinConfig(projectConfig)
+  db.prepare(`UPDATE projects SET execution = ?, integrity = ? WHERE project_id = ?`).run(
+    JSON.stringify({
+      runner_profile_id: projectConfig['execution.runner_profile_id'],
+      runner_target_id: projectConfig['execution.runner_target_id'],
+      network_policy: projectConfig['execution.network_policy'],
+      artifact_store: projectConfig['execution.artifact_store'],
+      fixture_id: projectConfig['execution.fixture_id'],
+    }),
+    JSON.stringify({
+      require_baseline_reproduction: projectConfig['integrity.require_baseline_reproduction'],
+      require_experiment_contract: projectConfig['integrity.require_experiment_contract'],
+      require_claim_evidence_links: projectConfig['integrity.require_claim_evidence_links'],
+      require_clean_room_rerun: projectConfig['integrity.require_clean_room_rerun'],
+      allow_automatic_public_release: projectConfig['integrity.allow_automatic_public_release'],
+      require_signed_manifest: projectConfig['integrity.require_signed_manifest'],
+    }),
+    SENTINEL_PROJECT_ID,
+  )
+  db.prepare(`INSERT INTO config_write_layers
+    (write_scope, scope_id, revision, config_json, config_pin, updated_by, updated_at)
+    VALUES ('project', ?, 1, ?, ?, 'principal:legacy', ?)`).run(
+    SENTINEL_PROJECT_ID,
+    JSON.stringify(projectConfig),
+    projectConfigPin,
+    SENTINEL_AT,
+  )
+  db.prepare(`INSERT INTO config_write_revisions
+    (revision_id, write_scope, scope_id, revision, changes_json, config_json, config_pin, updated_by, updated_at)
+    VALUES ('cfgrev_legacy_1', 'project', ?, 1, ?, ?, ?, 'principal:legacy', ?)`).run(
+    SENTINEL_PROJECT_ID,
+    JSON.stringify({ 'integrity.require_clean_room_rerun': true }),
+    JSON.stringify(projectConfig),
+    projectConfigPin,
+    SENTINEL_AT,
+  )
+
   return [
     'assurance_events',
     'methodology_run_outcomes',
@@ -122,6 +164,8 @@ function seedCurrentSchemaLedgers(db: DatabaseSync): string[] {
     'budget_block_provenance',
     'writing_patch_intents',
     'full_auto_gate_idempotency',
+    'config_write_layers',
+    'config_write_revisions',
   ]
 }
 
@@ -158,7 +202,7 @@ describe('kernel data adoption', () => {
 
     const first = adoptLegacyKernelData({ sourceDataDir, targetDataDir, operatorPrincipal: 'stable-operator' })
     expect(first.status).toBe('imported')
-    expect(first.format_version).toBe(4)
+    expect(first.format_version).toBe(5)
     expect(first.adopting_operator_principal).toBe('stable-operator')
     expect(first.source_database_id).toBe(sourceDatabaseId)
     expect(first.rows_inserted).toBeGreaterThan(0)
@@ -178,7 +222,7 @@ describe('kernel data adoption', () => {
     // schema. Re-adoption is idempotent, backup-first, and replaces it only
     // after rows and files have both been verified.
     const oldReceipt = JSON.parse(readFileSync(first.receipt_path, 'utf8')) as Record<string, unknown>
-    oldReceipt.format_version = 3
+    oldReceipt.format_version = 4
     writeFileSync(first.receipt_path, `${JSON.stringify(oldReceipt)}\n`)
     const membershipDb = new DatabaseSync(join(targetDataDir, 'kernel.db'))
     membershipDb.prepare('DELETE FROM project_members WHERE project_id = ? AND principal_id = ?').run('current-project', 'stable-operator')
@@ -186,7 +230,7 @@ describe('kernel data adoption', () => {
 
     const second = adoptLegacyKernelData({ sourceDataDir, targetDataDir, operatorPrincipal: 'stable-operator' })
     expect(second.status).toBe('imported')
-    expect(second.format_version).toBe(4)
+    expect(second.format_version).toBe(5)
     const afterSecond = new DatabaseSync(join(targetDataDir, 'kernel.db'), { readOnly: true })
     expect((afterSecond.prepare('SELECT COUNT(*) AS n FROM projects').get() as { n: number }).n).toBe(2)
     expect(afterSecond.prepare('SELECT role FROM project_members WHERE project_id = ? AND principal_id = ?').get('current-project', 'stable-operator')).toEqual(expect.objectContaining({ role: 'pi' }))
@@ -214,7 +258,7 @@ describe('kernel data adoption', () => {
     target.close()
   })
 
-  it('adopts every persistent ledger added by schema 0028 through 0033 and survives reopen', () => {
+  it('adopts every persistent ledger added by schema 0028 through 0037 and survives reopen', () => {
     const root = makeRoot('dsh-data-upgrade-current-schema-')
     const sourceDataDir = join(root, 'legacy')
     const targetDataDir = join(root, 'shared')
@@ -248,6 +292,8 @@ describe('kernel data adoption', () => {
         ['budget_block_provenance', 'gate_id', 'gate_legacy_budget'],
         ['writing_patch_intents', 'application_id', 'application_legacy_1'],
         ['full_auto_gate_idempotency', 'idempotency_key', 'full-auto:legacy'],
+        ['config_write_layers', 'scope_id', SENTINEL_PROJECT_ID],
+        ['config_write_revisions', 'revision_id', 'cfgrev_legacy_1'],
       ]
       for (const [table, key, value] of exactRows) {
         expect(reopened.prepare(`SELECT 1 AS present FROM ${table} WHERE ${key} = ?`).get(value), `${table} sentinel`)
@@ -264,6 +310,78 @@ describe('kernel data adoption', () => {
     } finally {
       reopened.close()
     }
+  })
+
+  it('accounts for current PTY context rows and closes the non-surviving runtime lease after adoption', () => {
+    const root = makeRoot('dsh-data-upgrade-pty-context-')
+    const sourceDataDir = join(root, 'legacy')
+    const targetDataDir = join(root, 'shared')
+    mkdirSync(sourceDataDir, { recursive: true })
+    mkdirSync(targetDataDir, { recursive: true })
+    const now = '2026-08-31T04:00:00.000Z'
+
+    const source = openDatabase(join(sourceDataDir, 'kernel.db'))
+    insertProject(source, 'pty-project', 'PTY project')
+    source.prepare(`INSERT INTO pty_sessions (
+      pty_session_id, project_id, workspace_id, principal_id, tenant_id,
+      context_kind, context_id, parent_session_id, label, purpose,
+      profile, target, preset, cwd, config_hash, state, generation,
+      lease_token_hash, idle_ttl_s, retention_bytes, open_at, last_activity_at)
+      VALUES ('pty_adopt_1','pty-project','ws-pty','pi-pty','local',
+        'chat','chat-context-1','dsh-parent-1','Training shell','inspect metrics',
+        'profile-1','target_local_docker_v1','bash','.','${'a'.repeat(64)}','attached',3,
+        '${'b'.repeat(64)}',900,1048576,?,?)`).run(now, now)
+    source.prepare(`INSERT INTO pty_frames
+      (pty_session_id,server_seq,frame_kind,type,payload_json,byte_length,created_at)
+      VALUES ('pty_adopt_1',1,'output','stdout','{"data":"kept"}',4,?)`).run(now)
+    source.close()
+    openDatabase(join(targetDataDir, 'kernel.db')).close()
+
+    adoptLegacyKernelData({ sourceDataDir, targetDataDir, operatorPrincipal: 'stable-operator' })
+    const merged = openDatabase(join(targetDataDir, 'kernel.db'))
+    expect(merged.prepare(`SELECT context_kind,context_id,parent_session_id,label,purpose,state,close_reason
+      FROM pty_sessions WHERE pty_session_id='pty_adopt_1'`).get()).toEqual({
+      context_kind: 'chat', context_id: 'chat-context-1', parent_session_id: 'dsh-parent-1',
+      label: 'Training shell', purpose: 'inspect metrics', state: 'closed', close_reason: 'lease_expired',
+    })
+    expect((merged.prepare("SELECT COUNT(*) AS n FROM pty_sessions WHERE context_id='chat-context-1'").get() as { n: number }).n).toBe(1)
+    expect((merged.prepare("SELECT COUNT(*) AS n FROM pty_frames WHERE pty_session_id='pty_adopt_1'").get() as { n: number }).n).toBe(1)
+    merged.close()
+  })
+
+  it('fails the PTY adoption inventory when a current required context column is absent', () => {
+    const root = makeRoot('dsh-data-upgrade-pty-shape-')
+    const sourceDataDir = join(root, 'legacy')
+    const targetDataDir = join(root, 'shared')
+    mkdirSync(sourceDataDir, { recursive: true })
+    mkdirSync(targetDataDir, { recursive: true })
+    openDatabase(join(sourceDataDir, 'kernel.db')).close()
+    const target = openDatabase(join(targetDataDir, 'kernel.db'))
+    target.exec('ALTER TABLE pty_sessions DROP COLUMN purpose')
+    target.close()
+
+    expect(() => adoptLegacyKernelData({ sourceDataDir, targetDataDir, operatorPrincipal: 'stable-operator' }))
+      .toThrow(/PTY context inventory.*purpose/i)
+  })
+
+  it('rejects orphan PTY frames before the adoption transaction can commit', () => {
+    const root = makeRoot('dsh-data-upgrade-pty-orphan-')
+    const sourceDataDir = join(root, 'legacy')
+    const targetDataDir = join(root, 'shared')
+    mkdirSync(sourceDataDir, { recursive: true })
+    mkdirSync(targetDataDir, { recursive: true })
+    const source = openDatabase(join(sourceDataDir, 'kernel.db'))
+    source.prepare(`INSERT INTO pty_frames
+      (pty_session_id,server_seq,frame_kind,type,payload_json,byte_length,created_at)
+      VALUES ('pty_missing',1,'output','stdout','{}',0,'2026-08-31T05:00:00.000Z')`).run()
+    source.close()
+    openDatabase(join(targetDataDir, 'kernel.db')).close()
+
+    expect(() => adoptLegacyKernelData({ sourceDataDir, targetDataDir, operatorPrincipal: 'stable-operator' }))
+      .toThrow(/orphan PTY frame/i)
+    const target = openDatabase(join(targetDataDir, 'kernel.db'))
+    expect((target.prepare('SELECT COUNT(*) AS n FROM pty_frames').get() as { n: number }).n).toBe(0)
+    target.close()
   })
 
   it('backs up the target before a source snapshot migration can fail', () => {

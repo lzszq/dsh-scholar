@@ -51,20 +51,20 @@ describe('explicit migrations', () => {
 
   it('bumps a fresh database to SCHEMA_VERSION with all steps recorded', () => {
     const db = openDatabase(':memory:')
-    expect(SCHEMA_VERSION).toBe(31)
+    expect(SCHEMA_VERSION).toBe(35)
     const meta = Object.fromEntries((db.prepare('SELECT key, value FROM meta').all() as Array<{ key: string; value: string }>).map(r => [r.key, r.value]))
-    expect(meta.schema_version).toBe('31')
+    expect(meta.schema_version).toBe('35')
     expect(meta.database_id).toBeTruthy()
     expect(meta.created_at).toBeTruthy()
     const applied = db.prepare('SELECT id, checksum, report_json FROM schema_migrations ORDER BY id').all() as Array<{ id: string; checksum: string; report_json: string }>
-    expect(applied.map(r => r.id)).toEqual(['0001_schema_v2_initial', '0002_import_legacy_v1', '0003_terminal_tex_i18n_capabilities', '0004_artifact_media_type', '0005_code_snapshots', '0006_project_members', '0007_project_idempotency_keys', '0008_outbox_envelope', '0009_runs_snapshot_nullable', '0010_preview_builds', '0011_pty_workspace', '0012_intake', '0013_trajectory_topology', '0014_lease_token_hash', '0016_v2_shape_alignment', '0017_v1_legacy_marks', '0018_workspace_recovery_quarantine', '0019_project_deletion_tombstone', '0020_project_brief_status', '0021_provider_chunked_upload', '0022_reproduction_contracts', '0023_runner_target_registry', '0024_topology_cancelled_state', '0025_runner_target_runtime', '0026_runner_target_service_identity', '0027_project_execution_shape', '0028_methodology_knowledge_layer', '0029_research_run_outcomes', '0030_writing_review_methodology', '0031_correctness_hardening', '0032_methodology_rollout_policy', '0033_full_auto_global_idempotency', '0034_upload_abort_ownership'])
+    expect(applied.map(r => r.id)).toEqual(['0001_schema_v2_initial', '0002_import_legacy_v1', '0003_terminal_tex_i18n_capabilities', '0004_artifact_media_type', '0005_code_snapshots', '0006_project_members', '0007_project_idempotency_keys', '0008_outbox_envelope', '0009_runs_snapshot_nullable', '0010_preview_builds', '0011_pty_workspace', '0012_intake', '0013_trajectory_topology', '0014_lease_token_hash', '0016_v2_shape_alignment', '0017_v1_legacy_marks', '0018_workspace_recovery_quarantine', '0019_project_deletion_tombstone', '0020_project_brief_status', '0021_provider_chunked_upload', '0022_reproduction_contracts', '0023_runner_target_registry', '0024_topology_cancelled_state', '0025_runner_target_runtime', '0026_runner_target_service_identity', '0027_project_execution_shape', '0028_methodology_knowledge_layer', '0029_research_run_outcomes', '0030_writing_review_methodology', '0031_correctness_hardening', '0032_methodology_rollout_policy', '0033_full_auto_global_idempotency', '0034_upload_abort_ownership', '0035_ocr_requests', '0036_pty_context_reset', '0037_config_write_layers', '0038_remove_plaintext_lease_storage'])
     expect(tableInfo(db, 'runner_targets').map(column => column.name)).toContain('runtime_json')
     expect(tableInfo(db, 'runner_targets').map(column => column.name)).toContain('service_identity_json')
     for (const row of applied) expect(row.checksum).toMatch(/^[0-9a-f]{64}$/)
     // 0002 on a fresh DB: nothing to import (row counters still reported).
     expect(JSON.parse(applied[1]!.report_json)).toEqual({ rows: { manuscripts_converted: 0 } })
     // All product tables exist.
-    for (const t of ['projects', 'gates', 'decisions', 'ideas', 'contracts', 'corpus_snapshots', 'artifacts', 'jobs', 'runner_keys', 'runner_targets', 'evidence', 'claims', 'events', 'session_links', 'budget', 'manuscripts', 'terminal_frames', 'terminal_retention', 'tex_documents', 'tex_files', 'tex_snapshots', 'tex_builds', 'project_members', 'code_snapshots', 'runs', 'pty_sessions', 'pty_frames', 'workspaces', 'workspace_nodes', 'workspace_ops', 'intake_sessions', 'intake_artifacts', 'intake_observations', 'intake_questions', 'child_links', 'child_history', 'child_followups', 'upload_sessions', 'upload_chunks', 'model_providers', 'model_provider_models', 'reproduction_specs', 'reproduction_attempts', 'reproduction_reports', 'reproduction_links', 'assurance_events', 'methodology_project_events', 'methodology_registry_events', 'methodology_run_outcomes', 'writing_methodology_events', 'budget_block_provenance', 'writing_patch_intents', 'methodology_rollout_policies', 'methodology_project_rollout_events', 'methodology_rollout_consumptions', 'full_auto_gate_idempotency']) {
+    for (const t of ['projects', 'gates', 'decisions', 'ideas', 'contracts', 'corpus_snapshots', 'artifacts', 'jobs', 'runner_keys', 'runner_targets', 'evidence', 'claims', 'events', 'session_links', 'budget', 'manuscripts', 'terminal_frames', 'terminal_retention', 'tex_documents', 'tex_files', 'tex_snapshots', 'tex_builds', 'project_members', 'code_snapshots', 'runs', 'pty_sessions', 'pty_frames', 'workspaces', 'workspace_nodes', 'workspace_ops', 'intake_sessions', 'intake_artifacts', 'intake_observations', 'intake_questions', 'child_links', 'child_history', 'child_followups', 'upload_sessions', 'upload_chunks', 'model_providers', 'model_provider_models', 'reproduction_specs', 'reproduction_attempts', 'reproduction_reports', 'reproduction_links', 'assurance_events', 'methodology_project_events', 'methodology_registry_events', 'methodology_run_outcomes', 'writing_methodology_events', 'budget_block_provenance', 'writing_patch_intents', 'methodology_rollout_policies', 'methodology_project_rollout_events', 'methodology_rollout_consumptions', 'full_auto_gate_idempotency', 'ocr_requests', 'ocr_result_artifacts', 'ocr_observations', 'config_write_layers', 'config_write_revisions']) {
       expect(tableInfo(db, t).length, `table ${t}`).toBeGreaterThan(0)
     }
     expect((db.prepare('SELECT target_id, kind FROM runner_targets ORDER BY target_id').all() as Array<{ target_id: string; kind: string }>)).toEqual([
@@ -74,9 +74,10 @@ describe('explicit migrations', () => {
     // 0011 (PTY-01/WORK-01): the pty + workspace tables carry the interface
     // layer columns (state machine, client_seq idempotency, retention).
     const ptySessionCols = tableInfo(db, 'pty_sessions').map(c => c.name)
-    for (const c of ['pty_session_id', 'principal_id', 'workspace_id', 'profile', 'target', 'preset', 'cwd', 'config_hash', 'state', 'generation', 'lease_token', 'lease_token_hash', 'idle_ttl_s', 'retention_bytes', 'retained_from_seq', 'last_client_seq', 'last_event_seq', 'closed_at']) {
+    for (const c of ['pty_session_id', 'principal_id', 'workspace_id', 'context_kind', 'context_id', 'parent_session_id', 'label', 'purpose', 'profile', 'target', 'preset', 'cwd', 'config_hash', 'state', 'generation', 'lease_token_hash', 'idle_ttl_s', 'retention_bytes', 'retained_from_seq', 'last_client_seq', 'last_event_seq', 'closed_at']) {
       expect(ptySessionCols, `pty_sessions.${c}`).toContain(c)
     }
+    expect(ptySessionCols).not.toContain('lease_token')
     // 0014 (STORE-06): jobs carries the lease-token hash column (the
     // plaintext token is never persisted — payload.__lease_token is gone).
     const jobCols = tableInfo(db, 'jobs').map(c => c.name)
@@ -120,7 +121,7 @@ describe('explicit migrations', () => {
     const after = (db2.prepare('SELECT id FROM schema_migrations ORDER BY id').all() as Array<{ id: string }>).map(r => r.id)
     expect(after).toEqual(before)
     const version = (db2.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value
-    expect(version).toBe('31')
+    expect(version).toBe('35')
     db2.close()
     rmSync(path, { recursive: false, force: true })
   })
@@ -135,7 +136,7 @@ describe('explicit migrations', () => {
     db.close()
 
     const upgraded = openDatabase(path)
-    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('31')
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
     expect((upgraded.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE id = '0029_research_run_outcomes'").get() as { n: number }).n).toBe(1)
     expect(tableInfo(upgraded, 'methodology_run_outcomes').map(column => column.name)).toEqual([
       'project_id', 'revision', 'run_ref', 'outcome_json', 'created_at',
@@ -154,7 +155,7 @@ describe('explicit migrations', () => {
     db.close()
 
     const upgraded = openDatabase(path)
-    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('31')
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
     expect((upgraded.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE id = '0030_writing_review_methodology'").get() as { n: number }).n).toBe(1)
     expect(tableInfo(upgraded, 'writing_methodology_events').map(column => column.name)).toEqual([
       'project_id', 'revision', 'event_kind', 'record_id', 'parent_id', 'record_json', 'created_at',
@@ -200,7 +201,7 @@ describe('explicit migrations', () => {
     db.close()
 
     const upgraded = openDatabase(path)
-    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('31')
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
     expect((upgraded.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE id = '0032_methodology_rollout_policy'").get() as { n: number }).n).toBe(1)
     expect((upgraded.prepare(`SELECT policy_revision, mode, actor_ref FROM methodology_project_rollout_events
       WHERE project_id = 'p-before-rollout'`).get())).toEqual({
@@ -234,7 +235,7 @@ describe('explicit migrations', () => {
     db.close()
 
     const upgraded = openDatabase(path)
-    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('31')
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
     expect((upgraded.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE id = '0033_full_auto_global_idempotency'").get() as { n: number }).n).toBe(1)
     expect(tableInfo(upgraded, 'full_auto_gate_idempotency').map(column => column.name)).toEqual([
       'idempotency_key', 'request_sha256', 'project_id', 'gate_id', 'expected_project_revision',
@@ -264,7 +265,7 @@ describe('explicit migrations', () => {
     db.close()
 
     const upgraded = openDatabase(path)
-    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('31')
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
     expect(tableInfo(upgraded, 'upload_sessions').map(column => column.name)).toContain('owns_artifact')
     expect(tableInfo(upgraded, 'upload_sessions').map(column => column.name)).toContain('owner_scope_id')
     expect(tableInfo(upgraded, 'intake_sessions').map(column => column.name)).toContain('owner_scope_id')
@@ -272,6 +273,211 @@ describe('explicit migrations', () => {
       .toEqual(['project_id', 'scope_id', 'closed_at'])
     expect(upgraded.prepare('SELECT status, committed_offset, owns_artifact FROM upload_sessions WHERE upload_id = ?')
       .get('upl-before-0034')).toEqual({ status: 'open', committed_offset: 0, owns_artifact: 0 })
+    upgraded.close()
+  })
+
+  it('0035 adds isolated OCR lifecycle tables without rewriting Intake source state', () => {
+    const path = tmpDbPath()
+    const db = openDatabase(path)
+    const now = '2026-08-31T00:00:00.000Z'
+    db.prepare(`INSERT INTO projects
+      (project_id, name, workspace, mode, status, revision, brief, constraints, execution, integrity, created_at, updated_at)
+      VALUES ('p-before-ocr', 'OCR', '/work/ocr', 'gate-only', 'DRAFT', 1, '{}', '{}', '{}', '{}', ?, ?)`).run(now, now)
+    db.prepare(`INSERT INTO intake_sessions
+      (intake_id, project_id, owner_principal_id, status, revision, source_label, expires_at, created_at, updated_at)
+      VALUES ('intk-before-ocr', 'p-before-ocr', 'pi-1', 'needs_input', 3, 'paper', ?, ?, ?)`).run(now, now, now)
+    db.prepare(`INSERT INTO intake_artifacts
+      (intake_id, artifact_id, file_name, media_type, size_bytes, sha256, quarantine, created_at)
+      VALUES ('intk-before-ocr', ?, 'paper.pdf', 'application/pdf', 4, ?, 'clean', ?)`).run(`sha256:${'a'.repeat(64)}`, 'a'.repeat(64), now)
+    db.exec(`
+      DROP TABLE ocr_observations;
+      DROP TABLE ocr_result_artifacts;
+      DROP TABLE ocr_requests;
+      DELETE FROM schema_migrations WHERE id = '0035_ocr_requests';
+      UPDATE meta SET value = '31' WHERE key = 'schema_version';
+    `)
+    db.close()
+
+    const upgraded = openDatabase(path)
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
+    expect((upgraded.prepare("SELECT COUNT(*) AS n FROM schema_migrations WHERE id = '0035_ocr_requests'").get() as { n: number }).n).toBe(1)
+    expect(upgraded.prepare("SELECT status, revision FROM intake_sessions WHERE intake_id = 'intk-before-ocr'").get())
+      .toEqual({ status: 'needs_input', revision: 3 })
+    expect(upgraded.prepare("SELECT quarantine, sha256 FROM intake_artifacts WHERE intake_id = 'intk-before-ocr'").get())
+      .toEqual({ quarantine: 'clean', sha256: 'a'.repeat(64) })
+    expect(tableInfo(upgraded, 'ocr_requests').map(column => column.name)).toContain('provider_config_sha256')
+    expect(tableInfo(upgraded, 'ocr_result_artifacts').map(column => column.name)).toContain('trust')
+    expect(tableInfo(upgraded, 'ocr_observations').map(column => column.name)).toContain('confidence')
+    upgraded.close()
+  })
+
+  it('0036 destructively resets legacy context-less PTY state without changing research data', () => {
+    const path = tmpDbPath()
+    const db = openDatabase(path)
+    const now = '2026-08-31T01:00:00.000Z'
+    db.prepare(`INSERT INTO projects
+      (project_id, name, workspace, mode, status, revision, brief, constraints, execution, integrity, created_at, updated_at)
+      VALUES ('p-pty-upgrade', 'PTY upgrade sentinel', '/work/pty', 'gate-only', 'DRAFT', 7, '{"question":"keep"}', '{}', '{}', '{}', ?, ?)`).run(now, now)
+    db.prepare(`INSERT INTO workspaces
+      (workspace_id, project_id, kind, name, revision, created_at, updated_at)
+      VALUES ('ws-pty-upgrade', 'p-pty-upgrade', 'code', 'Code', 4, ?, ?)`).run(now, now)
+    db.prepare(`INSERT INTO artifacts
+      (project_id, artifact_id, kind, size_bytes, sha256, metadata, created_at, media_type, file_name)
+      VALUES ('p-pty-upgrade', 'sha256:${'a'.repeat(64)}', 'dataset', 4, '${'a'.repeat(64)}', '{"sentinel":true}', ?, 'application/octet-stream', 'keep.bin')`).run(now)
+    db.prepare(`INSERT INTO tex_documents
+      (document_id, project_id, root_file, revision, created_at, updated_at)
+      VALUES ('tex-pty-upgrade', 'p-pty-upgrade', 'paper.tex', 5, ?, ?)`).run(now, now)
+    const sentinels = {
+      project: db.prepare("SELECT * FROM projects WHERE project_id='p-pty-upgrade'").get(),
+      workspace: db.prepare("SELECT * FROM workspaces WHERE workspace_id='ws-pty-upgrade'").get(),
+      artifact: db.prepare("SELECT * FROM artifacts WHERE project_id='p-pty-upgrade'").get(),
+      tex: db.prepare("SELECT * FROM tex_documents WHERE document_id='tex-pty-upgrade'").get(),
+    }
+    db.exec(`
+      DROP TABLE pty_frames;
+      DROP TABLE pty_sessions;
+      CREATE TABLE pty_sessions (
+        pty_session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT '', profile TEXT NOT NULL,
+        target TEXT NOT NULL, preset TEXT NOT NULL, cwd TEXT NOT NULL, config_hash TEXT NOT NULL,
+        state TEXT NOT NULL, generation INTEGER NOT NULL, lease_token TEXT,
+        lease_token_hash TEXT NOT NULL DEFAULT '', lease_expires_at TEXT,
+        idle_ttl_s INTEGER NOT NULL, retention_bytes INTEGER NOT NULL,
+        retained_from_seq INTEGER NOT NULL DEFAULT 0, last_client_seq INTEGER NOT NULL DEFAULT 0,
+        last_event_seq INTEGER NOT NULL DEFAULT 0, total_bytes INTEGER NOT NULL DEFAULT 0,
+        dropped_bytes INTEGER NOT NULL DEFAULT 0, adapter_id TEXT NOT NULL DEFAULT 'none',
+        open_at TEXT NOT NULL, last_activity_at TEXT NOT NULL, closed_at TEXT, close_reason TEXT
+      );
+      CREATE TABLE pty_frames (
+        pty_session_id TEXT NOT NULL, server_seq INTEGER NOT NULL, frame_kind TEXT NOT NULL,
+        client_seq INTEGER, type TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}',
+        byte_length INTEGER, created_at TEXT NOT NULL, PRIMARY KEY (pty_session_id, server_seq)
+      );
+      INSERT INTO pty_sessions
+        (pty_session_id,project_id,workspace_id,principal_id,tenant_id,profile,target,preset,cwd,
+         config_hash,state,generation,lease_token_hash,idle_ttl_s,retention_bytes,open_at,last_activity_at)
+        VALUES ('pty-legacy','p-pty-upgrade','ws-pty-upgrade','pi-1','local','local','target-local',
+          'bash','.', '${'b'.repeat(64)}','attached',3,'${'c'.repeat(64)}',900,1048576,
+          '${now}','${now}');
+      INSERT INTO pty_frames
+        (pty_session_id,server_seq,frame_kind,type,payload_json,byte_length,created_at)
+        VALUES ('pty-legacy',1,'output','stdout','{"data":"legacy"}',6,'${now}');
+      DELETE FROM schema_migrations WHERE id IN ('0036_pty_context_reset','0038_remove_plaintext_lease_storage');
+      UPDATE meta SET value = '32' WHERE key = 'schema_version';
+    `)
+    db.close()
+
+    const upgraded = openDatabase(path)
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value).toBe('35')
+    expect((upgraded.prepare('SELECT COUNT(*) AS n FROM pty_sessions').get() as { n: number }).n).toBe(0)
+    expect((upgraded.prepare('SELECT COUNT(*) AS n FROM pty_frames').get() as { n: number }).n).toBe(0)
+    const columns = tableInfo(upgraded, 'pty_sessions').map(column => column.name)
+    for (const column of ['context_kind', 'context_id', 'parent_session_id', 'label', 'purpose']) {
+      expect(columns).toContain(column)
+    }
+    const indexes = upgraded.prepare("PRAGMA index_list('pty_sessions')").all() as Array<{ name: string }>
+    expect(indexes.map(index => index.name)).toContain('idx_pty_sessions_context')
+    const report = JSON.parse((upgraded.prepare("SELECT report_json FROM schema_migrations WHERE id='0036_pty_context_reset'").get() as { report_json: string }).report_json) as { rows: Record<string, number> }
+    expect(report.rows).toMatchObject({ pty_sessions_discarded: 1, pty_frames_discarded: 1, pty_sessions: 0, pty_frames: 0 })
+    expect(upgraded.prepare("SELECT * FROM projects WHERE project_id='p-pty-upgrade'").get()).toEqual(sentinels.project)
+    expect(upgraded.prepare("SELECT * FROM workspaces WHERE workspace_id='ws-pty-upgrade'").get()).toEqual(sentinels.workspace)
+    expect(upgraded.prepare("SELECT * FROM artifacts WHERE project_id='p-pty-upgrade'").get()).toEqual(sentinels.artifact)
+    expect(upgraded.prepare("SELECT * FROM tex_documents WHERE document_id='tex-pty-upgrade'").get()).toEqual(sentinels.tex)
+    upgraded.close()
+  })
+
+  it('0036 preserves current context-bound PTY rows', () => {
+    const path = tmpDbPath()
+    const db = openDatabase(path)
+    const now = '2026-08-31T02:00:00.000Z'
+    db.exec('ALTER TABLE pty_sessions ADD COLUMN lease_token TEXT')
+    db.prepare(`INSERT INTO pty_sessions (
+      pty_session_id, project_id, workspace_id, principal_id, tenant_id,
+      context_kind, context_id, parent_session_id, label, purpose,
+      profile, target, preset, cwd, config_hash, state, generation,
+      lease_token, lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes,
+      open_at, last_activity_at)
+      VALUES ('pty-current','p-current','ws-current','pi-current','local',
+        'chat','ctx-current','dsh-session-current','Experiment shell','inspect',
+        'profile-current','target-current','bash','.','${'d'.repeat(64)}','detached',4,
+        NULL,'${'e'.repeat(64)}',NULL,900,1048576,?,?)`).run(now, now)
+    db.prepare(`INSERT INTO pty_frames
+      (pty_session_id, server_seq, frame_kind, type, payload_json, byte_length, created_at)
+      VALUES ('pty-current', 1, 'output', 'stdout', '{"data":"kept"}', 4, ?)`)
+      .run(now)
+    db.exec(`
+      DELETE FROM schema_migrations WHERE id IN ('0036_pty_context_reset','0038_remove_plaintext_lease_storage');
+      UPDATE meta SET value = '32' WHERE key = 'schema_version';
+    `)
+    db.close()
+
+    const upgraded = openDatabase(path)
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value).toBe('35')
+    const report = JSON.parse((upgraded.prepare("SELECT report_json FROM schema_migrations WHERE id='0036_pty_context_reset'").get() as { report_json: string }).report_json) as { rows: Record<string, number> }
+    expect(report.rows).toMatchObject({ pty_sessions_discarded: 0, pty_frames_discarded: 0, pty_sessions: 1, pty_frames: 1 })
+    expect(upgraded.prepare("SELECT context_kind,context_id,parent_session_id,label,purpose FROM pty_sessions WHERE pty_session_id='pty-current'").get())
+      .toEqual({ context_kind: 'chat', context_id: 'ctx-current', parent_session_id: 'dsh-session-current', label: 'Experiment shell', purpose: 'inspect' })
+    expect((upgraded.prepare("SELECT COUNT(*) AS n FROM pty_frames WHERE pty_session_id='pty-current'").get() as { n: number }).n).toBe(1)
+    upgraded.close()
+  })
+
+  it('0036 rejects the removed operator PTY context instead of preserving a fallback authority', () => {
+    const path = tmpDbPath()
+    const db = openDatabase(path)
+    const now = '2026-08-31T02:30:00.000Z'
+    db.exec('ALTER TABLE pty_sessions ADD COLUMN lease_token TEXT')
+    db.exec('PRAGMA ignore_check_constraints = ON')
+    db.prepare(`INSERT INTO pty_sessions (
+      pty_session_id, project_id, workspace_id, principal_id, tenant_id,
+      context_kind, context_id, parent_session_id, label, purpose,
+      profile, target, preset, cwd, config_hash, state, generation,
+      lease_token, lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes,
+      open_at, last_activity_at)
+      VALUES ('pty-operator','p-current','ws-current','pi-current','local',
+        'operator','operator-current',NULL,'Obsolete fallback','must not survive',
+        'profile-current','target-current','bash','.','${'f'.repeat(64)}','detached',2,
+        NULL,'${'a'.repeat(64)}',NULL,900,1048576,?,?)`).run(now, now)
+    db.exec(`
+      PRAGMA ignore_check_constraints = OFF;
+      DELETE FROM schema_migrations WHERE id IN ('0036_pty_context_reset','0038_remove_plaintext_lease_storage');
+      UPDATE meta SET value = '32' WHERE key = 'schema_version';
+    `)
+    db.close()
+
+    const upgraded = openDatabase(path)
+    expect((upgraded.prepare("SELECT COUNT(*) AS n FROM pty_sessions WHERE context_kind='operator'").get() as { n: number }).n).toBe(0)
+    const report = JSON.parse((upgraded.prepare("SELECT report_json FROM schema_migrations WHERE id='0036_pty_context_reset'").get() as { report_json: string }).report_json) as { rows: Record<string, number> }
+    expect(report.rows).toMatchObject({ pty_sessions_discarded: 1, pty_sessions: 0 })
+    upgraded.close()
+  })
+
+  it('0037 adds the config write ledger without rewriting canonical project rows', () => {
+    const path = tmpDbPath()
+    const db = openDatabase(path)
+    const now = '2026-08-31T03:00:00.000Z'
+    db.prepare(`INSERT INTO projects
+      (project_id, name, workspace, mode, status, revision, brief, constraints, execution, integrity, created_at, updated_at)
+      VALUES ('p-config-upgrade', 'Config upgrade sentinel', '/work/config', 'gate-only', 'DRAFT', 9,
+        '{"question":"keep"}', '{}',
+        '{"runner_profile_id":null,"runner_target_id":"target_local_docker_v1","network_policy":"none","artifact_store":"local-cas","fixture_id":null}',
+        '{"require_baseline_reproduction":true,"require_clean_room_rerun":false,"require_claim_evidence":true,"allow_automatic_public_release":false,"required_code_snapshot_id":null,"required_environment_lock_artifact_id":null}',
+        ?, ?)`).run(now, now)
+    const before = db.prepare("SELECT * FROM projects WHERE project_id='p-config-upgrade'").get()
+    db.exec(`
+      DROP TABLE config_write_revisions;
+      DROP TABLE config_write_layers;
+      DELETE FROM schema_migrations WHERE id = '0037_config_write_layers';
+      UPDATE meta SET value = '33' WHERE key = 'schema_version';
+    `)
+    db.close()
+
+    const upgraded = openDatabase(path)
+    expect(upgraded.prepare("SELECT * FROM projects WHERE project_id='p-config-upgrade'").get()).toEqual(before)
+    expect(tableInfo(upgraded, 'config_write_layers').map(column => column.name)).toContain('config_pin')
+    expect(tableInfo(upgraded, 'config_write_revisions').map(column => column.name)).toContain('changes_json')
+    expect((upgraded.prepare('SELECT COUNT(*) AS n FROM config_write_layers').get() as { n: number }).n).toBe(0)
+    expect((upgraded.prepare('SELECT COUNT(*) AS n FROM config_write_revisions').get() as { n: number }).n).toBe(0)
+    expect((upgraded.prepare("SELECT value FROM meta WHERE key='schema_version'").get() as { value: string }).value).toBe('35')
     upgraded.close()
   })
 
@@ -328,7 +534,7 @@ describe('explicit migrations', () => {
       .toEqual([{ runtime_json: null }, { runtime_json: null }])
     expect(db.prepare(`SELECT target_id, kind, revision, capabilities_json, connection_json
       FROM runner_targets ORDER BY target_id`).all()).toEqual(before)
-    expect((db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('31')
+    expect((db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
     db.close()
   })
 
@@ -347,7 +553,7 @@ describe('explicit migrations', () => {
       { target_id: 'target_local_docker_v1', identity: { scheme: 'file', name: 'runner-targets/target_local_docker_v1.token', scope: 'instance' } },
       { target_id: 'target_local_process_v1', identity: { scheme: 'file', name: 'runner-targets/target_local_process_v1.token', scope: 'instance' } },
     ])
-    expect((db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('31')
+    expect((db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('35')
     db.close()
   })
 
@@ -429,7 +635,7 @@ describe('explicit migrations', () => {
     const path = tmpDbPath()
     copyFileSync(FIXTURE, path)
     const db = openDatabase(path)
-    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('31')
+    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('35')
     // Projects preserved.
     const projects = db.prepare('SELECT project_id, name FROM projects ORDER BY project_id').all() as Array<{ project_id: string; name: string }>
     expect(projects).toEqual([{ project_id: 'p_legacy1', name: 'Legacy Study' }, { project_id: 'p_legacy2', name: 'Legacy Study B' }])
@@ -478,8 +684,8 @@ describe('explicit migrations', () => {
     // Re-open: still idempotent and consistent.
     db.close()
     const db2 = openDatabase(path)
-    expect((db2.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(33)
-    expect((db2.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('31')
+    expect((db2.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(37)
+    expect((db2.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('35')
     db2.close()
     rmSync(path, { recursive: false, force: true })
   })
@@ -504,7 +710,7 @@ describe('explicit migrations', () => {
     db.prepare("UPDATE meta SET value = '6' WHERE key = 'schema_version'").run()
     runMigrations(db)
     // Version bumped; outbox columns re-added by the new migration.
-    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('31')
+    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('35')
     const cols = tableInfo(db, 'events').map(c => c.name)
     for (const c of outboxCols) expect(cols).toContain(c)
     // Existing rows get default envelope values + a stable backfilled seq.
@@ -532,16 +738,16 @@ describe('explicit migrations', () => {
     db.prepare(`INSERT INTO jobs (job_id, project_id, idempotency_key, kind, command, payload, status, lease_owner, lease_expires_at, lease_generation, attempts, max_attempts, created_at, updated_at)
       VALUES (?, ?, ?, 'smoke', '[]', ?, 'running', 'legacy-runner', '2026-02-01T00:00:00.000Z', 1, 1, 3, ?, ?)`)
       .run('job_legacy_lease', 'p1', 'legacy-key', JSON.stringify({ __lease_token: 'lt_legacysecret', data: 1 }), '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
-    db.exec("DELETE FROM schema_migrations WHERE id = '0014_lease_token_hash'")
+    db.exec("DELETE FROM schema_migrations WHERE id IN ('0014_lease_token_hash','0038_remove_plaintext_lease_storage')")
     db.exec('ALTER TABLE jobs DROP COLUMN lease_token_hash')
     db.prepare("UPDATE meta SET value = '12' WHERE key = 'schema_version'").run()
     runMigrations(db)
-    // Column exists and the legacy plaintext token was hashed in place —
-    // existing data (including the payload itself) is otherwise untouched.
+    // 0014 hashes the historical row; 0038 completes the current migration
+    // chain by removing the reserved plaintext payload key.
     const row = db.prepare('SELECT lease_token_hash, payload FROM jobs WHERE job_id = ?').get('job_legacy_lease') as { lease_token_hash: string; payload: string }
     expect(row.lease_token_hash).toBe(sha256('lt_legacysecret'))
     expect(row.lease_token_hash).toMatch(/^[0-9a-f]{64}$/)
-    expect(JSON.parse(row.payload)).toEqual({ __lease_token: 'lt_legacysecret', data: 1 })
+    expect(JSON.parse(row.payload)).toEqual({ data: 1 })
     // Rows without a token keep NULL (no hash to derive).
     db.prepare(`INSERT INTO jobs (job_id, project_id, idempotency_key, kind, command, payload, status, attempts, max_attempts, created_at, updated_at)
       VALUES (?, ?, ?, 'smoke', '[]', '{}', 'queued', 0, 3, ?, ?)`)
@@ -551,7 +757,7 @@ describe('explicit migrations', () => {
     db.close()
   })
 
-  it('0014 (STORE-06): legacy pty_sessions (plaintext NOT NULL) rebuild with lease_token_hash and nullable plaintext', () => {
+  it('0014 then 0036 upgrades a plaintext context-less PTY without inventing authority', () => {
     const db = openDatabase(':memory:')
     // Rewind pty_sessions to the pre-0014 shape (plaintext NOT NULL, no
     // hash column) and drop the 0014 record.
@@ -571,26 +777,147 @@ describe('explicit migrations', () => {
     db.prepare(`INSERT INTO pty_sessions (pty_session_id, project_id, workspace_id, principal_id, tenant_id, profile, target, preset, cwd, config_hash, state, generation, lease_token, lease_expires_at, idle_ttl_s, retention_bytes, open_at, last_activity_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run('pty_legacy1', 'p1', 'ws1', 'pi1', 't1', 'local-docker-cpu', 'tgt', 'bash', 'scratch', 'sha256:deadbeef', 'open', 1, 'lease_legacysecret', '2026-02-01T00:00:00.000Z', 900, 1048576, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
-    db.exec("DELETE FROM schema_migrations WHERE id = '0014_lease_token_hash'")
+    db.prepare(`INSERT INTO pty_frames
+      (pty_session_id, server_seq, frame_kind, type, payload_json, byte_length, created_at)
+      VALUES ('pty_legacy1', 1, 'output', 'stdout', '{"data":"old"}', 3, '2026-01-01T00:00:00.000Z')`).run()
+    db.exec("DELETE FROM schema_migrations WHERE id IN ('0014_lease_token_hash','0036_pty_context_reset','0038_remove_plaintext_lease_storage')")
     db.prepare("UPDATE meta SET value = '12' WHERE key = 'schema_version'").run()
     runMigrations(db)
-    // Rebuilt shape: hash column populated from the legacy plaintext, which
-    // is preserved (existing data untouched).
+    // 0014 can complete its released hash rebuild against the frozen legacy
+    // DDL. 0036 then drops the transient row/frame instead of fabricating a
+    // Research/Chat/Subagent context from project/profile/target fields.
     const cols = tableInfo(db, 'pty_sessions').map(c => c.name)
-    expect(cols).toContain('lease_token_hash')
-    const row = db.prepare('SELECT lease_token, lease_token_hash FROM pty_sessions WHERE pty_session_id = ?').get('pty_legacy1') as { lease_token: string; lease_token_hash: string }
-    expect(row.lease_token).toBe('lease_legacysecret')
-    expect(row.lease_token_hash).toBe(sha256('lease_legacysecret'))
-    // The new shape accepts NULL plaintext + hash-only writes (the post-0014
-    // store path) and keeps the project index.
-    db.prepare(`INSERT INTO pty_sessions (pty_session_id, project_id, workspace_id, principal_id, tenant_id, profile, target, preset, cwd, config_hash, state, generation, lease_token, lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes, open_at, last_activity_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, 900, 1048576, ?, ?)`)
-      .run('pty_new1', 'p1', 'ws1', 'pi1', 't1', 'local-docker-cpu', 'tgt', 'bash', 'scratch', 'sha256:deadbeef', 'open', 1, sha256('lease_freshsecret'), '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
-    const newRow = db.prepare('SELECT lease_token, lease_token_hash FROM pty_sessions WHERE pty_session_id = ?').get('pty_new1') as { lease_token: string | null; lease_token_hash: string }
-    expect(newRow.lease_token).toBeNull()
-    expect(newRow.lease_token_hash).toBe(sha256('lease_freshsecret'))
+    for (const column of ['lease_token_hash', 'context_kind', 'context_id', 'parent_session_id', 'label', 'purpose']) {
+      expect(cols).toContain(column)
+    }
+    expect(cols).not.toContain('lease_token')
+    expect((db.prepare('SELECT COUNT(*) AS n FROM pty_sessions').get() as { n: number }).n).toBe(0)
+    expect((db.prepare('SELECT COUNT(*) AS n FROM pty_frames').get() as { n: number }).n).toBe(0)
+    const report = JSON.parse((db.prepare("SELECT report_json FROM schema_migrations WHERE id='0036_pty_context_reset'").get() as { report_json: string }).report_json) as { rows: Record<string, number> }
+    expect(report.rows).toMatchObject({ pty_sessions_discarded: 1, pty_frames_discarded: 1 })
     const idx = db.prepare(`PRAGMA index_list('pty_sessions')`).all() as Array<{ name: string }>
     expect(idx.some(i => i.name === 'idx_pty_sessions_project')).toBe(true)
+    expect(idx.some(i => i.name === 'idx_pty_sessions_context')).toBe(true)
+    db.close()
+  })
+
+  it('0038 removes plaintext lease storage while preserving current PTY sessions and frames', () => {
+    const db = openDatabase(':memory:')
+    const token = 'lease_upgrade_secret'
+    const oldManifest = JSON.stringify({
+      run_id: 'run_upgrade_0038', job_id: 'job_upgrade_0038',
+      lease: { generation: 1, token }, runner_key_id: 'runner-old',
+      payload_sha256: 'old-payload-hash', signature: 'old-signature', exit_code: 0,
+    })
+    db.prepare(`INSERT INTO jobs (job_id, project_id, idempotency_key, kind, command, payload, status, lease_owner, lease_expires_at, lease_generation, attempts, max_attempts, run_manifest, signature_status, created_at, updated_at)
+      VALUES (?, ?, ?, 'smoke', '[]', ?, 'running', 'runner-upgrade', '2026-02-01T00:00:00.000Z', 1, 1, 3, ?, 'signed', ?, ?)`).run(
+      'job_upgrade_0038', 'p1', 'upgrade-0038', JSON.stringify({ __lease_token: token, data: 7 }), oldManifest,
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z',
+    )
+    db.prepare(`INSERT INTO runs
+      (run_id, project_id, job_id, attempt_no, contract_id, snapshot_sha256, manifest_json, signature_status, started_at, finished_at)
+      VALUES ('run_upgrade_0038', 'p1', 'job_upgrade_0038', 1, NULL, NULL, ?, 'signed', ?, ?)`)
+      .run(oldManifest, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:01.000Z')
+    db.exec('ALTER TABLE pty_sessions ADD COLUMN lease_token TEXT')
+    db.prepare(`INSERT INTO pty_sessions (
+      pty_session_id, project_id, workspace_id, principal_id, tenant_id,
+      context_kind, context_id, parent_session_id, label, purpose,
+      profile, target, preset, cwd, config_hash, state, generation,
+      lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes,
+      open_at, last_activity_at, lease_token
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      'pty_upgrade_0038', 'p1', 'ws_upgrade', 'pi1', 'tenant1',
+      'chat', 'session_upgrade', null, 'Upgrade shell', 'preserve me',
+      'local-process', 'target_local_process_v1', 'bash', '', 'sha256:config', 'open', 4,
+      '', '2026-02-01T00:00:00.000Z', 900, 1048576,
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'pty-secret',
+    )
+    db.prepare(`INSERT INTO pty_frames
+      (pty_session_id, server_seq, frame_kind, type, payload_json, byte_length, created_at)
+      VALUES (?, 1, 'output', 'stdout', '{"data":"kept"}', 4, ?)`).run(
+      'pty_upgrade_0038', '2026-01-01T00:00:01.000Z',
+    )
+    db.exec("DELETE FROM schema_migrations WHERE id = '0038_remove_plaintext_lease_storage'")
+    db.prepare("UPDATE meta SET value = '34' WHERE key = 'schema_version'").run()
+
+    runMigrations(db)
+
+    const job = db.prepare('SELECT payload, lease_token_hash, run_manifest, signature_status FROM jobs WHERE job_id = ?').get('job_upgrade_0038') as { payload: string; lease_token_hash: string; run_manifest: string; signature_status: string }
+    expect(JSON.parse(job.payload)).toEqual({ data: 7 })
+    expect(job.lease_token_hash).toBe(sha256(token))
+    const jobManifest = JSON.parse(job.run_manifest) as Record<string, unknown>
+    expect(jobManifest.lease).toEqual({ generation: 1 })
+    expect(jobManifest).not.toHaveProperty('signature')
+    expect(jobManifest).not.toHaveProperty('runner_key_id')
+    expect(jobManifest).not.toHaveProperty('payload_sha256')
+    expect(job.signature_status).toBe('credential_redacted')
+    const run = db.prepare('SELECT manifest_json, signature_status FROM runs WHERE run_id = ?').get('run_upgrade_0038') as { manifest_json: string; signature_status: string }
+    expect(JSON.parse(run.manifest_json)).toEqual(jobManifest)
+    expect(run.signature_status).toBe('credential_redacted')
+    const columns = tableInfo(db, 'pty_sessions').map(column => column.name)
+    expect(columns).not.toContain('lease_token')
+    expect(db.prepare('SELECT label, purpose, generation, lease_token_hash FROM pty_sessions WHERE pty_session_id = ?').get('pty_upgrade_0038')).toEqual({
+      label: 'Upgrade shell', purpose: 'preserve me', generation: 4, lease_token_hash: sha256('pty-secret'),
+    })
+    expect(db.prepare('SELECT payload_json FROM pty_frames WHERE pty_session_id = ? AND server_seq = 1').get('pty_upgrade_0038')).toEqual({ payload_json: '{"data":"kept"}' })
+    const report = JSON.parse((db.prepare("SELECT report_json FROM schema_migrations WHERE id = '0038_remove_plaintext_lease_storage'").get() as { report_json: string }).report_json) as { rows: Record<string, number> }
+    expect(report.rows).toMatchObject({
+      jobs_scrubbed: 1, job_manifests_scrubbed: 1, run_manifests_scrubbed: 1,
+      job_hashes_backfilled: 1, pty_hashes_backfilled: 1,
+      pty_sessions_preserved: 1, pty_frames_preserved: 1,
+    })
+    db.close()
+  })
+
+  it('0038 rolls back when plaintext and persisted lease hash conflict', () => {
+    const db = openDatabase(':memory:')
+    db.prepare(`INSERT INTO jobs (job_id, project_id, idempotency_key, kind, command, payload, status, lease_owner, lease_expires_at, lease_generation, lease_token_hash, attempts, max_attempts, created_at, updated_at)
+      VALUES (?, ?, ?, 'smoke', '[]', ?, 'running', 'runner-upgrade', '2026-02-01T00:00:00.000Z', 1, ?, 1, 3, ?, ?)`).run(
+      'job_conflict_0038', 'p1', 'conflict-0038', JSON.stringify({ __lease_token: 'token-a', data: 8 }), sha256('token-b'),
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z',
+    )
+    db.exec('ALTER TABLE pty_sessions ADD COLUMN lease_token TEXT')
+    db.exec("DELETE FROM schema_migrations WHERE id = '0038_remove_plaintext_lease_storage'")
+    db.prepare("UPDATE meta SET value = '34' WHERE key = 'schema_version'").run()
+
+    expect(() => runMigrations(db)).toThrow(/plaintext lease token conflicts with its hash/)
+    expect(JSON.parse((db.prepare('SELECT payload FROM jobs WHERE job_id = ?').get('job_conflict_0038') as { payload: string }).payload)).toEqual({ __lease_token: 'token-a', data: 8 })
+    expect((db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('34')
+    expect(db.prepare("SELECT 1 FROM schema_migrations WHERE id = '0038_remove_plaintext_lease_storage'").get()).toBeUndefined()
+    expect(tableInfo(db, 'pty_sessions').map(column => column.name)).toContain('lease_token')
+    db.close()
+  })
+
+  it('0038 rolls back instead of redacting a signed manifest whose token conflicts with the Job hash', () => {
+    const db = openDatabase(':memory:')
+    const manifest = JSON.stringify({
+      run_id: 'run_manifest_conflict_0038', job_id: 'job_manifest_conflict_0038',
+      lease: { generation: 1, token: 'token-a' },
+      runner_key_id: 'runner-old', payload_sha256: 'old-hash', signature: 'old-signature',
+    })
+    db.prepare(`INSERT INTO jobs
+      (job_id, project_id, idempotency_key, kind, command, payload, status,
+       lease_owner, lease_expires_at, lease_generation, lease_token_hash,
+       attempts, max_attempts, run_manifest, signature_status, created_at, updated_at)
+      VALUES (?, ?, ?, 'smoke', '[]', '{}', 'running', 'runner-upgrade', ?, 1, ?, 1, 3, ?, 'signed', ?, ?)`)
+      .run(
+        'job_manifest_conflict_0038', 'p1', 'manifest-conflict-0038',
+        '2026-02-01T00:00:00.000Z', sha256('token-b'), manifest,
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z',
+      )
+    db.prepare(`INSERT INTO runs
+      (run_id, project_id, job_id, attempt_no, manifest_json, signature_status, started_at)
+      VALUES ('run_manifest_conflict_0038', 'p1', 'job_manifest_conflict_0038', 1, ?, 'signed', ?)`)
+      .run(manifest, '2026-01-01T00:00:00.000Z')
+    db.prepare("DELETE FROM schema_migrations WHERE id = '0038_remove_plaintext_lease_storage'").run()
+    db.prepare("UPDATE meta SET value = '34' WHERE key = 'schema_version'").run()
+
+    expect(() => runMigrations(db)).toThrow(/run_manifest plaintext lease token conflicts with its Job hash/)
+    expect(db.prepare('SELECT run_manifest, signature_status FROM jobs WHERE job_id = ?').get('job_manifest_conflict_0038'))
+      .toEqual({ run_manifest: manifest, signature_status: 'signed' })
+    expect(db.prepare('SELECT manifest_json, signature_status FROM runs WHERE run_id = ?').get('run_manifest_conflict_0038'))
+      .toEqual({ manifest_json: manifest, signature_status: 'signed' })
+    expect((db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('34')
     db.close()
   })
 
@@ -633,7 +960,7 @@ describe('explicit migrations', () => {
     const casDir = mkdtempSync(join(tmpdir(), 'dsh-mig-cas-'))
     copyFileSync(FIXTURE, path)
     const db = openDatabase(path, undefined, casDir)
-    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('31')
+    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('35')
     // STORE-08 rule: the canonical body binds the up source AND the helpers
     // it executes — editing either changes the recorded checksum.
     const m17 = MIGRATIONS.find(x => x.id === '0017_v1_legacy_marks')
@@ -679,7 +1006,7 @@ describe('explicit migrations', () => {
     // Re-open: idempotent — same marks, no duplicate artifacts, version stable.
     db.close()
     const db2 = openDatabase(path, undefined, casDir)
-    expect((db2.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(33)
+    expect((db2.prepare('SELECT COUNT(*) AS n FROM schema_migrations').get() as { n: number }).n).toBe(37)
     const echo2 = db2.prepare('SELECT synthetic_fixture, signature_status, legacy_log_artifact FROM jobs WHERE job_id = ?').get('job_echo1') as { synthetic_fixture: number; signature_status: string | null; legacy_log_artifact: string | null }
     expect(echo2.synthetic_fixture).toBe(1)
     expect(echo2.signature_status).toBeNull()
@@ -769,7 +1096,7 @@ describe('explicit migrations', () => {
     db.exec("DELETE FROM schema_migrations WHERE id = '0018_workspace_recovery_quarantine'")
     db.prepare("UPDATE meta SET value = '15' WHERE key = 'schema_version'").run()
     runMigrations(db)
-    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('31')
+    expect((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value).toBe('35')
     const q = db.prepare('SELECT quarantine FROM workspaces WHERE workspace_id = ?').get('ws_q1') as { quarantine: string | null }
     expect(q.quarantine).toContain('a.txt')
     // The report row counts the quarantined marker (idempotent).

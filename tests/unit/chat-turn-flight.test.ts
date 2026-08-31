@@ -28,10 +28,12 @@ describe('Scholar Chat exact-session single-flight state', () => {
 
     expect(flights.cancel('project-a', 'chat-1')).toBe(true)
     expect(exact.aborted).toBe(true)
+    expect(flights.begin('project-a', 'chat-1')).toBe(false)
     expect(sibling.aborted).toBe(false)
     expect(flights.cancelProject('project-a')).toBe(1)
     expect(sibling.aborted).toBe(true)
     expect(foreign.aborted).toBe(false)
+    expect(flights.begin('project-a', 'chat-new')).toBe(false)
     expect(flights.active('project-b', 'chat-1')).toBe(true)
     expect(flights.projectIds()).toEqual(['project-b'])
   })

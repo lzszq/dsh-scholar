@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "DSH Research OS — isolated experiment runner gateway: claims durable jobs from the Research Kernel, executes them outside the DSH process (subprocess fallback for smoke, docker when available), heartbeats leases, terminates real executions on cancel, uploads artifacts and Ed25519-signs RunManifests.",
   "type": "module",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {

@@ -130,10 +130,8 @@ export interface Projection {
   jobs?: Array<{ job_id?: string; kind?: string; status?: string; error?: string; contract_id?: string | null }>
   budget?: { model_cost_usd?: number; gpu_hours?: number; api_requests?: number }
   counts?: { ideas?: number; contracts?: number; claims?: number; evidence?: number; artifacts?: number; corpus_snapshots?: number }
-  next_actions?: string[]
-  /** GUIDE-01: structured next-step projection (kernel-authoritative; legacy
-   *  string[] kept for old consumers). Rendered as v2 cards by
-   *  panels/overview.ts; falls back to next_actions when absent. */
+  /** GUIDE-01: the only authoritative next-step projection. Missing or
+   * malformed wire data is a safe empty state and never a label fallback. */
   next_actions_v2?: NextActionV2[]
 }
 

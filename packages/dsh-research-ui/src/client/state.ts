@@ -12,20 +12,12 @@ import {
   appendStoredChatMessage,
   appendStoredChatHistory,
   consumeStoredChatQuote,
-  deleteChatProjectSnapshot,
-  listChatProjectSnapshotIds,
   loadChatProjectSnapshot,
   saveChatProjectSnapshot,
   type ChatProjectSnapshot,
   type ChatQuoteTarget,
 } from './chat-project-store'
-import { chatVisionTurnStore } from './chat-vision'
-import { chatUploadStore } from './chat-upload-store'
-import { browserTransport } from './chunked-upload'
-import { chatTurnFlightStore } from './chat-turn-flight'
-import { chatAttachmentFlightStore } from './chat-attachment-flight'
-import { chatScopeCloseStore } from './chat-scope-close-store'
-import { apiResult } from './api'
+import { chatScopeLifecycle } from './chat-scope-lifecycle'
 
 export let favProjects = new Set<string>()
 
@@ -256,7 +248,6 @@ export const CHAT_MAX = 200
 /** Multi-session chats (dsh-web session tabs), persisted. */
 export const SESSIONS_KEY = 'dsh-scholar-ui-sessions'
 let chatContextProjectId: string | null = null
-const discardedChatProjects = new Set<string>()
 
 export function activeChatProjectId(): string | null {
   return chatContextProjectId
@@ -265,17 +256,7 @@ export function activeChatProjectId(): string | null {
 /** Page scopes that may still own transcript/File/turn state even while a
  * different project is selected. Used only after an authoritative list read. */
 export function chatTrackedProjectIds(): string[] {
-  const ids = new Set<string>(chatContextProjectId === null ? [] : [chatContextProjectId])
-  try {
-    for (const projectId of listChatProjectSnapshotIds(localStorage)) ids.add(projectId)
-    chatScopeCloseStore.hydrate(localStorage)
-  } catch { /* private mode */ }
-  for (const projectId of chatUploadStore.projectIds()) ids.add(projectId)
-  for (const projectId of chatVisionTurnStore.projectIds()) ids.add(projectId)
-  for (const projectId of chatTurnFlightStore.projectIds()) ids.add(projectId)
-  for (const projectId of chatAttachmentFlightStore.projectIds()) ids.add(projectId)
-  for (const projectId of chatScopeCloseStore.projectIds()) ids.add(projectId)
-  return [...ids]
+  return chatScopeLifecycle.trackedProjectIds(localStorage, chatContextProjectId)
 }
 
 function currentChatSnapshot(projectId: string): ChatProjectSnapshot {
@@ -326,7 +307,6 @@ export function chatActivateProject(projectId: string): void {
   state.chatCommandsOnly = snapshot.commandsOnly
   state.chatSessionSearchQuery = snapshot.sessionSearchQuery
   chatSessionEnsure()
-  try { chatScopeCloseStore.hydrate(localStorage) } catch { /* private mode */ }
   void flushChatScopeCloseOutbox(projectId)
 }
 
@@ -382,8 +362,6 @@ export function chatSessionNew(): void {
   chatSessionsPersist()
   state.rerender()
 }
-const chatScopeCloseRequests = new Map<string, Promise<boolean>>()
-
 function removeChatSessionLocally(projectId: string, id: string): void {
   if (chatContextProjectId !== projectId) {
     try {
@@ -411,54 +389,21 @@ function removeChatSessionLocally(projectId: string, id: string): void {
   state.rerender()
 }
 
-function requestChatScopeClose(projectId: string, sessionId: string): Promise<boolean> {
-  const key = `${projectId}\u0000${sessionId}`
-  const existing = chatScopeCloseRequests.get(key)
-  if (existing !== undefined) return existing
-  const request = (async (): Promise<boolean> => {
-    const result = await apiResult<{ ok: true }>(
-      `/v1/projects/${encodeURIComponent(projectId)}/chat-scopes/${encodeURIComponent(sessionId)}/tombstone`,
-      { method: 'POST', body: '{}' },
-    )
-    // A deleted project is a stronger tombstone; no retry is needed.
-    if (!result.ok && result.status !== 404) return false
-    try { chatScopeCloseStore.complete(localStorage, projectId, sessionId) } catch { /* stale outbox replays idempotently */ }
-    removeChatSessionLocally(projectId, sessionId)
-    return true
-  })().finally(() => { chatScopeCloseRequests.delete(key) })
-  chatScopeCloseRequests.set(key, request)
-  return request
-}
-
 export async function flushChatScopeCloseOutbox(projectId?: string): Promise<void> {
-  try { chatScopeCloseStore.hydrate(localStorage) } catch { /* page-lifetime entries remain */ }
-  await Promise.all(chatScopeCloseStore.entries(projectId).map(item => requestChatScopeClose(item.projectId, item.sessionId)))
+  await chatScopeLifecycle.flush(localStorage, removeChatSessionLocally, projectId)
 }
 
 export function chatSessionClose(id: string): void {
   const projectId = chatContextProjectId
   if (projectId === null || !state.chatSessions.some(session => session.id === id && session.project_id === projectId)) return
-  // Publish every page-lifetime tombstone before any asynchronous close I/O.
-  const discarded = chatUploadStore.clear(projectId, id)
-  chatAttachmentFlightStore.cancel(projectId, id)
-  chatTurnFlightStore.cancel(projectId, id)
-  chatVisionTurnStore.clear(projectId, id)
-  let durable = false
-  try { durable = chatScopeCloseStore.enqueue(localStorage, projectId, id) } catch { /* keep the visible session until server ACK */ }
-  if (durable) removeChatSessionLocally(projectId, id)
-  void requestChatScopeClose(projectId, id)
-  const transport = browserTransport()
-  for (const item of discarded) {
-    if (item.uploadId === null || item.intakeId === null || item.projectId !== projectId) continue
-    void transport.abort({ project_id: projectId, intake_id: item.intakeId, upload_id: item.uploadId }).catch(() => {})
-  }
+  chatScopeLifecycle.closeSession({ storage: localStorage, projectId, sessionId: id, removeLocal: removeChatSessionLocally })
 }
 
 /** Exact project/session liveness fence for delayed model, Intake and upload
  * continuations. Project switches persist the session; explicit close makes
  * it disappear and therefore rejects all late writes. */
 export function chatSessionExists(projectId: string, sessionId: string): boolean {
-  if (discardedChatProjects.has(projectId)) return false
+  if (chatScopeLifecycle.sessionClosed(projectId, sessionId)) return false
   if (chatContextProjectId === projectId) {
     return state.chatSessions.some(session => session.project_id === projectId && session.id === sessionId)
   }
@@ -474,16 +419,7 @@ export function chatSessionExists(projectId: string, sessionId: string): boolean
 /** Explicit destructive cleanup; ordinary navigation deliberately retains
  * the page-lifetime File handles and persisted queue metadata. */
 export function chatDiscardProject(projectId: string): void {
-  discardedChatProjects.add(projectId)
-  chatAttachmentFlightStore.cancelProject(projectId)
-  chatTurnFlightStore.cancelProject(projectId)
-  chatVisionTurnStore.clearProject(projectId)
-  // Project deletion is authoritative in the Kernel, which removes every
-  // open server-side stage before the project becomes unreadable. The browser
-  // only owns its local queue and must not issue doomed post-tombstone aborts.
-  chatUploadStore.clearProject(projectId)
-  try { chatScopeCloseStore.clearProject(localStorage, projectId) } catch { /* project authority already deleted */ }
-  try { deleteChatProjectSnapshot(localStorage, projectId) } catch { /* private mode */ }
+  chatScopeLifecycle.discardProject(localStorage, projectId)
   if (chatContextProjectId === projectId) {
     chatContextProjectId = null
     resetChatContext()
@@ -640,7 +576,7 @@ export function chatPush(role: ChatMessage['role'], text: string, quote?: { inde
 
 /** Write a delayed result to the exact project/session that launched it. */
 export function chatPushToProjectSession(projectId: string, sessionId: string | null, message: ChatMessage, markUnread = true): boolean {
-  if (sessionId === null) return false
+  if (sessionId === null || chatScopeLifecycle.sessionClosed(projectId, sessionId)) return false
   if (message.attachment !== undefined && message.attachment.project_id !== projectId) return false
   if (chatContextProjectId === projectId) {
     const session = state.chatSessions.find(candidate => candidate.project_id === projectId && candidate.id === sessionId)
@@ -676,7 +612,10 @@ export function consumeChatQuoteForProjectSession(
 }
 
 export function chatUpsertAttachmentForProjectSession(projectId: string, sessionId: string | null, message: ChatMessage): boolean {
-  if (sessionId === null || message.attachment === undefined || message.attachment.project_id !== projectId) return false
+  if (
+    sessionId === null || chatScopeLifecycle.sessionClosed(projectId, sessionId)
+    || message.attachment === undefined || message.attachment.project_id !== projectId
+  ) return false
   const update = (snapshot: ChatProjectSnapshot): boolean => {
     const session = snapshot.sessions.find(candidate => candidate.project_id === projectId && candidate.id === sessionId)
     if (session === undefined) return false

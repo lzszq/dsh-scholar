@@ -23,7 +23,7 @@ import { SCHEMA_VERSION } from './migrations.js'
 
 const DB_FILE = 'kernel.db'
 const IMPORT_DIR = 'data-imports'
-const ADOPTION_FORMAT_VERSION = 4
+const ADOPTION_FORMAT_VERSION = 5
 const CAS_NAME = 'cas'
 const COPY_ROOTS = [CAS_NAME, 'workspaces', 'pty-workspaces'] as const
 const NON_PRODUCT_TABLES = new Set(['meta', 'schema_migrations'])
@@ -47,11 +47,18 @@ const MERGE_TABLES = [
   'terminal_retention', 'terminal_frames',
   'tex_documents', 'tex_files', 'tex_snapshots', 'tex_snapshot_files', 'tex_builds', 'tex_preview_pending',
   'workspaces', 'workspace_nodes', 'workspace_ops', 'pty_sessions', 'pty_frames',
-  'intake_sessions', 'intake_artifacts', 'intake_observations', 'intake_questions',
+  'intake_sessions', 'intake_artifacts',
+  'ocr_requests', 'ocr_result_artifacts', 'ocr_observations',
+  'intake_observations', 'intake_questions',
   'child_links', 'child_history', 'child_followups',
   'model_providers', 'model_provider_models', 'upload_sessions', 'upload_chunks',
+  'config_write_layers', 'config_write_revisions',
   'reproduction_specs', 'reproduction_attempts', 'reproduction_reports', 'reproduction_links',
   'runner_targets', 'runner_keys', 'project_grill_answers',
+] as const
+
+const PTY_CONTEXT_REQUIRED_COLUMNS = [
+  'context_kind', 'context_id', 'parent_session_id', 'label', 'purpose',
 ] as const
 
 type SqlValue = null | string | number | bigint | Uint8Array
@@ -212,6 +219,38 @@ function assertCompleteMergeInventory(db: DatabaseSync): void {
   }
 }
 
+interface PtyContextInventory {
+  main: { sessions: number; frames: number }
+  legacy: { sessions: number; frames: number }
+}
+
+/** PTY is transient, but a current context-bound source is still merged
+ * exactly. Validate its authority-bearing shape and row accounting before
+ * any insert, and reject orphan frames because pty_frames intentionally has
+ * no formal-evidence foreign key. */
+function assertPtyContextInventory(db: DatabaseSync): PtyContextInventory {
+  const result = {} as PtyContextInventory
+  for (const schema of ['main', 'legacy'] as const) {
+    const columns = tableColumns(db, schema, 'pty_sessions').map(column => column.name)
+    const missing = PTY_CONTEXT_REQUIRED_COLUMNS.filter(column => !columns.includes(column))
+    if (missing.length > 0) {
+      throw new Error(`PTY context inventory for ${schema}.pty_sessions is missing required column(s): ${missing.join(',')}`)
+    }
+    const sessions = Number((db.prepare(`SELECT COUNT(*) AS n FROM ${quoteIdentifier(schema)}.pty_sessions`).get() as { n: number }).n)
+    const frames = Number((db.prepare(`SELECT COUNT(*) AS n FROM ${quoteIdentifier(schema)}.pty_frames`).get() as { n: number }).n)
+    const orphans = Number((db.prepare(`SELECT COUNT(*) AS n
+      FROM ${quoteIdentifier(schema)}.pty_frames AS frame
+      LEFT JOIN ${quoteIdentifier(schema)}.pty_sessions AS session
+        ON session.pty_session_id = frame.pty_session_id
+      WHERE session.pty_session_id IS NULL`).get() as { n: number }).n)
+    if (orphans > 0) {
+      throw new Error(`kernel data adoption found ${orphans} orphan PTY frame(s) in ${schema}`)
+    }
+    result[schema] = { sessions, frames }
+  }
+  return result
+}
+
 /**
  * Raw ledger adoption must not fire business triggers that derive new rows.
  * Their exact source rows are merged later in the same transaction. SQLite
@@ -272,6 +311,9 @@ function mergeTable(db: DatabaseSync, table: string): { inserted: number; existi
     }
     insert.run(...columns.map(column => row[column]!))
     inserted += 1
+  }
+  if (inserted + existing !== sourceRows.length) {
+    throw new Error(`kernel data adoption row-count mismatch for ${table}`)
   }
   return { inserted, existing }
 }
@@ -344,11 +386,20 @@ export function adoptLegacyKernelData(options: AdoptLegacyKernelDataOptions): Ke
       targetDb.exec('PRAGMA defer_foreign_keys = ON')
       try {
         assertCompleteMergeInventory(targetDb)
+        const ptyBefore = assertPtyContextInventory(targetDb)
         const suspendedTriggers = suspendMergeSideEffectTriggers(targetDb)
+        const ptyInserted = { sessions: 0, frames: 0 }
         for (const table of MERGE_TABLES) {
           const result = mergeTable(targetDb, table)
           rowsInserted += result.inserted
           rowsAlreadyPresent += result.existing
+          if (table === 'pty_sessions') ptyInserted.sessions = result.inserted
+          if (table === 'pty_frames') ptyInserted.frames = result.inserted
+        }
+        const ptyAfter = assertPtyContextInventory(targetDb)
+        if (ptyAfter.main.sessions !== ptyBefore.main.sessions + ptyInserted.sessions
+          || ptyAfter.main.frames !== ptyBefore.main.frames + ptyInserted.frames) {
+          throw new Error('kernel data adoption PTY row-count reconciliation failed')
         }
         const now = new Date().toISOString()
         const grant = targetDb.prepare(`INSERT OR IGNORE INTO project_members
@@ -364,10 +415,11 @@ export function adoptLegacyKernelData(options: AdoptLegacyKernelDataOptions): Ke
           const result = grant.run(projectId, operatorPrincipal, now, now)
           membershipsAdded += Number(result.changes)
         }
-        // A PTY adapter process cannot survive a Kernel move. Preserve its
-        // frames/history but make the durable state truthful after adoption.
+        // A PTY adapter process and its in-memory lease token cannot survive
+        // a Kernel move. Preserve the current context row/frames but close
+        // the runtime through the existing lease-expiry vocabulary.
         const closePty = targetDb.prepare(`UPDATE pty_sessions SET state='closed', closed_at=COALESCE(closed_at, ?),
-          close_reason=COALESCE(close_reason, 'kernel_data_adopted_restart') WHERE pty_session_id=? AND state<>'closed'`)
+          close_reason=COALESCE(close_reason, 'lease_expired') WHERE pty_session_id=? AND state<>'closed'`)
         for (const row of targetDb.prepare('SELECT pty_session_id FROM legacy.pty_sessions').all() as Array<{ pty_session_id: string }>) {
           closePty.run(now, row.pty_session_id)
         }

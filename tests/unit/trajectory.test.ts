@@ -62,12 +62,12 @@ function insertRawEvent(
 describe('trajectory projection (kernel)', () => {
   it('projects redacted entries with monotonic seq, lanes and no raw payload', () => {
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })
+    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief(), creator_principal_id: 'trajectory-pi' })
     const pid = project.project_id
     kernel.createGate({ project_id: pid, type: 'scope', title: 'Scope gate' })
     kernel.submitJob({ project_id: pid, idempotency_key: 'k1', kind: 'echo' })
     kernel.registerArtifact({ project_id: pid, kind: 'log', content: 'x' })
-    kernel.linkSession('sess-1', pid)
+    kernel.linkSession('sess-1', pid, { principal_id: 'trajectory-pi', tenant_id: '', issuer: 'kernel' })
     kernel.recordUsage(pid, { api_requests: 3 })
     const page = kernel.projectTrajectory(pid)
     // project.created + gate.created + job.submitted + artifact.registered +
@@ -103,10 +103,10 @@ describe('trajectory projection (kernel)', () => {
 
   it('returns both lanes with their own cursors and lane filtering', () => {
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })
+    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief(), creator_principal_id: 'trajectory-pi' })
     const pid = project.project_id
     kernel.createGate({ project_id: pid, type: 'scope', title: 'G' })
-    kernel.linkSession('sess-2', pid)
+    kernel.linkSession('sess-2', pid, { principal_id: 'trajectory-pi', tenant_id: '', issuer: 'kernel' })
     const lanes = kernel.projectTrajectoryLanes(pid)
     expect(lanes.research.lane).toBe('research')
     expect(lanes.session.lane).toBe('session')

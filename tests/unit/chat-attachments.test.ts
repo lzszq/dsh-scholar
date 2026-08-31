@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { admitChatAttachmentFiles } from '../../packages/dsh-research-ui/src/client/chat-attachments'
+import { admitChatAttachmentFiles, hashChatAttachmentFile } from '../../packages/dsh-research-ui/src/client/chat-attachments'
 import { ChatUploadStore } from '../../packages/dsh-research-ui/src/client/chat-upload-store'
 import { ChatVisionTurnStore } from '../../packages/dsh-research-ui/src/client/chat-vision'
 
@@ -19,6 +19,17 @@ function imageFile(name: string, type = 'image/png') {
 }
 
 describe('Chat attachment admission', () => {
+  it('maps whole-file read failures to upload_hash_failed without preserving raw prose', async () => {
+    const file = {
+      name: 'broken.pdf', type: 'application/pdf', size: 1,
+      slice: () => ({ arrayBuffer: async () => { throw new Error('raw local path or browser prose') } }),
+    }
+
+    await expect(hashChatAttachmentFile(file)).rejects.toMatchObject({
+      failure: { code: 'upload_hash_failed' }, message: 'upload_hash_failed',
+    })
+  })
+
   it('stages visual context synchronously and without reading bytes or waiting for Intake I/O', () => {
     const uploads = new ChatUploadStore(null)
     const vision = new ChatVisionTurnStore()

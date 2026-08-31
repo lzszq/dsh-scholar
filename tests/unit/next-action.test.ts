@@ -2,7 +2,7 @@
  * GUIDE-01 — structured NextAction projection tests (design §4.2, §14).
  *
  * Covers: per-phase base actions, code stability, required-gap semantics,
- * legacy string[] derivation from v2 labels, unknown-state safe degradation,
+ * the structured single authority, unknown-state safe degradation,
  * pending-gate and budget-blocking overlay actions, failed-job retry/repair
  * overlay, and kernel-level projectProjection integration.
  */
@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  ResearchKernel, nextActionProjection, legacyNextActionStrings, INTAKE_ACTIVE_STATUSES,
+  ResearchKernel, nextActionProjection, INTAKE_ACTIVE_STATUSES,
   type NextActionContext, type NextActionIntake, type NextActionJob,
 } from '@dsh-scholar/research-kernel'
 import {
@@ -456,19 +456,6 @@ describe('GUIDE-01 NextAction projection (pure)', () => {
     expect(withEvidence.find(a => a.code === 'evidence_verify')?.state).toBe('done')
   })
 
-  it('legacy strings are stably derived from the v2 labels (non-done actions only)', () => {
-    for (const status of ProjectStatus.options) {
-      const actions = nextActionProjection(ctx({ status }))
-      const expected = actions.filter(a => a.state !== 'done').map(a => a.label)
-      expect(legacyNextActionStrings(actions)).toEqual(expected)
-    }
-    // Terminal states have no pending work → legacy list is empty (UI shows
-    // "no pending actions").
-    for (const status of ['ARCHIVED', 'RELEASED', 'STOPPED'] as const) {
-      expect(legacyNextActionStrings(nextActionProjection(ctx({ status })))).toEqual([])
-    }
-  })
-
   it('unknown/future status degrades safely: code=unknown, no throw, read-only', () => {
     const actions = nextActionProjection(ctx({ status: 'FUTURE_PHASE' as unknown as ResearchProject['status'] }))
     expect(actions).toHaveLength(1)
@@ -477,7 +464,6 @@ describe('GUIDE-01 NextAction projection (pure)', () => {
     expect(actions[0]?.required).toEqual(['state_mapping'])
     expect(actions[0]?.blocking).toBe(true)
     expect(actions[0]?.capability).toBeUndefined()
-    expect(legacyNextActionStrings(actions)).toEqual(['Unknown project state — inspect project'])
   })
 
   it('pending budget gate + exhausted budget → blocked budget_resolve; other pending gates → gate_decide', () => {
@@ -696,7 +682,7 @@ describe('GUIDE-01 kernel integration (projectProjection)', () => {
     }
   })
 
-  it('DRAFT projects project scope_gate_submit with derived legacy strings', () => {
+  it('DRAFT projects expose only structured scope_gate_submit', () => {
     const { kernel, dir } = freshKernel()
     try {
       const out = kernel.createProjectWithInitialGate({
@@ -711,10 +697,7 @@ describe('GUIDE-01 kernel integration (projectProjection)', () => {
       expect(projection.next_actions_v2[0]?.route).toBe('gates')
       // No duplicate gate_decide for the initial scope gate.
       expect(projection.next_actions_v2.filter(a => a.code === 'gate_decide')).toHaveLength(0)
-      // Legacy strings equal the labels of non-done structured actions.
-      const expectedLegacy = projection.next_actions_v2.filter(a => a.state !== 'done').map(a => a.label)
-      expect(projection.next_actions).toEqual(expectedLegacy)
-      expect(projection.next_actions).toContain('Complete Scope Gate')
+      expect(projection).not.toHaveProperty('next_actions')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -736,7 +719,7 @@ describe('GUIDE-01 kernel integration (projectProjection)', () => {
       expect(scoped.next_actions_v2[0]?.code).toBe('survey_run')
       expect(scoped.next_actions_v2[0]?.route).toBe('chat')
       expect(scoped.next_actions_v2[0]?.required_by).toBe('agent')
-      expect(scoped.next_actions).toEqual(['Run literature survey → corpus snapshot'])
+      expect(scoped).not.toHaveProperty('next_actions')
 
       // Exceed the budget → BLOCKED_GATE + pending Budget Gate.
       kernel.recordUsage(projectId, { model_cost_usd: 300 })
@@ -802,7 +785,6 @@ describe('GUIDE-01 kernel integration (projectProjection)', () => {
       expect(projection.next_actions_v2.find(a => a.code === 'intake_resume')).toBeDefined()
       expect(projection.next_actions_v2.find(a => a.code === 'intake_resume')?.refs)
         .toContainEqual({ kind: 'intake', id: session.intake_id })
-      expect(projection.next_actions.some(s => s.startsWith('Resume intake'))).toBe(true)
       // stage a file → uploading → intake_resume + intake_scan
       kernel.stageIntakeArtifact(session.intake_id, { file_name: 'paper.txt', content: 'hello world' })
       projection = kernel.projectProjection(projectId)
@@ -813,9 +795,7 @@ describe('GUIDE-01 kernel integration (projectProjection)', () => {
       projection = kernel.projectProjection(projectId)
       expect(projection.next_actions_v2.filter(a => a.code.startsWith('intake_')).map(a => a.code))
         .toEqual(['intake_resume', 'intake_answer'])
-      // legacy strings derive from the non-done structured actions
-      const expectedLegacy = projection.next_actions_v2.filter(a => a.state !== 'done').map(a => a.label)
-      expect(projection.next_actions).toEqual(expectedLegacy)
+      expect(projection).not.toHaveProperty('next_actions')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

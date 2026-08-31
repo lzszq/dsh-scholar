@@ -41,7 +41,6 @@ import {
   computeProfileConfigHash,
   getRunnerProfile,
   isTargetAvailable,
-  LOCAL_DOCKER_TARGET_ID,
   matchesTargetCapability,
   RemoteArtifactFinalizeRequest as RemoteArtifactFinalizeRequestSchema,
   RemoteArtifactStageRequest as RemoteArtifactStageRequestSchema,
@@ -60,7 +59,6 @@ import {
   type JobRecord,
   type PlanSigningKey,
   type RemoteAgentRegistration,
-  type RunnerProfile,
   type RemoteArtifactFinalizeRequest,
   type RemoteArtifactFinalizeResponse,
   type RemoteArtifactStageRequest,
@@ -263,7 +261,6 @@ export interface RemoteFleetServerOptions {
   /** finalize 内容上限（默认 32 MiB，与 UPLOAD-01 同一量级）。 */
   maxFinalizeBytes?: number
   /** 从 Job 解析绑定的 target_id；默认取 payload.target_id（缺省 local-docker）。 */
-  resolveTargetId?: (job: JobRecord & { run_id?: string | null }) => string
   /** 显式时钟（测试确定性）。 */
   now?: () => number
 }
@@ -290,7 +287,6 @@ export class RemoteFleetServer {
   private readonly maxOutstandingPerAgent: number
   private readonly maxStages: number
   private readonly maxFinalizeBytes: number
-  private readonly resolveTargetId: (job: JobRecord & { run_id?: string | null }) => string
   private readonly now: () => number
 
   /** 已 claim 但未分发的任务（FIFO）。 */
@@ -313,11 +309,6 @@ export class RemoteFleetServer {
     this.maxOutstandingPerAgent = options.maxOutstandingPerAgent ?? 8
     this.maxStages = options.maxStages ?? 64
     this.maxFinalizeBytes = options.maxFinalizeBytes ?? 32 * 1024 * 1024
-    this.resolveTargetId = options.resolveTargetId ?? (job => {
-      const payload = job.payload as Record<string, unknown> | undefined
-      if (typeof payload?.runner_target_id === 'string' && payload.runner_target_id !== '') return payload.runner_target_id
-      return typeof payload?.target_id === 'string' && payload.target_id !== '' ? payload.target_id : LOCAL_DOCKER_TARGET_ID
-    })
     this.now = options.now ?? (() => Date.now())
   }
 
@@ -429,16 +420,8 @@ export class RemoteFleetServer {
     const accepted: AgentClaim[] = []
     for (const claim of claims) {
       const plan = claim.plan
-      // Legacy pre-registry plans are preserved for wire compatibility. New
-      // kernel jobs always carry all three pins and use the authoritative API.
-      if (plan.target_revision === null && plan.target_config_hash === null && plan.target_kind === null) {
-        accepted.push(claim)
-        continue
-      }
       let reason: string | null = null
-      if (plan.target_revision === null || plan.target_config_hash === null || plan.target_kind === null) {
-        reason = `remote plan ${plan.plan_id} has an incomplete target pin`
-      } else if (this.client.getRunnerTarget === undefined) {
+      if (this.client.getRunnerTarget === undefined) {
         reason = `remote plan ${plan.plan_id} cannot revalidate target ${plan.target_id}`
       } else {
         try {
@@ -522,7 +505,7 @@ export class RemoteFleetServer {
     try {
       // A fleet server only leases remote targets. Local process/Docker jobs
       // stay available for the corresponding local runner loop; unpinned
-      // legacy jobs are deliberately excluded from remote dispatch.
+      // jobs are excluded from remote dispatch.
       jobs = await this.client.claimJobs(this.owner, room, this.leaseTtlSeconds, {
         runner_target_kinds: ['remote-ssh'],
         include_unpinned: false,
@@ -788,17 +771,31 @@ export class RemoteFleetServer {
   // ── 内部 ─────────────────────────────────────────────────────────────────
 
   private buildPlan(job: JobRecord & { run_id?: string | null }): ExecutionPlan {
-    const runId = job.run_id ?? `run_${randomUUID().replaceAll('-', '').slice(0, 12)}`
-    const targetId = this.resolveTargetId(job)
+    if (typeof job.run_id !== 'string' || job.run_id === '') {
+      throw new FleetServerError(422, 'run_id_missing', `job ${job.job_id} is missing the Kernel claim run_id`, false)
+    }
+    const runId = job.run_id
+    if (typeof job.lease_generation !== 'number' || job.lease_generation < 1
+      || typeof job.lease_token !== 'string' || job.lease_token === '') {
+      throw new FleetServerError(422, 'lease_fence_missing',
+        `job ${job.job_id} is missing its current lease generation/token`, false)
+    }
+    const leaseGeneration = job.lease_generation
+    const leaseToken = job.lease_token
     const payload = job.payload as Record<string, unknown> | undefined
-    const image = typeof payload?.image_digest === 'string' && payload.image_digest !== ''
-      ? payload.image_digest
-      : (job.kind === 'latex-compile' ? 'texlive/texlive:latest' : 'node:22-alpine')
+    const targetId = typeof payload?.runner_target_id === 'string' && payload.runner_target_id !== ''
+      ? payload.runner_target_id
+      : null
+    if (targetId === null) {
+      throw new FleetServerError(422, 'runner_target_pin_missing',
+        `job ${job.job_id} is missing runner_target_id`, false)
+    }
+    if (typeof payload?.image_digest !== 'string' || payload.image_digest === '') {
+      throw new FleetServerError(422, 'image_digest_missing', `job ${job.job_id} is missing its digest-pinned image`, false)
+    }
     // domain-model.md §9.1: secure jobs 固定 opaque profile id + config hash。
     // 服务端按注册表复算校验——未知 id / hash 不一致 → retryable 环境错误
-    // （任务留在 pending，绝不带病分发到远端 target）。legacy jobs 无 pin，
-    // plan 保持既有形状。
-    let resolvedProfile: RunnerProfile | null = null
+    // （任务留在 pending，绝不带病分发到远端 target）。
     const payloadProfileId = typeof payload?.runner_profile_id === 'string' && payload.runner_profile_id !== ''
       ? payload.runner_profile_id
       : null
@@ -816,21 +813,19 @@ export class RemoteFleetServer {
         throw new FleetServerError(409, 'profile_config_hash_mismatch',
           `job ${job.job_id} profile config hash mismatch: job pins ${pinnedHash ?? '(none)'}, registry computes ${computed} (domain-model.md §9.1)`, true)
       }
-      resolvedProfile = candidate
+    } else {
+      throw new FleetServerError(422, 'runner_profile_missing',
+        `job ${job.job_id} is missing its current runner profile pin`, false)
     }
     const plan = buildExecutionPlan(job, {
       run_id: runId,
       lease: {
         owner: this.owner,
-        generation: job.lease_generation ?? 0,
-        token: job.lease_token,
+        generation: leaseGeneration,
+        token: leaseToken,
         expires_at: job.lease_expires_at,
       },
-      image_digest: image,
       timeout_ms: this.timeoutMs,
-      target_id: targetId,
-      profile_id: resolvedProfile?.profile_id ?? targetId,
-      profile: resolvedProfile ?? undefined,
     })
     // plan 由 fleet 服务端固定并签名；未配置签名密钥时保持未签名（生产必须配置）。
     return this.signingKey !== undefined ? signExecutionPlan(plan, this.signingKey) : plan

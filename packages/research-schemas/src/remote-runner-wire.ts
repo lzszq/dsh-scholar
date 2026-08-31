@@ -105,10 +105,10 @@ export const AgentClaim = z.object({
   plan: ExecutionPlan,
   lease: z.object({
     owner: z.string().min(1),
-    generation: z.number().int().nonnegative(),
-    token: z.string().nullable().default(null),
-    expires_at: z.string().nullable().default(null),
-  }),
+    generation: z.number().int().positive(),
+    token: z.string().min(1),
+    expires_at: z.string().nullable(),
+  }).strict(),
   claimed_at: z.string(),
 }).strict()
 export type AgentClaim = z.infer<typeof AgentClaim>
@@ -136,7 +136,7 @@ export const RemoteFrame = z.object({
   byte_length: z.number().int().nonnegative().nullable().optional(),
   frame_kind: z.enum(['chunk', 'gap', 'exit']),
   payload_json: z.string().optional(),
-  lease_generation: z.number().int().nonnegative().optional(),
+  lease_generation: z.number().int().positive(),
 }).strict()
 export type RemoteFrame = z.infer<typeof RemoteFrame>
 
@@ -145,7 +145,7 @@ export const RemoteFramesRequest = z.object({
   schema_version: z.literal(REMOTE_WIRE_SCHEMA_VERSION),
   frames: z.array(RemoteFrame).min(1).max(256),
   owner: z.string().min(1),
-  lease_token: z.string().nullable().default(null),
+  lease_token: z.string().min(1),
   max_log_bytes: z.number().int().positive().optional(),
 }).strict()
 export type RemoteFramesRequest = z.infer<typeof RemoteFramesRequest>
@@ -223,9 +223,9 @@ export const RemoteCompleteRequest = z.object({
   run_manifest: z.record(z.unknown()),
   lease: z.object({
     owner: z.string().min(1),
-    generation: z.number().int().nonnegative(),
-    token: z.string().nullable().default(null),
-  }),
+    generation: z.number().int().positive(),
+    token: z.string().min(1),
+  }).strict(),
 }).strict()
 export type RemoteCompleteRequest = z.infer<typeof RemoteCompleteRequest>
 

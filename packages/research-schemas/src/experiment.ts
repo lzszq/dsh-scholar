@@ -128,10 +128,11 @@ export type FailureClass = z.infer<typeof FailureClass>
 /** Run manifest — generated and signed by the Runner; agents cannot edit (design §6.5). */
 export const RunManifest = z.object({
   run_id: z.string().min(1),
-  contract_id: z.string().min(1),
+  config_pin: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+  contract_id: z.string().min(1).nullable(),
   job_id: z.string().min(1),
-  project_id: z.string().optional(),
-  code_commit: z.string().min(1),
+  project_id: z.string().min(1),
+  code_commit: z.string(),
   container_digest: z.string().default(''),
   data_hash: z.string().default(''),
   command: z.array(z.string()).default([]),
@@ -148,8 +149,8 @@ export const RunManifest = z.object({
   log_artifact: z.string().optional(), // sha256:...
   checkpoint_artifact: z.string().optional(), // sha256:...
   signed_by: z.string().default('runner-gateway'),
-  /** §12.6: lease generation at run time; kernel fences stale generations. */
-  lease: z.object({ generation: z.number().int().nonnegative() }).optional(),
+  /** §12.6: only the lease generation is provenance; the plaintext token is never persisted. */
+  lease: z.object({ generation: z.number().int().positive() }).strict(),
   /** §12.7: Ed25519 envelope — runner_key_id + payload hash + signature. */
   runner_key_id: z.string().optional(),
   payload_sha256: z.string().optional(),

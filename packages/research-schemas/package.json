@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "DSH Research OS — authoritative JSON schemas: Project, State, Gate, Artifact, IdeaCard, ExperimentContract, RunManifest, Evidence, Claim, Decision.",
   "type": "module",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {

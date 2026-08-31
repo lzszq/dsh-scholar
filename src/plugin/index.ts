@@ -71,6 +71,7 @@ import {
   StageSubagentCoordinator,
   type StageSubagentConfig,
 } from './stage-subagents.js'
+import { StageSubagentLedger } from './stage-subagent-ledger.js'
 import {
   DEFAULT_STANDALONE_SHORTCUT,
   DEFAULT_STANDALONE_URL,
@@ -537,10 +538,12 @@ export async function apply(ctx: Context, config: ResearchPluginConfig = {}): Pr
   }
   const roles = new RoleRegistry()
   const projectScopes = new Map<string, string>()
+  const stageSubagentLedger = new StageSubagentLedger(join(sidecar.dataDir, 'subagents', 'panels.db'))
+  ctx.effect(() => () => stageSubagentLedger.close(), 'research-plugin.stage-subagent-ledger')
   const stageSubagents = new StageSubagentCoordinator({
     ...DEFAULT_STAGE_SUBAGENT_CONFIG,
     ...effectiveConfig.subagents,
-  })
+  }, stageSubagentLedger)
 
   const projectSummary = (project: {
     project_id: string; name: string; status: string; revision: number; brief_status?: string

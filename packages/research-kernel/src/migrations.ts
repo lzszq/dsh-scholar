@@ -12,7 +12,7 @@
 
 import { DatabaseSync } from 'node:sqlite'
 import { createHash, randomUUID } from 'node:crypto'
-import { PTY_DDL, PTY_SESSIONS_TABLE_DDL } from './pty-session.js'
+import { PTY_CURRENT_DDL, PTY_DDL, PTY_SESSIONS_TABLE_DDL } from './pty-session.js'
 import { WORKSPACE_DDL } from './workspace-store.js'
 import { INTAKE_DDL } from './intake.js'
 import { TRAJECTORY_DDL } from './trajectory.js'
@@ -24,10 +24,12 @@ import { ASSURANCE_DDL } from './assurance-store.js'
 import { METHODOLOGY_DDL, RESEARCH_RUN_OUTCOME_DDL } from './methodology-store.js'
 import { WRITING_REVIEW_DDL } from './writing-review-store.js'
 import { METHODOLOGY_ROLLOUT_DDL } from './rollout-policy.js'
+import { OCR_DDL } from './ocr-store.js'
+import { CONFIG_WRITE_DDL } from './config-write-store.js'
 import { ArtifactCas } from './cas.js'
 
 /** Code-side schema version; bumped only when the migration set grows. */
-export const SCHEMA_VERSION = 31
+export const SCHEMA_VERSION = 35
 
 export interface MigrationReport {
   /** Row counts per affected table (legacy import steps). */
@@ -834,6 +836,184 @@ const ptyAndWorkspaceTables = (db: DatabaseSync, report: MigrationReport): void 
 }
 
 /**
+ * STORE-06 current-only credential storage. Released migrations 0014 and
+ * 0036 retain their historical intermediate shapes/checksums; this append-only
+ * migration removes those shapes after validating every credential first.
+ */
+const removePlaintextLeaseStorage = (db: DatabaseSync, report: MigrationReport): void => {
+  const hasOwn = (value: object, key: string): boolean => Object.prototype.hasOwnProperty.call(value, key)
+  let jobsScrubbed = 0
+  let jobHashesBackfilled = 0
+  const jobRows = db.prepare("SELECT job_id, payload, lease_token_hash FROM jobs WHERE payload LIKE '%__lease_token%'")
+    .all() as unknown as Array<{ job_id: string; payload: string; lease_token_hash: string | null }>
+  const updateJob = db.prepare('UPDATE jobs SET payload = ?, lease_token_hash = ? WHERE job_id = ?')
+  for (const row of jobRows) {
+    const parsed = JSON.parse(row.payload) as unknown
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed) || !hasOwn(parsed, '__lease_token')) continue
+    const payload = parsed as Record<string, unknown>
+    const token = payload.__lease_token
+    if (typeof token !== 'string' || token.length === 0) {
+      throw new Error(`migration 0038: job ${row.job_id} has an invalid plaintext lease token`)
+    }
+    const expectedHash = sha256(token)
+    let storedHash = row.lease_token_hash
+    if (storedHash === null || storedHash === '') {
+      storedHash = expectedHash
+      jobHashesBackfilled += 1
+    } else if (!/^[0-9a-f]{64}$/.test(storedHash) || storedHash !== expectedHash) {
+      throw new Error(`migration 0038: job ${row.job_id} plaintext lease token conflicts with its hash`)
+    }
+    delete payload.__lease_token
+    updateJob.run(JSON.stringify(payload), storedHash, row.job_id)
+    jobsScrubbed += 1
+  }
+
+  const scrubManifest = (raw: string, tokenHash: string | null, label: string): { json: string; tokenHash: string; scrubbed: boolean } => {
+    const parsed = JSON.parse(raw) as unknown
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`migration 0038: ${label} is not a JSON object`)
+    }
+    const manifest = parsed as Record<string, unknown>
+    const lease = manifest.lease
+    if (typeof lease !== 'object' || lease === null || Array.isArray(lease) || !hasOwn(lease, 'token')) {
+      if (tokenHash === null || tokenHash === '' || !/^[0-9a-f]{64}$/.test(tokenHash)) {
+        return { json: raw, tokenHash: tokenHash ?? '', scrubbed: false }
+      }
+      return { json: raw, tokenHash, scrubbed: false }
+    }
+    const leaseRecord = lease as Record<string, unknown>
+    const token = leaseRecord.token
+    if (typeof token !== 'string' || token.length === 0) {
+      throw new Error(`migration 0038: ${label} has an invalid plaintext lease token`)
+    }
+    const expectedHash = sha256(token)
+    let storedHash = tokenHash
+    if (storedHash === null || storedHash === '') {
+      storedHash = expectedHash
+      jobHashesBackfilled += 1
+    } else if (!/^[0-9a-f]{64}$/.test(storedHash) || storedHash !== expectedHash) {
+      throw new Error(`migration 0038: ${label} plaintext lease token conflicts with its Job hash`)
+    }
+    delete leaseRecord.token
+    delete manifest.signature
+    delete manifest.runner_key_id
+    delete manifest.payload_sha256
+    return { json: JSON.stringify(manifest), tokenHash: storedHash, scrubbed: true }
+  }
+
+  let jobManifestsScrubbed = 0
+  const manifestJobs = db.prepare("SELECT job_id, run_manifest, lease_token_hash FROM jobs WHERE run_manifest LIKE '%\"token\"%'")
+    .all() as unknown as Array<{ job_id: string; run_manifest: string; lease_token_hash: string | null }>
+  const updateJobManifest = db.prepare("UPDATE jobs SET run_manifest = ?, lease_token_hash = ?, signature_status = 'credential_redacted' WHERE job_id = ?")
+  for (const row of manifestJobs) {
+    const scrubbed = scrubManifest(row.run_manifest, row.lease_token_hash, `job ${row.job_id} run_manifest`)
+    if (!scrubbed.scrubbed) continue
+    updateJobManifest.run(scrubbed.json, scrubbed.tokenHash, row.job_id)
+    jobManifestsScrubbed += 1
+  }
+
+  let runManifestsScrubbed = 0
+  const manifestRuns = db.prepare(`
+    SELECT runs.run_id, runs.job_id, runs.manifest_json, jobs.lease_token_hash
+    FROM runs JOIN jobs ON jobs.job_id = runs.job_id
+    WHERE runs.manifest_json LIKE '%"token"%'
+  `).all() as unknown as Array<{ run_id: string; job_id: string; manifest_json: string; lease_token_hash: string | null }>
+  const updateRunManifest = db.prepare("UPDATE runs SET manifest_json = ?, signature_status = 'credential_redacted' WHERE run_id = ?")
+  const markRunJobRedacted = db.prepare("UPDATE jobs SET lease_token_hash = ?, signature_status = 'credential_redacted' WHERE job_id = ?")
+  for (const row of manifestRuns) {
+    const scrubbed = scrubManifest(row.manifest_json, row.lease_token_hash, `run ${row.run_id} manifest_json`)
+    if (!scrubbed.scrubbed) continue
+    updateRunManifest.run(scrubbed.json, row.run_id)
+    markRunJobRedacted.run(scrubbed.tokenHash, row.job_id)
+    runManifestsScrubbed += 1
+  }
+
+  const ptyColumns = (db.prepare("PRAGMA table_info('pty_sessions')").all() as unknown as Array<{ name: string }>).map(column => column.name)
+  let ptyHashesBackfilled = 0
+  const ptyRows = (ptyColumns.includes('lease_token')
+    ? db.prepare('SELECT pty_session_id, lease_token, lease_token_hash FROM pty_sessions').all()
+    : db.prepare('SELECT pty_session_id, NULL AS lease_token, lease_token_hash FROM pty_sessions').all()) as unknown as Array<{
+      pty_session_id: string
+      lease_token: string | null
+      lease_token_hash: string
+    }>
+  const updatePtyHash = db.prepare('UPDATE pty_sessions SET lease_token_hash = ? WHERE pty_session_id = ?')
+  for (const row of ptyRows) {
+    let storedHash = row.lease_token_hash
+    if (row.lease_token !== null) {
+      if (row.lease_token.length === 0) {
+        throw new Error(`migration 0038: PTY ${row.pty_session_id} has an invalid plaintext lease token`)
+      }
+      const expectedHash = sha256(row.lease_token)
+      if (storedHash === '') {
+        storedHash = expectedHash
+        updatePtyHash.run(storedHash, row.pty_session_id)
+        ptyHashesBackfilled += 1
+      } else if (!/^[0-9a-f]{64}$/.test(storedHash) || storedHash !== expectedHash) {
+        throw new Error(`migration 0038: PTY ${row.pty_session_id} plaintext lease token conflicts with its hash`)
+      }
+    }
+    if (!/^[0-9a-f]{64}$/.test(storedHash)) {
+      throw new Error(`migration 0038: PTY ${row.pty_session_id} has no valid lease hash`)
+    }
+  }
+  const sessionsBefore = Number((db.prepare('SELECT COUNT(*) AS n FROM pty_sessions').get() as { n: number }).n)
+  const framesBefore = Number((db.prepare('SELECT COUNT(*) AS n FROM pty_frames').get() as { n: number }).n)
+  if (ptyColumns.includes('lease_token')) {
+    db.exec(`
+      DROP TABLE IF EXISTS pty_sessions_v0037;
+      ALTER TABLE pty_sessions RENAME TO pty_sessions_v0037;
+      DROP INDEX IF EXISTS idx_pty_sessions_project;
+      DROP INDEX IF EXISTS idx_pty_sessions_context;
+    `)
+    db.exec(PTY_CURRENT_DDL)
+    db.exec(`
+      INSERT INTO pty_sessions (
+        pty_session_id, project_id, workspace_id, principal_id, tenant_id,
+        context_kind, context_id, parent_session_id, label, purpose,
+        profile, target, preset, cwd, config_hash, state, generation,
+        lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes,
+        retained_from_seq, last_client_seq, last_event_seq, total_bytes,
+        dropped_bytes, adapter_id, open_at, last_activity_at, closed_at,
+        close_reason
+      )
+      SELECT
+        pty_session_id, project_id, workspace_id, principal_id, tenant_id,
+        context_kind, context_id, parent_session_id, label, purpose,
+        profile, target, preset, cwd, config_hash, state, generation,
+        lease_token_hash, lease_expires_at, idle_ttl_s, retention_bytes,
+        retained_from_seq, last_client_seq, last_event_seq, total_bytes,
+        dropped_bytes, adapter_id, open_at, last_activity_at, closed_at,
+        close_reason
+      FROM pty_sessions_v0037;
+      DROP TABLE pty_sessions_v0037;
+    `)
+  } else {
+    db.exec(PTY_CURRENT_DDL)
+  }
+  const sessionsAfter = Number((db.prepare('SELECT COUNT(*) AS n FROM pty_sessions').get() as { n: number }).n)
+  const framesAfter = Number((db.prepare('SELECT COUNT(*) AS n FROM pty_frames').get() as { n: number }).n)
+  if (sessionsAfter !== sessionsBefore || framesAfter !== framesBefore) {
+    throw new Error(`migration 0038: PTY preservation mismatch sessions ${sessionsBefore}/${sessionsAfter}, frames ${framesBefore}/${framesAfter}`)
+  }
+  const foreignKeyFailures = db.prepare('PRAGMA foreign_key_check').all()
+  if (foreignKeyFailures.length > 0) {
+    throw new Error(`migration 0038: foreign key check failed for ${foreignKeyFailures.length} row(s)`)
+  }
+  report.rows = {
+    ...(report.rows ?? {}),
+    jobs_scrubbed: jobsScrubbed,
+    job_manifests_scrubbed: jobManifestsScrubbed,
+    run_manifests_scrubbed: runManifestsScrubbed,
+    job_hashes_backfilled: jobHashesBackfilled,
+    pty_hashes_backfilled: ptyHashesBackfilled,
+    pty_sessions_preserved: sessionsAfter,
+    pty_frames_preserved: framesAfter,
+  }
+  report.notes = ['plaintext lease storage removed; current runtime uses hash-only fencing']
+}
+
+/**
  * 0012 — ONBOARD-01 (research-onboarding.md): Research Intake sessions.
  * Four isolated tables (sessions/artifacts/observations/questions) that the
  * pre-accept pipeline may write — business tables stay untouched until the
@@ -1391,6 +1571,58 @@ const canonicalizeProjectExecution = (db: DatabaseSync, report: MigrationReport)
 }
 
 /**
+ * 0036 — REVIEW-PTY-CONTEXT-03. Interactive PTYs are transient interface
+ * state, never formal research evidence. A context-less historical session
+ * cannot be authorized safely, so the upgrade does not infer a context from
+ * its project/workspace/owner/profile/target fields. Instead it atomically
+ * drops frames then sessions and recreates the current tables. Current,
+ * valid context-bound rows are left untouched.
+ */
+const ptyContextReset = (db: DatabaseSync, report: MigrationReport): void => {
+  const tableExists = (table: string): boolean => db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+  ).get(table) !== undefined
+  const rowCount = (table: string): number => tableExists(table)
+    ? Number((db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number }).n)
+    : 0
+
+  const sessionColumns = tableExists('pty_sessions')
+    ? (db.prepare("PRAGMA table_info('pty_sessions')").all() as unknown as Array<{ name: string }>).map(column => column.name)
+    : []
+  const requiredColumns = ['context_kind', 'context_id', 'parent_session_id', 'label', 'purpose']
+  let reset = sessionColumns.length > 0 && requiredColumns.some(column => !sessionColumns.includes(column))
+  if (!reset && sessionColumns.length > 0) {
+    const invalid = Number((db.prepare(`SELECT COUNT(*) AS n FROM pty_sessions
+      WHERE context_kind NOT IN ('research','chat','subagent')
+         OR context_id IS NULL OR length(context_id) < 1 OR length(context_id) > 256
+         OR substr(context_id, 1, 1) NOT GLOB '[A-Za-z0-9]'
+         OR context_id GLOB '*[^A-Za-z0-9._:@-]*'
+         OR (parent_session_id IS NOT NULL AND (
+              length(parent_session_id) < 1 OR length(parent_session_id) > 256
+              OR substr(parent_session_id, 1, 1) NOT GLOB '[A-Za-z0-9]'
+              OR parent_session_id GLOB '*[^A-Za-z0-9._:@-]*'))
+         OR label IS NULL OR length(trim(label)) < 1 OR length(trim(label)) > 96
+         OR purpose IS NULL OR length(trim(purpose)) > 512`).get() as { n: number }).n)
+    reset = invalid > 0
+  }
+
+  const discardedSessions = reset ? rowCount('pty_sessions') : 0
+  const discardedFrames = reset ? rowCount('pty_frames') : 0
+  if (reset) {
+    db.exec('DROP TABLE IF EXISTS pty_frames; DROP TABLE IF EXISTS pty_sessions;')
+  }
+  db.exec(PTY_DDL)
+  if (report.rows === undefined) report.rows = {}
+  report.rows.pty_sessions_discarded = discardedSessions
+  report.rows.pty_frames_discarded = discardedFrames
+  report.rows.pty_sessions = rowCount('pty_sessions')
+  report.rows.pty_frames = rowCount('pty_frames')
+  report.notes = reset
+    ? ['legacy transient PTY sessions and frames were discarded; no context was inferred']
+    : ['PTY context schema already current; existing context-bound sessions were preserved']
+}
+
+/**
  * Ordered migration registry. Never reorder or edit a released migration:
  * its checksum is recorded in schema_migrations and a mismatch is fatal.
  * New steps append at the end and bump SCHEMA_VERSION.
@@ -1595,6 +1827,30 @@ export const MIGRATIONS: Migration[] = [
     description: 'REVIEW-UPLOAD-02: durable Chat scope tombstones and ownership marker for session-close/upload races',
     body: uploadAbortOwnership.toString(),
     up: uploadAbortOwnership,
+  },
+  {
+    id: '0035_ocr_requests',
+    description: 'REVIEW-OCR-03: durable pinned OCR request lifecycle and observed-unverified normalized results',
+    body: OCR_DDL,
+    up: (db) => { db.exec(OCR_DDL) },
+  },
+  {
+    id: '0036_pty_context_reset',
+    description: 'REVIEW-PTY-CONTEXT-03: destructive reset of legacy context-less transient PTY sessions and frames',
+    body: `${ptyContextReset.toString()}\n\n${PTY_DDL}`,
+    up: ptyContextReset,
+  },
+  {
+    id: '0037_config_write_layers',
+    description: 'REVIEW-CONFIG-WRITE-03: durable revision-CAS global/project/runtime Settings layers and immutable revision ledger',
+    body: CONFIG_WRITE_DDL,
+    up: (db) => { db.exec(CONFIG_WRITE_DDL) },
+  },
+  {
+    id: '0038_remove_plaintext_lease_storage',
+    description: 'STORE-06: scrub legacy job lease plaintext and remove the obsolete PTY plaintext column',
+    body: `${removePlaintextLeaseStorage.toString()}\n\n${PTY_CURRENT_DDL}`,
+    up: removePlaintextLeaseStorage,
   },
 ]
 

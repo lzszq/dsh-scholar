@@ -160,8 +160,12 @@ UNK_ERR=$(jqfield "j.error?.code??''" < "$WORK/unk.json")
 BPORT=$((21900 + $$ % 400))
 BKPORT=$((BPORT + 1))
 BTOKEN="upload-test-token-$$"
+mkdir -p "$WORK/bff"
+chmod 700 "$WORK/bff"
+printf '%s' "$BTOKEN" > "$WORK/bff/standalone-token"
+chmod 600 "$WORK/bff/standalone-token"
 nohup node "$SERVER_BIN" --host 127.0.0.1 --port "$BPORT" --kernel-port "$BKPORT" \
-  --kernel-data-dir "$WORK/bff" --data-dir "$WORK/bff" --token "$BTOKEN" --principal alice > "$WORK/bff.log" 2>&1 &
+  --kernel-data-dir "$WORK/bff" --data-dir "$WORK/bff" --principal alice > "$WORK/bff.log" 2>&1 &
 BFF_PID=$!
 bff_ready=0
 for _ in $(seq 1 100); do

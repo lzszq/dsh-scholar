@@ -260,18 +260,18 @@ FLEET-01 行）。本地、Fleet 服务端、直接 Agent 与受控 SSH bootstra
 ### 9.1 Fleet 服务端（--fleet-server）
 
 ~~~bash
-node workers/runner-gateway/lib/bin/runner.js \
+DSH_SCHOLAR_SERVICE_TOKEN='<svc-token>' node workers/runner-gateway/lib/bin/runner.js \
   --fleet-server 7415 \
   --kernel http://127.0.0.1:7412 \
-  --service-token <svc-token> \
   --owner fleet-1 \
   --key-file /path/to/fleet-key.pem
 ~~~
 
 - 监听 `127.0.0.1:<port>`（`--fleet-server 0` = 临时端口，stderr 打印实际
   baseUrl）；生产部署须显式绑定可达接口并在反向代理/TLS 层终止 mTLS；
-- 鉴权：所有 `/v1/agents/*` 路由要求 `x-service-token`（配置 `--service-token`
-  后生效；与 kernel 内部路由同一机制，常数时间比较）。**生产必须替换为
+- 鉴权：所有 `/v1/agents/*` 路由要求 `x-service-token`（只能通过
+  `DSH_SCHOLAR_SERVICE_TOKEN` 环境或受控 0600 配置文件注入；与 kernel
+  内部路由同一机制，常数时间比较）。runner 拒绝 secret argv。**生产必须替换为
   mTLS service identity**（§3 生产差异）；
 - 注册表 = agent-registry（InMemoryAgentRegistry）；plan 签名密钥 =
   `--key-file` 或临时生成的 Ed25519 密钥，**公钥 PEM 打印到 stderr**，供
@@ -282,9 +282,8 @@ node workers/runner-gateway/lib/bin/runner.js \
 ### 9.2 Fleet 代理端（--agent）
 
 ~~~bash
-node workers/runner-gateway/lib/bin/runner.js \
+DSH_SCHOLAR_SERVICE_TOKEN='<svc-token>' node workers/runner-gateway/lib/bin/runner.js \
   --agent http://127.0.0.1:7415 \
-  --service-token <svc-token> \
   --target-id local-docker \
   --agent-id worker-1 \
   --fleet-public-key /path/to/fleet-public.pem \
@@ -304,7 +303,7 @@ node workers/runner-gateway/lib/bin/runner.js \
 
 ### 9.3 本地验收拓扑（无 mTLS 环境，x-service-token 等价实现）
 
-kernel + fleet 服务端 + agent 同机：以同一 `--service-token` 启动三者，
+kernel + fleet 服务端 + agent 同机：以同一受控 `DSH_SCHOLAR_SERVICE_TOKEN` 启动三者，
 fleet 服务端打印的公钥存文件后传给 agent `--fleet-public-key`；agent 显式
 `--kernel` 以注册 manifest 公钥。`tests/unit/fleet-bin.test.ts` 以真实
 node:http listener + HttpRemoteFleetTransport 覆盖该拓扑的全链

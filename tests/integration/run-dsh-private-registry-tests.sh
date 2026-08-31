@@ -16,10 +16,11 @@ fi
 
 REGISTRY_URL="${DSH_PRIVATE_REGISTRY_URL:-}"
 REGISTRY_TOKEN="${DSH_PRIVATE_REGISTRY_TOKEN:-${NPM_TOKEN:-}}"
-DSH_SPEC="${DSH_PRIVATE_DSH_SPEC:-@deepseek-ai/dsh@0.0.1}"
+DSH_SPEC="${DSH_PRIVATE_DSH_SPEC:-}"
 SCHOLAR_SPEC="${DSH_SCHOLAR_PLUGIN_SPEC:-}"
 PROFILE="${DSH_PRIVATE_PROFILE:-web}"
 BOOT_SECONDS="${DSH_PRIVATE_BOOT_SECONDS:-8}"
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 pending() {
   echo "NOT_RUN_MANUAL_PENDING dsh-private-registry-install: $1"
@@ -36,12 +37,22 @@ pending() {
   echo "FAIL dsh-private-registry-install: registry must be an https URL without userinfo" >&2
   exit 2
 }
+[[ "$SCHOLAR_SPEC" =~ ^@dsh-scholar/research-plugin@[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+  echo "FAIL dsh-private-registry-install: DSH_SCHOLAR_PLUGIN_SPEC must pin an exact @dsh-scholar/research-plugin version" >&2
+  exit 2
+}
+[[ -n "$DSH_SPEC" ]] || pending "DSH_PRIVATE_DSH_SPEC is not configured to the exact config/dsh-baseline.json version"
 [[ "$DSH_SPEC" =~ ^@deepseek-ai/dsh@[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
   echo "FAIL dsh-private-registry-install: DSH_PRIVATE_DSH_SPEC must pin an exact @deepseek-ai/dsh version" >&2
   exit 2
 }
-[[ "$SCHOLAR_SPEC" =~ ^@dsh-scholar/research-plugin@[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
-  echo "FAIL dsh-private-registry-install: DSH_SCHOLAR_PLUGIN_SPEC must pin an exact @dsh-scholar/research-plugin version" >&2
+BASELINE_VERSION="$(node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version; if (typeof value !== "string") process.exit(2); process.stdout.write(value)' "$REPO_ROOT/config/dsh-baseline.json")" || {
+  echo "FAIL dsh-private-registry-install: config/dsh-baseline.json has no valid version" >&2
+  exit 2
+}
+EXPECTED_DSH_SPEC="@deepseek-ai/dsh@$BASELINE_VERSION"
+[[ "$DSH_SPEC" == "$EXPECTED_DSH_SPEC" ]] || {
+  echo "FAIL dsh-private-registry-install: DSH_PRIVATE_DSH_SPEC must equal $EXPECTED_DSH_SPEC" >&2
   exit 2
 }
 [[ "$BOOT_SECONDS" =~ ^[0-9]+$ ]] || {

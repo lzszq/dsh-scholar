@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "DSH Research OS — controlled scholarly connectors: OpenAlex, Crossref, arXiv with caching, dedup and immutable query snapshots.",
   "type": "module",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {

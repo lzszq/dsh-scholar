@@ -8,7 +8,7 @@
  * calls cancelRun() so a cancel request terminates the REAL subprocess /
  * container, not just the lease. RunManifests are Ed25519-signed (§12.7);
  * the public key is registered with the kernel when it exposes
- * POST /v1/runner-keys (skipped with a warning otherwise).
+ * POST /v1/runner-keys before any claim or execution can begin.
  *
  * FLEET-01 (docs/remote-runner-wire.md §9 生产接线): the same binary also
  * serves the two fleet roles — `--fleet-server <port>` runs RemoteFleetServer
@@ -34,7 +34,7 @@
 
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { ResearchClient, KernelApiError } from '@dsh-scholar/research-client'
+import { ResearchClient } from '@dsh-scholar/research-client'
 import {
   cancelRun,
   createFleetServer,
@@ -52,6 +52,7 @@ import {
   type RunnerSigningKey,
 } from '../index.js'
 import { validateConfig, parseCli, generateCliHelp, ConfigRegistryError } from '@dsh-scholar/research-schemas'
+import { registerRunnerKeyRequired } from '../runner-key-registration.js'
 
 const argv = process.argv.slice(2)
 if (argv.includes('--help') || argv.includes('-h')) {
@@ -75,15 +76,12 @@ const heartbeatMs = (cli['runner.heartbeat_ms'] as number | undefined) ?? 15000
 const cancelPollMs = (cli['runner.cancel_poll_ms'] as number | undefined) ?? 5000
 const keyFile = cli['runner.key_file'] as string | undefined
 const owner = (cli['runner.owner'] as string | undefined) ?? `runner-${randomUUID().slice(0, 8)}`
-const serviceToken = (cli['runner.service_token'] as string | undefined) ?? process.env.DSH_SCHOLAR_SERVICE_TOKEN
-const runnerTargetToken = (cli['runner.target_token'] as string | undefined) ?? process.env.DSH_SCHOLAR_RUNNER_TARGET_TOKEN
+const serviceToken = process.env.DSH_SCHOLAR_SERVICE_TOKEN
+const runnerTargetToken = process.env.DSH_SCHOLAR_RUNNER_TARGET_TOKEN
 // §5 P0-1 (hardening API-01/SIDE-01): the runner's kernel bearer token.
-// Explicit --token wins; otherwise the process env is inherited — a runner
-// spawned by a sidecar-orchestrated host (plugin/BFF process tree) carries
-// DSH_SCHOLAR_KERNEL_TOKEN and authenticates to the kernel automatically.
-// A bare kernel (no token configured) simply skips the check, so a runner
-// without any token still works against a dev kernel.
-const token = (cli['runner.token'] as string | undefined) ?? process.env.DSH_SCHOLAR_KERNEL_TOKEN
+// The process env is inherited by a runner spawned from a controlled host;
+// credential values are deliberately absent from argv and generated help.
+const token = process.env.DSH_SCHOLAR_KERNEL_TOKEN
 
 // CONFIG-01: the runner's effective config is validated through the
 // canonical Config Registry before any claim cycle (unknown keys / invalid
@@ -171,7 +169,7 @@ async function runFleetServerMain(): Promise<void> {
  * → poll claims → 执行 → frames/artifacts/complete；离线有界 spool 复用
  * AgentOutboundSpool）。plan 验签公钥经 --fleet-public-key 配置（缺省 → 任何
  * plan 拒绝执行，fail closed）；run_manifest 签名密钥 = --key-file；显式提供
- * --kernel 时尽力把该公钥注册到对应 kernel（§12.7，非致命——失败仅告警）。
+ * --kernel 时必须先把该公钥注册到对应 kernel（§12.7，失败即停止）。
  */
 async function runFleetAgentMainCli(): Promise<void> {
   const fleetUrl = cli['runner.fleet_url'] as string
@@ -191,11 +189,10 @@ async function runFleetAgentMainCli(): Promise<void> {
   const targetId = resolveTargetId(cli['runner.fleet_target_id'] as string | undefined)
   const runnerVersion = packageVersion()
 
-  // 尽力把 agent 的 manifest 公钥注册到显式指定的 kernel（§12.7）：fleet
-  // 服务端原样转发 complete，kernel 按 runner_keys 验签——未注册 → 422
-  // manifest_key_unknown（fail closed，不静默降级）。非致命：注册失败只告警。
+  // An explicitly connected Kernel must accept the manifest key before this
+  // agent starts polling. There is no unsigned/compatibility execution path.
   if ('runner.kernel' in cli) {
-    await tryRegisterAgentKey(signingKey.keyId, publicKeyPem, 10_000)
+    await registerRunnerKeyOrExit(signingKey.keyId, publicKeyPem, 10_000)
   }
 
   console.error(`[runner-gateway] agent ${agentId} (target=${targetId}) polling ${parsedUrl.origin}${parsedUrl.pathname} (poll=${pollMs}ms, key=${signingKey.keyId}${fleetPublicKey === undefined ? ', NO fleet public key — plans will be refused (fail closed)' : ''})`)
@@ -237,7 +234,7 @@ async function runSshBootstrapMain(): Promise<void> {
   const { key: manifestKey, publicKeyPem } = loadOrCreateSigningKey(keyFile)
   // Register before SSH starts: a remote completion signed by this key is
   // immediately verifiable at the central kernel.
-  await registerRunnerKey(manifestKey.keyId, publicKeyPem, 30_000)
+  await registerRunnerKeyOrExit(manifestKey.keyId, publicKeyPem, 30_000)
   const privateKeyPem = manifestKey.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
   const handle = startSshAgentBootstrap({
     resolved,
@@ -265,26 +262,6 @@ if (fleetMode === 'agent') {
 }
 if (fleetMode === 'ssh-bootstrap') {
   await runSshBootstrapMain()
-}
-
-/** 尽力注册 agent manifest 公钥（非致命：超时仅告警，绝不 exit——agent 不
- * 依赖 kernel 在线才能轮询 fleet）。 */
-async function tryRegisterAgentKey(keyId: string, publicKeyPem: string, maxWaitMs: number): Promise<void> {
-  const deadline = Date.now() + maxWaitMs
-  while (Date.now() < deadline) {
-    try {
-      await client.registerRunnerKey({ key_id: keyId, public_key_pem: publicKeyPem })
-      console.error(`[runner-gateway] agent key ${keyId} registered with kernel ${endpoint}`)
-      return
-    } catch (error) {
-      if (error instanceof KernelApiError && error.status === 404) {
-        console.error(`[runner-gateway] warning: kernel has no /v1/runner-keys endpoint — key registration skipped (compat mode)`)
-        return
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000))
-    }
-  }
-  console.error(`[runner-gateway] warning: agent key ${keyId} not registered with kernel ${endpoint} after ${maxWaitMs}ms — signed-manifest completion may be rejected (register out-of-band via POST /v1/runner-keys)`)
 }
 
 /** runner_ver capability：从本包 package.json 读取（与发布版本一致）。 */
@@ -322,33 +299,15 @@ function loadOrCreateSigningKey(file: string | undefined): { key: RunnerSigningK
   return { key: { keyId, privateKey }, publicKeyPem }
 }
 
-/** Public-key registration (§12.7) with retry: the runner MUST NOT claim
- * jobs before its key is registered — an unregistered key makes every
- * signed-manifest completion fail at the kernel. The kernel is also
- * booting concurrently, so registration retries with backoff until it
- * succeeds; after `maxWaitMs` the runner exits non-zero (fail fast rather
- * than claim jobs that can never complete). A kernel WITHOUT the
- * /v1/runner-keys endpoint is treated as compat mode (unsigned manifests
- * accepted) and the runner proceeds. */
-async function registerRunnerKey(keyId: string, publicKeyPem: string, maxWaitMs = 60_000): Promise<void> {
-  const deadline = Date.now() + maxWaitMs
-  let firstError: string | undefined
-  while (Date.now() < deadline) {
-    try {
-      await client.registerRunnerKey({ key_id: keyId, public_key_pem: publicKeyPem })
-      console.error(`[runner-gateway] runner key ${keyId} registered with kernel`)
-      return
-    } catch (error) {
-      if (error instanceof KernelApiError && error.status === 404) {
-        console.error(`[runner-gateway] warning: kernel has no /v1/runner-keys endpoint — key registration skipped (compat mode)`)
-        return
-      }
-      firstError = (error as Error).message
-      await new Promise(resolve => setTimeout(resolve, 1000))
-    }
+/** Required public-key registration (§12.7). No compatibility mode exists. */
+async function registerRunnerKeyOrExit(keyId: string, publicKeyPem: string, maxWaitMs = 60_000): Promise<void> {
+  try {
+    await registerRunnerKeyRequired(client, { keyId, publicKeyPem, maxWaitMs })
+    console.error(`[runner-gateway] runner key ${keyId} registered with kernel`)
+  } catch (error) {
+    console.error(`[runner-gateway] FATAL: ${error instanceof Error ? error.message : 'runner manifest key registration failed'}`)
+    process.exit(1)
   }
-  console.error(`[runner-gateway] FATAL: runner key ${keyId} not registered after ${maxWaitMs}ms: ${firstError ?? 'unknown error'}`)
-  process.exit(1)
 }
 
 const { key: signingKey, publicKeyPem } = loadOrCreateSigningKey(keyFile)
@@ -372,9 +331,8 @@ async function heartbeatLocalTarget(): Promise<void> {
   nextTargetHeartbeatAt = Date.now() + Math.max(10_000, Math.min(heartbeatMs, 30_000))
 }
 
-// Register the public key once at startup (design §12.7; skipped when the
-// kernel does not expose the endpoint yet).
-await registerRunnerKey(signingKey.keyId, publicKeyPem)
+// Register the public key once at startup before the first claim.
+await registerRunnerKeyOrExit(signingKey.keyId, publicKeyPem)
 await heartbeatLocalTarget().catch(error => {
   console.error(`[runner-gateway] target heartbeat rejected for ${localTargetId}: ${(error as Error).message}`)
 })
@@ -425,9 +383,6 @@ while (!stopping) {
       try {
         const { job: completed } = await executeJob(job, {
           client, owner, mode, timeoutMs, signal: executeAc.signal, signingKey, targetId: localTargetId,
-          // §12.6 (P0): terminal frames must carry the claim's generation —
-          // the kernel rejects frames without it (409 lease_stale).
-          leaseGeneration: job.lease_generation,
         })
         console.error(`[runner-gateway] job ${job.job_id} → ${completed.status}`)
       } catch (error) {

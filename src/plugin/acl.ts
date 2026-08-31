@@ -81,12 +81,11 @@ export const RESEARCH_TOOLS = [
   'manuscript_review',
   'release_bundle_request',
   // ONBOARD-01 intake prepare surface (research-onboarding.md §2): agents
-  // may begin/stage/scan/answers/propose; NO adopt tool exists (Agent has no
-  // accept — adoption is the Human PI's, via the authenticated BFF/UI).
+  // may begin/stage/scan/propose; Human answers and adopt stay in the
+  // authenticated native question UI/BFF.
   'research_intake_begin',
   'research_intake_stage',
   'research_intake_scan',
-  'research_intake_answers',
   'research_intake_propose',
 ] as const
 
@@ -95,11 +94,11 @@ export const ROLE_TOOLS: Record<ResearchRole, readonly string[]> = {
   none: ['dsh_scholar', ...DSH_SESSION_METHODOLOGY_TOOLS],
   director: ['research_project', 'research_phase', 'research_gate_request', 'research_budget', 'research_status', 'research_panel', 'release_bundle_request', ...DSH_SESSION_METHODOLOGY_TOOLS],
   // ONBOARD-01 (research-onboarding.md §2): the researcher (scholar) role
-  // prepares intakes — begin/stage/scan/answers/propose. There is NO adopt
-  // tool: the Agent has no accept; adoption is the Human PI's, via the
+  // prepares intakes — begin/stage/scan/propose. There is no Human-answer or
+  // adopt tool: those actions belong to the Human PI via the
   // authenticated BFF/UI (researcher/viewer/auditor project members are
   // likewise 403 on the kernel's adopt route).
-  scholar: ['literature_search', 'paper_resolve', 'corpus_snapshot', 'passage_lookup', 'research_status', 'research_methodology_status', 'research_synthesis_record', 'research_intake_begin', 'research_intake_stage', 'research_intake_scan', 'research_intake_answers', 'research_intake_propose'],
+  scholar: ['literature_search', 'paper_resolve', 'corpus_snapshot', 'passage_lookup', 'research_status', 'research_methodology_status', 'research_synthesis_record', 'research_intake_begin', 'research_intake_stage', 'research_intake_scan', 'research_intake_propose'],
   curator: ['literature_search', 'paper_resolve', 'corpus_snapshot', 'passage_lookup', 'research_status'],
   'idea-panel': ['idea_create', 'idea_compare', 'novelty_audit', 'literature_search', 'research_status'],
   architect: ['experiment_register', 'research_status', 'research_methodology_status', 'research_protocol_record', 'experiment_status'],

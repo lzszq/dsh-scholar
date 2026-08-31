@@ -304,11 +304,10 @@ export interface GrillAnswerDraft {
   question_revision: number
 }
 
-/** Answers POST body: `principal` is replaced by the BFF with the
- *  session-derived operator principal (GOV-01) — the object presence keeps
- *  the fail-closed path when the BFF has no principal. */
+/** Answers POST body contains domain input only. The BFF supplies the
+ * authenticated Human identity through its trusted header seam. */
 export function intakeAnswersPayload(answers: GrillAnswerDraft[]): Record<string, unknown> {
-  return { principal: {}, answers }
+  return { answers }
 }
 
 /** Whether the proposal step is reachable (scan done + required answered). */
@@ -320,7 +319,6 @@ export function intakeProposeReady(p: IntakeProjectionLite | null | undefined): 
  *  project revision when known) so stale adopts 409 instead of overwriting. */
 export function intakeAdoptPayload(proposal: PhaseProposalLite | null | undefined, targetRevision?: number): Record<string, unknown> {
   const body: Record<string, unknown> = {
-    principal: {},
     expected_proposal_revision: typeof proposal?.revision === 'number' ? proposal.revision : 0,
   }
   if (targetRevision !== undefined && Number.isFinite(targetRevision)) body.expected_target_revision = targetRevision

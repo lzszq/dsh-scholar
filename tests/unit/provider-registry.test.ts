@@ -85,7 +85,7 @@ function nameOnlyProject(kernel: ResearchKernel): string {
 }
 
 describe('MODEL-01 provider CRUD + revision CAS', () => {
-  it('requires a durable PI/operator for HTTP Provider and project binding writes', async () => {
+  it('requires a durable PI/operator for the atomic HTTP MinerU Provider and project binding Settings write', async () => {
     const kernel = freshKernel(null, { hosts: ['mineru.net'] })
     const projectId = nameOnlyProject(kernel)
     const { server, url } = await startKernelServer({ kernel, port: 0 })
@@ -99,32 +99,30 @@ describe('MODEL-01 provider CRUD + revision CAS', () => {
       ],
     }
     try {
-      const secretValue = await fetch(`${url}/v1/providers`, {
+      const binding = { project_id: projectId, model_id: 'flash', expected_provider_revision: 1 }
+      const transaction = (input: unknown) => ({ operations: [{
+        kind: 'ocr-mineru', provider: { action: 'create', input }, binding,
+      }] })
+      const secretValue = await fetch(`${url}/v1/settings/transactions`, {
         method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'pi-1' },
-        body: JSON.stringify({ ...body, credential: { scheme: 'file', name: 'mineru-token', token: 'INLINE-SECRET' } }),
+        body: JSON.stringify(transaction({ ...body, credential: { scheme: 'file', name: 'mineru-token', token: 'INLINE-SECRET' } })),
       })
       expect(secretValue.status).toBe(422)
-      expect(await secretValue.json()).toMatchObject({ error: { code: 'secret_value_forbidden' } })
-      const anonymous = await fetch(`${url}/v1/providers`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      expect(await secretValue.json()).toMatchObject({ error: { code: 'validation_error' } })
+      const anonymous = await fetch(`${url}/v1/settings/transactions`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(transaction(body)),
       })
-      expect(anonymous.status).toBe(403)
-      const created = await fetch(`${url}/v1/providers`, {
-        method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'pi-1' }, body: JSON.stringify(body),
+      expect(anonymous.status).toBe(422)
+      const created = await fetch(`${url}/v1/settings/transactions`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'pi-1' }, body: JSON.stringify(transaction(body)),
       })
-      expect(created.status).toBe(201)
-      expect(await created.json()).not.toHaveProperty('credential')
-
-      const bindingBody = { purpose: 'ocr', provider_id: 'mineru', model_id: 'flash', expected_provider_revision: 1 }
-      const bindingAnonymous = await fetch(`${url}/v1/projects/${projectId}/model-binding`, {
-        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(bindingBody),
-      })
-      expect(bindingAnonymous.status).toBe(422)
-      const binding = await fetch(`${url}/v1/projects/${projectId}/model-binding`, {
-        method: 'PUT', headers: { 'content-type': 'application/json', 'x-principal-id': 'pi-1' }, body: JSON.stringify(bindingBody),
-      })
-      expect(binding.status).toBe(200)
-      expect(await binding.json()).toMatchObject({ provider_id: 'mineru', model_id: 'flash', updated_by: 'pi-1' })
+      expect(created.status).toBe(200)
+      const receipt = await created.json()
+      expect(receipt).toMatchObject({ operations: [{ resource: {
+        provider: { provider_id: 'mineru' },
+        binding: { provider_id: 'mineru', model_id: 'flash', updated_by: 'pi-1' },
+      } }] })
+      expect(receipt).not.toHaveProperty('credential')
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
       kernel.close()

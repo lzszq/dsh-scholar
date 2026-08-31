@@ -20,10 +20,10 @@ import {
   getLocale, localeParityReport, resetMissingKeyWarnings, setLocale, setMissingKeyReporter,
 } from '../../packages/dsh-research-ui/src/client/i18n/index'
 import {
-  SETTINGS_CONFIG_SCOPES, SETTINGS_SECTION_IDS, configPinChanged, mapSettingsServerErrors,
-  settingsConfigModel, settingsConfigPin, settingsConfigReload, settingsConfigSources,
+  SETTINGS_CONFIG_SCOPES, SETTINGS_SECTION_IDS, SettingsConfigInputError, configPinChanged, mapSettingsServerErrors,
+  settingsConfigModel, settingsConfigPin, settingsConfigTransaction,
   settingsConfigWrite, settingsFieldDisplay, settingsKey, settingsSectionsForData,
-  validateSettingsField,
+  settingsParseFieldValue, validateSettingsField,
 } from '../../packages/dsh-research-ui/src/client/settings-model'
 import type { SettingsConfigField, SettingsEffectiveWire, SettingsSchemaWire } from '../../packages/dsh-research-ui/src/client/settings-model'
 
@@ -56,7 +56,11 @@ function realModel(): { sections: ReturnType<typeof settingsConfigModel>; schema
     'kernel.require_signed_manifest': true,
   }, { scopes: ['global', 'project', 'kernel'] })
   const schema = generateJsonSchema() as unknown as SettingsSchemaWire
-  const effective: SettingsEffectiveWire = { config_pin: resolved.pinHash, config: resolved.redacted }
+  const effective: SettingsEffectiveWire = {
+    config_pin: resolved.pinHash,
+    config: resolved.redacted,
+    revisions: { global: 2, project: 4, runtime: { kernel: 7, 'runner-profile': 9, orchestrator: 0, standalone: 0 } },
+  }
   return { sections: settingsConfigModel(schema, effective), schema, effective }
 }
 
@@ -104,25 +108,18 @@ describe('CONFIG-01 dynamic Settings — schema/effective → field model', () =
     expect(digest.pattern).toContain('sha256')
   })
 
-  it('declared-sources mirror equals the REAL registry per-key sources (no drift)', () => {
+  it('reads sources/write scopes/apply verdict directly from the generated schema (no client mirror)', () => {
     const { sections } = realModel()
     for (const def of CONFIG_REGISTRY) {
-      expect(settingsConfigSources(def.key, def.scope)).toEqual([...def.sources], `sources mirror for ${def.key}`)
       const field = fieldByKey(sections, def.key)
       expect(field.sources).toEqual([...def.sources])
+      expect(field.writeScopes).toEqual([...def.write.allowedScopes])
+      expect(field.reload).toBe(def.write.apply)
     }
-  })
-
-  it('hot-reload inference: http/ui-reachable keys are hot, cli/env/file-only keys restart', () => {
-    for (const def of CONFIG_REGISTRY) {
-      const expected = def.sources.includes('http') || def.sources.includes('ui') ? 'hot' : 'restart'
-      expect(settingsConfigReload(def.sources)).toBe(expected)
-      expect(fieldByKey(realModel().sections, def.key).reload).toBe(expected)
-    }
-    // spot checks of the documented inference
-    expect(settingsConfigReload(['http', 'ui', 'file'])).toBe('hot')
-    expect(settingsConfigReload(['cli', 'env', 'file'])).toBe('restart')
-    expect(settingsConfigReload(['cli'])).toBe('restart')
+    expect(fieldByKey(sections, 'execution.network_policy')).toMatchObject({ writeScopes: ['project'], reload: 'hot' })
+    expect(fieldByKey(sections, 'kernel.port')).toMatchObject({ writeScopes: [], reload: 'restart' })
+    expect(fieldByKey(sections, 'kernel.require_signed_manifest')).toMatchObject({ writeScopes: ['runtime'], reload: 'restart' })
+    expect(fieldByKey(sections, 'standalone.no_token')).toMatchObject({ writeScopes: [], reload: 'restart' })
   })
 
   it('values come from the effective config; secrets are already redacted server-side', () => {
@@ -193,7 +190,6 @@ describe('CONFIG-01 dynamic Settings — schema/effective → field model', () =
       { key: 'shell.settings.valueNone' },
       { key: 'shell.settings.valueDefault', params: { value: '2000' } },
       { key: 'shell.settings.notInEffective' },
-      { key: 'shell.settings.readonlyNote' },
       { key: 'shell.settings.configPinChanged' },
       { key: 'shell.settings.error.invalid_number' },
       { key: 'shell.settings.error.not_integer' },
@@ -232,15 +228,58 @@ describe('CONFIG-01 dynamic Settings — schema/effective → field model', () =
 })
 
 describe('CONFIG-01 dynamic Settings — write mode, pin and section fallback', () => {
-  it('the write surface is read-only with the honest note (no PUT /v1/config in this revision)', () => {
+  it('the write surface targets the single atomic Settings transaction endpoint', () => {
     const write = settingsConfigWrite()
-    expect(write.available).toBe(false)
-    expect(write.endpoint).toBeUndefined()
+    expect(write.available).toBe(true)
+    expect(write.endpoint).toBe('/v1/settings/transactions')
     for (const locale of ['zh', 'en'] as const) {
       setLocale(locale)
       const note = settingsKey(write.noteKey)
       expect(note).not.toBe('')
       expect(note).not.toBe(write.noteKey)
+    }
+  })
+
+  it('groups only consumer-backed project/runtime edits with exact CAS revisions', () => {
+    const { sections, effective } = realModel()
+    const fields = sections.flatMap(section => section.fields)
+    const transaction = settingsConfigTransaction(fields, new Map([
+      ['execution.network_policy', 'none'],
+      ['kernel.require_signed_manifest', 'false'],
+    ]), effective, { projectId: 'rsp_config' })
+    expect(transaction).toEqual({ operations: [
+      {
+        kind: 'config', scope: 'project', scope_id: 'rsp_config', expected_revision: 4,
+        changes: { 'execution.network_policy': 'none' },
+      },
+      {
+        kind: 'config', scope: 'runtime', scope_id: 'kernel', expected_revision: 7,
+        changes: { 'kernel.require_signed_manifest': false },
+      },
+    ] })
+    expect(() => settingsConfigTransaction(fields, new Map([
+      ['standalone.no_token', 'true'],
+    ]), effective, { projectId: 'rsp_config' })).toThrow(/not writable/)
+  })
+
+  it('parses typed controls and requires strict SecretRef JSON for secret fields', () => {
+    const { sections, effective } = realModel()
+    expect(settingsParseFieldValue(fieldByKey(sections, 'kernel.port'), '7413')).toBe(7413)
+    expect(settingsParseFieldValue(fieldByKey(sections, 'execution.network_policy'), 'none')).toBe('none')
+    expect(settingsParseFieldValue(fieldByKey(sections, 'integrity.require_clean_room_rerun'), 'true')).toBe(true)
+    expect(settingsParseFieldValue(fieldByKey(sections, 'kernel.token'), '{"scheme":"file","name":"kernel/token"}')).toEqual({
+      scheme: 'file', name: 'kernel/token',
+    })
+    expect(() => settingsParseFieldValue(fieldByKey(sections, 'kernel.token'), 'plaintext-token')).toThrow(/SecretRef/)
+    expect(() => settingsParseFieldValue(fieldByKey(sections, 'kernel.token'), '{"scheme":"file","name":"x","value":"secret"}')).toThrow(/SecretRef/)
+    try {
+      settingsConfigTransaction(sections.flatMap(section => section.fields), new Map([
+        ['execution.network_policy', 'internet'],
+      ]), effective, { projectId: 'rsp_config' })
+      expect.fail('expected a field-addressable Settings error')
+    } catch (error) {
+      expect(error).toBeInstanceOf(SettingsConfigInputError)
+      expect(error).toMatchObject({ key: 'execution.network_policy', code: 'invalid_enum' })
     }
   })
 
@@ -270,31 +309,31 @@ describe('CONFIG-01 dynamic Settings — local validation (write-path machinery)
     {
       key: 'fixture.mode', labelKey: 'shell.settings.key.fixture.mode', scope: 'project', kind: 'enum',
       enumValues: ['a', 'b'], default: 'a', value: 'a', presentInEffective: true, secret: false,
-      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], reload: 'hot',
+      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], writeScopes: ['project'], reload: 'hot',
       description: '', minimum: undefined, maximum: undefined, minLength: undefined, pattern: undefined,
     },
     {
       key: 'fixture.ports', labelKey: 'shell.settings.key.fixture.ports', scope: 'project', kind: 'number',
       enumValues: [], default: 7412, value: 7412, presentInEffective: true, secret: false,
-      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], reload: 'hot',
+      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], writeScopes: ['project'], reload: 'hot',
       description: '', minimum: 0, maximum: 65535, minLength: undefined, pattern: undefined,
     },
     {
       key: 'fixture.flag', labelKey: 'shell.settings.key.fixture.flag', scope: 'project', kind: 'boolean',
       enumValues: [], default: false, value: false, presentInEffective: true, secret: false,
-      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], reload: 'hot',
+      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], writeScopes: ['project'], reload: 'hot',
       description: '', minimum: undefined, maximum: undefined, minLength: undefined, pattern: undefined,
     },
     {
       key: 'fixture.code', labelKey: 'shell.settings.key.fixture.code', scope: 'project', kind: 'string',
       enumValues: [], default: '', value: '', presentInEffective: true, secret: false,
-      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], reload: 'hot',
+      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], writeScopes: ['project'], reload: 'hot',
       description: '', minimum: undefined, maximum: undefined, minLength: 3, pattern: '^[a-z]+$',
     },
     {
       key: 'fixture.opaque', labelKey: 'shell.settings.key.fixture.opaque', scope: 'project', kind: 'unknown',
       enumValues: [], default: null, value: null, presentInEffective: true, secret: false,
-      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], reload: 'hot',
+      securityFloor: false, env: undefined, sources: ['http', 'ui', 'file'], writeScopes: ['project'], reload: 'hot',
       description: '', minimum: undefined, maximum: undefined, minLength: undefined, pattern: undefined,
     },
   ]
@@ -339,37 +378,36 @@ describe('CONFIG-01 dynamic Settings — local validation (write-path machinery)
 })
 
 describe('CONFIG-01 dynamic Settings — server error mapping (write-path machinery)', () => {
-  it('maps validation_error / unknown_config_key messages onto the named field', () => {
+  it('maps only authoritative structured envelope keys onto fields', () => {
     const { sections } = realModel()
     const fields = sections.flatMap(s => s.fields)
     const validation = mapSettingsServerErrors(fields, {
       code: 'validation_error',
-      message: 'invalid value for config key execution.network_policy: Invalid enum value. Expected \'allowlist\' | \'none\'',
+      key: 'execution.network_policy',
+      message: 'invalid network policy',
     })
     expect(validation.byKey.get('execution.network_policy')?.code).toBe('validation_error')
-    expect(validation.byKey.get('execution.network_policy')?.message).toContain('execution.network_policy')
     expect(validation.unmatched).toEqual([])
     const unknown = mapSettingsServerErrors(fields, {
       code: 'unknown_config_key',
-      message: 'unknown config key "kernel.port" (canonical registry: config-registry.ts)',
+      key: 'kernel.port',
+      message: 'unknown config key',
     })
     expect(unknown.byKey.get('kernel.port')?.code).toBe('unknown_config_key')
     expect(unknown.unmatched).toEqual([])
   })
 
-  it('security-floor violations map onto the rule key named at the message start', () => {
+  it('does not infer a field key from human-readable error text', () => {
     const { sections } = realModel()
     const fields = sections.flatMap(s => s.fields)
-    for (const message of [
-      'runner.privileged=true is forbidden: privileged containers break the execution security floor (security-baseline.md §5)',
-      'execution.network_policy=none forbids any container network other than none (runner.network must be none)',
-      'standalone.no_token requires an explicit loopback --host (127.0.0.1, ::1, or localhost)',
-    ]) {
-      const mapped = mapSettingsServerErrors(fields, { code: 'security_floor_violation', message })
-      expect(mapped.byKey.size).toBe(1)
-      expect(mapped.unmatched).toEqual([])
-      expect([...mapped.byKey.values()][0]?.code).toBe('security_floor_violation')
-    }
+    const mapped = mapSettingsServerErrors(fields, {
+      code: 'security_floor_violation',
+      message: 'runner.privileged=true is forbidden',
+    })
+    expect(mapped.byKey.size).toBe(0)
+    expect(mapped.unmatched).toEqual([{
+      key: '', code: 'security_floor_violation', message: 'runner.privileged=true is forbidden',
+    }])
   })
 
   it('envelopes naming no known field land in unmatched (never a fake field error)', () => {
@@ -377,7 +415,8 @@ describe('CONFIG-01 dynamic Settings — server error mapping (write-path machin
     const fields = sections.flatMap(s => s.fields)
     const unknownKey = mapSettingsServerErrors(fields, {
       code: 'unknown_config_key',
-      message: 'unknown config key "bogus.key" (canonical registry: config-registry.ts)',
+      key: 'bogus.key',
+      message: 'unknown config key',
     })
     expect(unknownKey.byKey.size).toBe(0)
     expect(unknownKey.unmatched).toHaveLength(1)
@@ -387,7 +426,7 @@ describe('CONFIG-01 dynamic Settings — server error mapping (write-path machin
     expect(http.unmatched).toHaveLength(1)
   })
 
-  it('a structured envelope.key (future surface) is honoured directly', () => {
+  it('a structured envelope.key is honoured directly', () => {
     const { sections } = realModel()
     const fields = sections.flatMap(s => s.fields)
     const mapped = mapSettingsServerErrors(fields, { code: 'validation_error', key: 'kernel.port', message: 'x' })

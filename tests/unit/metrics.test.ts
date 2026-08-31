@@ -261,15 +261,19 @@ describe('kernel key-path instrumentation (OBS-01)', () => {
 })
 
 describe('GET /internal/metrics endpoint (OBS-01)', () => {
-  it('serves a JSON snapshot over loopback without any token', async () => {
-    // serviceToken configured — the metrics surface must NOT require it
-    // (same public surface as /v1/health, reconstruction-contracts.md §18).
-    const kernel = freshKernel({ serviceToken: 'st_internal_secret' })
+  it('serves a JSON snapshot only with the configured service token and loopback peer', async () => {
+    const serviceToken = 'st_internal_secret'
+    const kernel = freshKernel({ serviceToken })
     const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })
     kernel.recordUsage(project.project_id, { model_cost_usd: 0.5 })
     const { server, port } = await startKernelServer({ kernel, port: 0 })
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/internal/metrics`)
+      const missing = await fetch(`http://127.0.0.1:${port}/internal/metrics`)
+      expect(missing.status).toBe(403)
+      expect((await missing.json() as { error: { code: string } }).error.code).toBe('service_token_required')
+      const response = await fetch(`http://127.0.0.1:${port}/internal/metrics`, {
+        headers: { 'x-service-token': serviceToken },
+      })
       expect(response.status).toBe(200)
       expect(response.headers.get('content-type')).toContain('application/json')
       const body = await response.json() as {
@@ -280,7 +284,9 @@ describe('GET /internal/metrics endpoint (OBS-01)', () => {
       expect(body.counters.some(c => c.key === 'budget.recorded' && c.value === 1)).toBe(true)
       // The request counter is recorded on response FINISH, so the first
       // snapshot cannot contain its own request — the second one can.
-      const second = await fetch(`http://127.0.0.1:${port}/internal/metrics`)
+      const second = await fetch(`http://127.0.0.1:${port}/internal/metrics`, {
+        headers: { 'x-service-token': serviceToken },
+      })
       expect(second.status).toBe(200)
       const body2 = await second.json() as { counters: Array<{ key: string; tags: Record<string, string>; value: number }> }
       expect(body2.counters.some(c => c.key === 'http.request' && c.tags.status === '200')).toBe(true)

@@ -171,7 +171,9 @@ describe('append-only methodology rollout policy', () => {
     const options = paths()
     const k = open(options)
     const project = createProject(k, 'Knowledge rollout')
-    k.linkSession('session-rollout', project.project_id)
+    k.linkSession('session-rollout', project.project_id, {
+      principal_id: 'pi', tenant_id: '', issuer: 'kernel',
+    })
     k.methodology.reconcileNativeKnowledgePacks()
     const policy = k.rollout.updatePolicy({ mode: 'opt-in-dev', expected_revision: 1, actor_ref: 'operator' })
     k.rollout.pinProject({

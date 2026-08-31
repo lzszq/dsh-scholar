@@ -248,7 +248,7 @@ describe('错误码映射 (intakeErrorText — 稳定错误码文案)', () => {
   })
 })
 
-describe('请求载荷 (principal 必带 — GOV-01 fail-closed)', () => {
+describe('请求载荷 (Human 身份仅由 BFF 可信 header 提供)', () => {
   it('begin payload: source_label 必填,target_phase 可空', () => {
     expect(intakeBeginPayload('uploaded-paper', 'experiment')).toEqual({ source_label: 'uploaded-paper', target_phase: 'experiment' })
     expect(intakeBeginPayload('uploaded-paper', null)).toEqual({ source_label: 'uploaded-paper' })
@@ -256,15 +256,15 @@ describe('请求载荷 (principal 必带 — GOV-01 fail-closed)', () => {
     expect(intakeBeginPayload('uploaded-paper', '')).toEqual({ source_label: 'uploaded-paper' })
   })
 
-  it('answers payload: 恒带 principal(BFF 替换为会话身份),答案含 revision', () => {
+  it('answers payload: 仅含答案与 revision', () => {
     const body = intakeAnswersPayload([{ question_code: 'seed', answer: '42', question_revision: 1 }])
-    expect(body.principal).toEqual({})
+    expect(body).not.toHaveProperty('principal')
     expect(body.answers).toEqual([{ question_code: 'seed', answer: '42', question_revision: 1 }])
   })
 
-  it('adopt payload: 恒带 principal + 钉定 proposal revision;可选 target revision;幂等键稳定', () => {
+  it('adopt payload: 仅钉定 proposal revision;可选 target revision;幂等键稳定', () => {
     const body = intakeAdoptPayload({ proposal_id: 'p', intake_id: 'i', revision: 3, observed_phase: 'experiment', safe_project_status: 'DRAFT', confidence: 0.5, created_at: NOW } as IntakeProjectionLite['proposal'], 7)
-    expect(body.principal).toEqual({})
+    expect(body).not.toHaveProperty('principal')
     expect(body.expected_proposal_revision).toBe(3)
     expect(body.expected_target_revision).toBe(7)
     // 无 proposal → 0(zod positive 会 422,向导仅在 awaiting_human 调用)

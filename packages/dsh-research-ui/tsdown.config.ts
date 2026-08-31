@@ -21,6 +21,7 @@ export default defineConfig({
     // emulator self-contained in client.js and let bundle verification reject
     // any accidental runtime dependency.
     alwaysBundle: [/^@xterm\//, /^@noble\/hashes/, /^@dsh-scholar\/research-schemas\/chat-agent$/, /^zod$/],
+    onlyBundle: [/^@xterm\//, /^@noble\/hashes/, /^zod$/],
   },
   plugins: [{
     name: 'dsh-scholar-xterm-css-inline',

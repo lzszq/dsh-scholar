@@ -10,7 +10,7 @@
  * Usage:
  *   node lib/standalone/server.js [--port 18610] [--kernel-port 7412]
  *     [--data-dir <dir>] [--kernel-data-dir <dir>]
- *     [--token <secret>] [--host 127.0.0.1]
+ *     [--host 127.0.0.1]
  *
  * On first start a token is generated and persisted under the data dir
  * (`standalone-token`); the browser asks for it once and keeps it
@@ -28,7 +28,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 import { UiKernelSidecar } from './sidecar.js'
-import { parseScholarModelId, validateConfig, parseCli, generateCliHelp, type CorpusSnapshot, type ExperimentContract, type NoveltyAudit, type ScholarAgentRequest } from '@dsh-scholar/research-schemas'
+import { SettingsWriteTransactionInput, parseScholarModelId, validateConfig, parseCli, generateCliHelp, type CorpusSnapshot, type ExperimentContract, type NoveltyAudit, type ScholarAgentRequest } from '@dsh-scholar/research-schemas'
 import { requestScholarAgent } from './chat-agent-client.js'
 import { executeStandaloneChatTurn } from './chat-turn-route.js'
 import { scholarModelUsability, type ScholarModelCatalogEntry } from '../shared/model-catalog.js'
@@ -71,6 +71,32 @@ export function surveySnapshotBody(result: SurveyConnectorResult): {
  * trigger it even though execution is initiated from Chat. */
 export function surveyWriteRoleAllowed(role: string | null): boolean {
   return role === 'pi' || role === 'operator' || role === 'researcher'
+}
+
+export interface SettingsWriteAuthorizationTargets {
+  requiresGlobalAdmin: boolean
+  projectIds: string[]
+}
+
+/** Parse the exact Settings transaction once at the standalone trust
+ * boundary and project the authorities it needs. The browser cannot hide a
+ * project-scoped binding inside an otherwise global OCR save. */
+export function settingsWriteAuthorizationTargets(raw: string): SettingsWriteAuthorizationTargets {
+  const input = SettingsWriteTransactionInput.parse(JSON.parse(raw) as unknown)
+  const projects = new Set<string>()
+  let requiresGlobalAdmin = false
+  for (const operation of input.operations) {
+    if (operation.kind === 'config') {
+      if (operation.scope === 'project') projects.add(operation.scope_id)
+      else requiresGlobalAdmin = true
+    } else if (operation.kind === 'ocr-mineru') {
+      requiresGlobalAdmin = true
+      if (operation.binding !== undefined) projects.add(operation.binding.project_id)
+    } else {
+      requiresGlobalAdmin = true
+    }
+  }
+  return { requiresGlobalAdmin, projectIds: [...projects].sort() }
 }
 
 interface IdeaAuditCandidate {
@@ -209,6 +235,13 @@ function isKernelPiOnlyForward(pathname: string): boolean {
   return KERNEL_PI_ONLY_FORWARD_ROUTES.some(re => re.test(pathname))
 }
 
+/** Intake Human mutations whose identity must come from the authenticated
+ * standalone operator session, never the JSON body. */
+function isIntakeHumanForward(method: string, pathname: string): boolean {
+  return method === 'POST'
+    && /^\/v1\/projects\/[^/]+\/intake\/[^/]+\/(?:answers|adopt|reject)$/.test(pathname)
+}
+
 /** The v1 SSE real-time stream routes (api-contracts.md §22) that sit under
  * a PATH project and demand the authenticated principal at the kernel
  * (requireProjectMember fail-closed): the BFF injects its server-derived
@@ -325,6 +358,28 @@ export function humanGateBffError(requestId: string, code: string, message: stri
   error: { code: string; message: string; request_id: string }
 } {
   return { error: { code, message, request_id: requestId } }
+}
+
+/** Normalize a Kernel rejection before it crosses the Human BFF. Known 4xx
+ * domain errors remain actionable; every 5xx message is fixed and generic so
+ * paths, SQL and credentials can never be reflected into the browser. */
+export function humanGateUpstreamError(requestId: string, status: number, payload: unknown): {
+  error: { code: string; message: string; request_id: string }
+} {
+  const envelope = payload !== null && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+  const error = envelope.error !== null && typeof envelope.error === 'object'
+    ? envelope.error as Record<string, unknown>
+    : {}
+  const candidate = error.code
+  const code = typeof candidate === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(candidate)
+    ? candidate
+    : status >= 500 ? 'kernel_error' : 'request_rejected'
+  const message = status >= 500
+    ? 'research request failed'
+    : typeof error.message === 'string' && error.message.length <= 500
+      ? error.message
+      : 'research request rejected'
+  return humanGateBffError(requestId, code, message)
 }
 
 /** Build the only Gate Decision body allowed to cross the Human BFF.
@@ -856,13 +911,7 @@ export function loadOptions(argv: string[]): StandaloneOptions {
     const tokenFile = join(dataDir, 'standalone-token')
     const tokenFileExists = existsSync(tokenFile)
     if (tokenFileExists) secureExistingTokenFile(tokenFile)
-    const explicitToken = values['standalone.token'] as string | undefined
-    if (explicitToken !== undefined && explicitToken !== '') {
-      token = explicitToken
-      mkdirSync(dataDir, { recursive: true })
-      writeFileSync(tokenFile, token, { mode: 0o600, flag: tokenFileExists ? 'w' : 'wx' })
-      chmodSync(tokenFile, 0o600)
-    } else if (tokenFileExists) {
+    if (tokenFileExists) {
       token = readFileSync(tokenFile, 'utf8').trim()
       if (token === '') throw new Error('standalone token file must not be empty')
     } else {
@@ -1107,18 +1156,17 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
       return typeof tree.document?.project_id === 'string' && tree.document.project_id !== '' ? tree.document.project_id : null
     }).catch(() => null)
   }
-  /** PTY session: /v1/pty/sessions/{id}* resolves via the kernel session
-   * read (project_id is pinned at open). The kernel demands the
-   * authenticated principal on the read (fail-closed) and hides foreign
-   * sessions (403) — both resolve to null here → 404, so a non-owner
-   * member never learns the session's project either. */
+  /** PTY session: /v1/pty/sessions/{id}* resolves via the kernel's
+   * authority-only HEAD route. The session GET is generation + lease fenced
+   * and is therefore not an ownership-discovery API. */
   async function ptySessionProjectId(sessionId: string): Promise<string | null> {
     return fetch(`${endpoint}/v1/pty/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'HEAD',
       headers: { accept: 'application/json', ...upstreamAuthHeaders, ...options.principal !== null ? { 'x-principal-id': options.principal } : {} },
-    }).then(async (r) => {
+    }).then((r) => {
       if (!r.ok) return null
-      const session = await r.json() as { project_id?: unknown }
-      return typeof session.project_id === 'string' && session.project_id !== '' ? session.project_id : null
+      const projectId = r.headers.get('x-project-id')
+      return projectId !== null && projectId !== '' ? projectId : null
     }).catch(() => null)
   }
   /** Global events: /v1/events requires an explicit ?project_id= (the
@@ -1132,6 +1180,15 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
   async function globalResourceProject(pathname: string, search: URLSearchParams, method: string): Promise<string | null> {
     const parts = pathname.split('/').filter(Boolean).map(decodeURIComponent)
     if (parts.length >= 1 && parts[0] === 'v1') {
+      if (method === 'GET' && parts[1] === 'config' && parts[2] === 'effective' && parts.length === 3) {
+        const projectId = search.get('project_id')
+        return projectId !== null && projectId !== '' ? projectId : null
+      }
+      if (method === 'GET' && parts[1] === 'config'
+        && (parts[2] === 'layers' || parts[2] === 'revisions')
+        && parts[3] === 'project' && parts[4] !== undefined && parts[4] !== '') {
+        return parts[4]
+      }
       if (parts[1] === 'events' && parts.length === 2) {
         return eventsProjectId(search)
       }
@@ -1364,18 +1421,7 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
           return
         }
         if (!upstream.ok) {
-          const envelope = payload !== null && typeof payload === 'object' ? payload as Record<string, unknown> : {}
-          const error = envelope.error !== null && typeof envelope.error === 'object'
-            ? envelope.error as Record<string, unknown>
-            : {}
-          const candidate = error.code
-          const code = typeof candidate === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(candidate)
-            ? candidate
-            : upstream.status >= 500 ? 'kernel_error' : 'request_rejected'
-          const message = typeof error.message === 'string' && error.message.length <= 500
-            ? error.message
-            : 'research request rejected'
-          sendJson(res, upstream.status, humanGateBffError(requestId, code, message))
+          sendJson(res, upstream.status, humanGateUpstreamError(requestId, upstream.status, payload))
           return
         }
         sendJson(res, upstream.status, payload)
@@ -2220,84 +2266,61 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
         if (options.principal !== null && method === 'POST' && /^\/v1\/projects\/[^/]+\/(?:jobs|baseline-runs)$/.test(url.pathname)) {
           proxyHeaders['x-principal-id'] = options.principal
         }
-        // Global runner target configuration is a PI/operator administration
-        // surface. Resolve the role from fresh authoritative memberships;
-        // never promote an arbitrary authenticated browser principal.
-        if (options.principal !== null && url.pathname.startsWith('/v1/runner-targets')) {
-          proxyHeaders['x-principal-id'] = options.principal
-          if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
-            const role = await globalConfigRole()
+        // REVIEW-CONFIG-WRITE-03: a single Settings transaction can combine
+        // global/runtime administration with one or more project-scoped
+        // config/binding operations. Parse it at the trusted BFF boundary,
+        // authorize every referenced project, and derive the global role
+        // independently. The kernel repeats these checks from durable state.
+        if (options.principal !== null && method === 'POST' && url.pathname === '/v1/settings/transactions') {
+          let targets: SettingsWriteAuthorizationTargets
+          try {
+            if (typeof body !== 'string') throw new TypeError('Settings transaction must be JSON')
+            targets = settingsWriteAuthorizationTargets(body)
+          } catch {
+            sendJson(res, 422, bffError('validation_error', 'invalid Settings transaction'))
+            return
+          }
+          let forwardedRole: 'pi' | 'operator' | null = null
+          for (const projectId of targets.projectIds) {
+            const role = await projectRole(projectId)
             if (role === null) {
-              sendJson(res, 403, bffError('role_forbidden', 'runner target configuration requires PI or operator role'))
+              sendJson(res, 404, bffError('project_not_found', 'project not found or access denied'))
               return
             }
-            proxyHeaders['x-principal-role'] = role
-          }
-        }
-        // OCR-CONFIG-01: Provider Registry writes are instance/global
-        // administration, matching runner-target configuration. The browser
-        // never supplies its own role; derive it from fresh memberships and
-        // forward only the server-owned principal metadata.
-        if (options.principal !== null && url.pathname.startsWith('/v1/providers')) {
-          proxyHeaders['x-principal-id'] = options.principal
-          if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
-            const role = await globalConfigRole()
-            if (role === null) {
-              sendJson(res, 403, bffError('role_forbidden', 'model provider configuration requires PI or operator role'))
-              return
-            }
-            proxyHeaders['x-principal-role'] = role
-          }
-        }
-        // Project OCR model binding is a PI/operator configuration write.
-        // Forward the durable browser principal so the Kernel can re-resolve
-        // current membership and record updated_by; never trust client headers.
-        if (options.principal !== null && /^\/v1\/projects\/[^/]+\/model-binding\/?$/.test(url.pathname)) {
-          proxyHeaders['x-principal-id'] = options.principal
-          if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
-            const role = memberProjectId === null ? null : await projectRole(memberProjectId)
             if (role !== 'pi' && role !== 'operator') {
-              sendJson(res, 403, bffError('role_forbidden', 'model binding configuration requires PI or operator role'))
+              sendJson(res, 403, bffError('role_forbidden', 'Settings writes require PI or operator role'))
               return
             }
-            proxyHeaders['x-principal-role'] = role
+            if (role === 'operator') forwardedRole = 'operator'
+            else if (forwardedRole === null) forwardedRole = 'pi'
           }
+          if (targets.requiresGlobalAdmin) {
+            const role = await globalConfigRole()
+            if (role === null) {
+              sendJson(res, 403, bffError('role_forbidden', 'global Settings writes require PI or operator role'))
+              return
+            }
+            forwardedRole = role
+          }
+          proxyHeaders['x-principal-id'] = options.principal
+          if (forwardedRole !== null) proxyHeaders['x-principal-role'] = forwardedRole
         }
-        // PTY-01 (execution-runtime.md §6.1, hardening §5 P0-2): the kernel
-        // demands the authenticated principal on EVERY pty operation — open,
-        // session read, control and frames (fail-closed: 422
-        // principal_required without it; 403 for a non-owner; control
-        // additionally demands the session lease). The BFF injects the
-        // loopback operator identity on ALL /v1/pty/sessions/* forwards
-        // (server-derived, never a client-supplied value) and passes the
-        // client's x-pty-lease through (the kernel validates it). At OPEN
-        // the BFF additionally resolves the body's project and enforces
-        // membership BEFORE forwarding (unknown/foreign project → 404, no
-        // session row, no tty spawned); viewer/auditor are read-only
-        // surfaces → 403 (same role policy as project-scoped v2 writes).
-        if (options.principal !== null && url.pathname.startsWith('/v1/pty/sessions')) {
-          if (method === 'POST' && url.pathname === '/v1/pty/sessions') {
-            let ptyProjectId: string | null = null
-            if (typeof body === 'string' && body !== '') {
-              try {
-                const parsed = JSON.parse(body) as { project_id?: unknown }
-                if (typeof parsed.project_id === 'string' && parsed.project_id !== '') ptyProjectId = parsed.project_id
-              } catch { /* invalid JSON → the kernel answers 422 validation_error */ }
-            }
-            if (ptyProjectId === null) {
-              sendJson(res, 422, bffError('project_required', 'project_id required'))
-              return
-            }
-            if (!(await isProjectMember(ptyProjectId))) {
-              sendJson(res, 404, { error: { code: 'project_not_found', message: 'project not found or access denied' } })
-              return
-            }
-            const ptyRole = await projectRole(ptyProjectId)
-            if (ptyRole === 'viewer' || ptyRole === 'auditor') {
-              sendJson(res, 403, bffError('role_forbidden', 'role forbidden'))
-              return
-            }
-          }
+        // Config effective/layer/revision reads are redacted, but a
+        // project-scoped view still requires current durable membership in
+        // the Kernel. The browser never supplies its own principal header.
+        if (options.principal !== null && url.pathname.startsWith('/v1/config/')) {
+          proxyHeaders['x-principal-id'] = options.principal
+        }
+        if (options.principal !== null
+          && method === 'GET'
+          && /^\/v1\/projects\/[^/]+\/model-binding$/.test(url.pathname)) {
+          proxyHeaders['x-principal-id'] = options.principal
+        }
+        // PTY-SESSION-02: the browser supplies only an opaque context_id.
+        // Project, membership, role, runner binding and parent authority are
+        // re-resolved by the Kernel. The BFF contributes only its trusted
+        // principal and never parses an obsolete project_id from the body.
+        if (options.principal !== null && url.pathname.startsWith('/v1/pty/')) {
           proxyHeaders['x-principal-id'] = options.principal
         }
         // API-01/PTY-01 (hardening §5 P0-2): POST /v1/artifacts is a
@@ -2356,12 +2379,22 @@ export async function startStandalone(options: StandaloneOptions): Promise<void>
         // injects its server-derived operator identity on these forwards;
         // the role header is a hint for the kernel's fast path, the kernel
         // membership lookup is the authority.
-        if (options.principal !== null && (method === 'POST' && isKernelPiOnlyForward(url.pathname) || isProjectDelete(method, url.pathname))) {
+        if (options.principal !== null && (
+          method === 'POST' && isKernelPiOnlyForward(url.pathname)
+          || isProjectDelete(method, url.pathname)
+          || isIntakeHumanForward(method, url.pathname)
+        )) {
           proxyHeaders['x-principal-id'] = options.principal
           if (memberProjectId !== null) {
             const role = await projectRole(memberProjectId)
             if (role !== null) proxyHeaders['x-principal-role'] = role
           }
+        }
+        // Intake answer/adopt/reject are Human-only BFF writes. The shared
+        // service token admits the service process; this fixed audience plus
+        // the durable principal/session headers proves the Human channel.
+        if (isIntakeHumanForward(method, url.pathname)) {
+          proxyHeaders['x-service-principal'] = 'standalone-human-bff'
         }
         // GOV-01 principal resolver: the authenticated operator session is a
         // DURABLE identity derived from the bearer token (session.json,

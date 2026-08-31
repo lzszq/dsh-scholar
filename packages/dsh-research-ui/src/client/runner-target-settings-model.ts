@@ -86,3 +86,35 @@ export function runnerTargetSecretRefPayload(
     ...(scope === '' ? {} : { scope }),
   }
 }
+
+export type RunnerTargetSettingsOperationInput =
+  | {
+      action: 'create'
+      input: {
+        target_id: string
+        display_name: string
+        kind: RunnerTargetKindLite
+        enabled?: boolean
+        draining?: boolean
+        capabilities?: string[]
+        service_identity: RunnerTargetSecretRefPayload
+        runtime?: RunnerTargetRuntimeLite
+        connection?: {
+          endpoint: RunnerTargetSecretRefPayload
+          credential: RunnerTargetSecretRefPayload
+          known_hosts: RunnerTargetSecretRefPayload
+        }
+      }
+    }
+  | {
+      action: 'update'
+      target_id: string
+      patch: Record<string, unknown> & { expected_revision: number }
+    }
+
+/** Wrap the dedicated target editor in the same transaction envelope used
+ * by generated config and OCR settings. */
+export function runnerTargetSettingsOperation(input: RunnerTargetSettingsOperationInput):
+  RunnerTargetSettingsOperationInput & { kind: 'runner-target' } {
+  return { kind: 'runner-target', ...input }
+}

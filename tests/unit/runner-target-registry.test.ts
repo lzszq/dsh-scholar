@@ -170,30 +170,27 @@ describe('EXEC-ENV-02 configurable runner targets', () => {
         name: 'target selection', workspace: '/w',
         brief: { problem: 'p', scope: 's', questions: [], primary_metrics: ['m'], resources: '', risks: [], target_outputs: ['paper'], target_venue: null, baseline_repo: null, domain: 'ml' },
       })
-      const configured = kernel.configureProjectRunnerTarget({
-        project_id: project.project_id,
-        runner_target_id: 'target_local_process_v1',
-        expected_revision: project.revision,
-      })
+      kernel.writeSettingsTransaction({ operations: [{
+        kind: 'config', scope: 'project', scope_id: project.project_id, expected_revision: 0,
+        changes: { 'execution.runner_target_id': 'target_local_process_v1' },
+      }] }, 'operator')
+      const configured = kernel.getProject(project.project_id)
       expect(configured.execution.runner_target_id).toBe('target_local_process_v1')
       expect(configured.execution.runner_profile_id).toBe('profile_isolated_subprocess_v1')
       expect(configured.revision).toBe(project.revision + 1)
-      expect(() => kernel.configureProjectRunnerTarget({
-        project_id: project.project_id,
-        runner_target_id: 'target_local_docker_v1',
-        expected_revision: project.revision,
-      })).toThrowError(KernelError)
-      expect(() => kernel.configureProjectRunnerTarget({
-        project_id: project.project_id,
-        runner_target_id: 'target_missing',
-        expected_revision: configured.revision,
-      })).toThrowError(KernelError)
+      expect(() => kernel.writeSettingsTransaction({ operations: [{
+        kind: 'config', scope: 'project', scope_id: project.project_id, expected_revision: 0,
+        changes: { 'execution.runner_target_id': 'target_local_docker_v1' },
+      }] }, 'operator')).toThrowError(KernelError)
+      expect(() => kernel.writeSettingsTransaction({ operations: [{
+        kind: 'config', scope: 'project', scope_id: project.project_id, expected_revision: 1,
+        changes: { 'execution.runner_target_id': 'target_missing' },
+      }] }, 'operator')).toThrowError(KernelError)
       kernel.updateRunnerTarget('target_local_docker_v1', { expected_revision: 1, enabled: false })
-      expect(() => kernel.configureProjectRunnerTarget({
-        project_id: project.project_id,
-        runner_target_id: 'target_local_docker_v1',
-        expected_revision: configured.revision,
-      })).toThrowError(KernelError)
+      expect(() => kernel.writeSettingsTransaction({ operations: [{
+        kind: 'config', scope: 'project', scope_id: project.project_id, expected_revision: 1,
+        changes: { 'execution.runner_target_id': 'target_local_docker_v1' },
+      }] }, 'operator')).toThrowError(KernelError)
       kernel.updateRunnerTarget('target_local_docker_v1', { expected_revision: 2, enabled: true })
 
       const projectDefault = kernel.submitJob({
@@ -296,7 +293,7 @@ describe('EXEC-ENV-02 configurable runner targets', () => {
     }
   })
 
-  it('exposes redacted CRUD over HTTP and restricts writes to PI/operator', async () => {
+  it('exposes redacted reads and routes target writes through the PI/operator Settings transaction', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-target-http-'))
     const kernel = new ConfiguredTestKernel({ dbPath: join(root, 'kernel.db'), casRoot: join(root, 'cas') })
     const project = kernel.createProject({
@@ -311,21 +308,24 @@ describe('EXEC-ENV-02 configurable runner targets', () => {
         target_id: 'http-local', display_name: 'HTTP local', kind: 'local-process',
         service_identity: { scheme: 'file', name: 'runner/http-local.token' },
       }
-      const denied = await fetch(`${url}/v1/runner-targets`, {
-        method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'outsider', 'x-principal-role': 'operator' }, body: JSON.stringify(body),
+      const createBody = { operations: [{ kind: 'runner-target', action: 'create', input: body }] }
+      const denied = await fetch(`${url}/v1/settings/transactions`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'outsider', 'x-principal-role': 'operator' }, body: JSON.stringify(createBody),
       })
       expect(denied.status).toBe(403)
-      const created = await fetch(`${url}/v1/runner-targets`, {
-        method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'op', 'x-principal-role': 'operator' }, body: JSON.stringify(body),
+      const created = await fetch(`${url}/v1/settings/transactions`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'op', 'x-principal-role': 'operator' }, body: JSON.stringify(createBody),
       })
-      expect(created.status).toBe(201)
-      expect(await created.json()).toMatchObject({ target_id: 'http-local', revision: 1, kind: 'local-process' })
-      const updated = await fetch(`${url}/v1/runner-targets/http-local`, {
-        method: 'PATCH', headers: { 'content-type': 'application/json', 'x-principal-id': 'pi', 'x-principal-role': 'pi' },
-        body: JSON.stringify({ expected_revision: 1, draining: true }),
+      expect(created.status).toBe(200)
+      expect(await created.json()).toMatchObject({ operations: [{ resource: { target_id: 'http-local', revision: 1, kind: 'local-process' } }] })
+      const updated = await fetch(`${url}/v1/settings/transactions`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-principal-id': 'pi', 'x-principal-role': 'pi' },
+        body: JSON.stringify({ operations: [{
+          kind: 'runner-target', action: 'update', target_id: 'http-local', patch: { expected_revision: 1, draining: true },
+        }] }),
       })
       expect(updated.status).toBe(200)
-      expect(await updated.json()).toMatchObject({ target_id: 'http-local', revision: 2, draining: true })
+      expect(await updated.json()).toMatchObject({ operations: [{ resource: { target_id: 'http-local', revision: 2, draining: true } }] })
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
       kernel.close()
@@ -333,7 +333,7 @@ describe('EXEC-ENV-02 configurable runner targets', () => {
     }
   })
 
-  it('exposes a PI/operator-only project target configuration route', async () => {
+  it('exposes a PI/operator-only project target Settings operation', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-project-target-http-'))
     const kernel = new ConfiguredTestKernel({ dbPath: join(root, 'kernel.db'), casRoot: join(root, 'cas') })
     const project = kernel.createProject({
@@ -344,21 +344,24 @@ describe('EXEC-ENV-02 configurable runner targets', () => {
     kernel.addProjectMember({ project_id: project.project_id, principal_id: 'researcher-1', role: 'researcher', actor: 'pi-1' })
     const { server, url } = await startKernelServer({ kernel, port: 0 })
     const patchTarget = (principal: string, role: string, expectedRevision: number): Promise<Response> => fetch(
-      `${url}/v2/projects/${project.project_id}/execution`, {
-        method: 'PATCH',
+      `${url}/v1/settings/transactions`, {
+        method: 'POST',
         headers: { 'content-type': 'application/json', 'x-principal-id': principal, 'x-principal-role': role },
-        body: JSON.stringify({ expected_revision: expectedRevision, runner_target_id: 'target_local_process_v1' }),
+        body: JSON.stringify({ operations: [{
+          kind: 'config', scope: 'project', scope_id: project.project_id, expected_revision: expectedRevision,
+          changes: { 'execution.runner_target_id': 'target_local_process_v1' },
+        }] }),
       },
     )
     try {
-      expect((await patchTarget('researcher-1', 'researcher', project.revision)).status).toBe(403)
-      const updated = await patchTarget('pi-1', 'pi', project.revision)
+      expect((await patchTarget('researcher-1', 'researcher', 0)).status).toBe(403)
+      const updated = await patchTarget('pi-1', 'pi', 0)
       expect(updated.status).toBe(200)
-      expect(await updated.json()).toMatchObject({
+      expect(kernel.getProject(project.project_id)).toMatchObject({
         revision: project.revision + 1,
         execution: { runner_target_id: 'target_local_process_v1', runner_profile_id: 'profile_isolated_subprocess_v1' },
       })
-      expect((await patchTarget('pi-1', 'pi', project.revision)).status).toBe(409)
+      expect((await patchTarget('pi-1', 'pi', 0)).status).toBe(409)
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
       kernel.close()

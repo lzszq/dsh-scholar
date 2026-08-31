@@ -18,8 +18,11 @@ import { createHash, generateKeyPairSync, sign as nodeSign } from 'node:crypto'
 import {
   buildExecutionPlan,
   canonicalPlanJson,
+  computeProfileConfigHash,
   ExecutionPlan,
   executionPlanFingerprint,
+  getRunnerProfile,
+  RunManifest,
   signExecutionPlan,
   verifyExecutionPlanSignature,
   type JobRecord,
@@ -35,6 +38,9 @@ import {
   type DockerExecContext,
   type RunOutcome,
 } from '@dsh-scholar/runner-gateway'
+
+const PROJECT_CONFIG_PIN = `sha256:${'9'.repeat(64)}`
+const CURRENT_PROFILE = getRunnerProfile('profile_local_docker_cpu_v1')!
 
 describe('runner target spawn-time fencing', () => {
   const payload = {
@@ -61,7 +67,7 @@ describe('runner target spawn-time fencing', () => {
 })
 
 function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
-  return {
+  const base: JobRecord = {
     job_id: 'job_test_1',
     project_id: 'prj_test_1',
     contract_id: 'expc_test_1',
@@ -69,6 +75,15 @@ function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
     kind: 'formal',
     command: ['python', 'run.py'],
     payload: {
+      project_config_pin: PROJECT_CONFIG_PIN,
+      runner_target_id: 'local-docker',
+      runner_target_kind: 'local-docker',
+      runner_target_revision: 1,
+      runner_target_hash: `sha256:${'8'.repeat(64)}`,
+      runner_profile_id: CURRENT_PROFILE.profile_id,
+      profile_config_hash: computeProfileConfigHash(CURRENT_PROFILE),
+      image_digest: CURRENT_PROFILE.image,
+      runner_compute: { mode: 'cpu' },
       seed: 11,
       output_contract: { metrics: 'metrics.json' },
       contract_metrics: ['macro_f1', 'accuracy'],
@@ -88,15 +103,14 @@ function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
     error: '',
     created_at: '2026-08-11T00:00:00.000Z',
     updated_at: '2026-08-11T00:00:00.000Z',
-    ...overrides,
   }
+  return { ...base, ...overrides, payload: { ...base.payload, ...(overrides.payload ?? {}) } }
 }
 
 function makePlan(overrides: Partial<ExecutionPlanType> = {}): ExecutionPlanType {
   return buildExecutionPlan(makeJob(), {
     run_id: 'run_1234567890ab',
     lease: { owner: 'runner-1', generation: 3, token: 'tok-123', expires_at: '2026-08-11T00:00:00.000Z' },
-    image_digest: 'node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32',
     timeout_ms: 60000,
     created_at: '2026-08-11T00:00:00.000Z',
     ...overrides,
@@ -123,10 +137,15 @@ describe('ExecutionPlan schema（research-schemas）', () => {
     expect(plan.job_id).toBe(job.job_id)
     expect(plan.run_id).toBe('run_1234567890ab')
     expect(plan.kind).toBe('formal')
+    expect(plan.config_pin).toBe(PROJECT_CONFIG_PIN)
     expect(plan.lease).toEqual({ owner: 'runner-1', generation: 3, token: 'tok-123', expires_at: '2026-08-11T00:00:00.000Z' })
-    expect(plan.profile_id).toBe('local-docker')
+    expect(plan.profile_id).toBe(CURRENT_PROFILE.profile_id)
+    expect(plan.profile_config_hash).toBe(CURRENT_PROFILE.config_hash)
     expect(plan.target_id).toBe('local-docker')
-    expect(plan.image.digest).toBe('node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32')
+    expect(plan.target_kind).toBe('local-docker')
+    expect(plan.target_revision).toBe(1)
+    expect(plan.target_config_hash).toBe(`sha256:${'8'.repeat(64)}`)
+    expect(plan.image.digest).toBe(CURRENT_PROFILE.image)
     expect(plan.snapshot.code_snapshot_id).toBeNull()
     expect(plan.artifact_refs.data_artifact_ids).toEqual(['sha256:abc'])
     expect(plan.limits).toEqual({ timeout_ms: 60000, memory_mb: 1024, cpus: 1, pids: 256, max_log_bytes: 32 * 1024 * 1024 })
@@ -144,10 +163,16 @@ describe('ExecutionPlan schema（research-schemas）', () => {
   })
 
   it('command override 进入 plan（TeX/smoke 的容器内脚本路径）', () => {
-    const plan = buildExecutionPlan(makeJob({ kind: 'latex-compile', payload: { tex_snapshot: { schema_version: 1 } } }), {
+    const plan = buildExecutionPlan(makeJob({ kind: 'latex-compile', payload: {
+      project_config_pin: PROJECT_CONFIG_PIN,
+      runner_target_id: 'local-docker',
+      runner_target_kind: 'local-docker',
+      runner_target_revision: 1,
+      runner_target_hash: `sha256:${'8'.repeat(64)}`,
+      tex_snapshot: { schema_version: 1 },
+    } }), {
       run_id: 'run_x',
-      lease: { owner: 'o', generation: 0, token: null, expires_at: null },
-      image_digest: 'texlive/texlive@sha256:8957c916b8160049f89c24d362a6d86c09d8a04095acde37e88404c4afed85b4',
+      lease: { owner: 'o', generation: 1, token: 'tok-command', expires_at: null },
       timeout_ms: 60000,
       command: ['sh', '/work/run.sh'],
       created_at: '2026-08-11T00:00:00.000Z',
@@ -159,6 +184,7 @@ describe('ExecutionPlan schema（research-schemas）', () => {
   it('将 target kind/revision/hash 的不可变 pin 带入 ExecutionPlan', () => {
     const plan = buildExecutionPlan(makeJob({
       payload: {
+        project_config_pin: PROJECT_CONFIG_PIN,
         runner_target_id: 'lab-gpu-1',
         runner_target_kind: 'remote-ssh',
         runner_target_revision: 7,
@@ -167,9 +193,7 @@ describe('ExecutionPlan schema（research-schemas）', () => {
     }), {
       run_id: 'run_target_pin',
       lease: { owner: 'fleet', generation: 1, token: 'tok', expires_at: null },
-      image_digest: 'node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32',
       timeout_ms: 60000,
-      target_id: 'lab-gpu-1',
     })
     expect(plan).toMatchObject({
       target_id: 'lab-gpu-1', target_kind: 'remote-ssh', target_revision: 7,
@@ -181,6 +205,46 @@ describe('ExecutionPlan schema（research-schemas）', () => {
     const plan = makePlan()
     const { run_id: _runId, ...missing } = plan
     expect(() => ExecutionPlan.parse(missing)).toThrow()
+    const { compute: _compute, ...withoutCompute } = plan
+    expect(() => ExecutionPlan.parse(withoutCompute)).toThrow()
+    const { profile_config_hash: _profileHash, ...withoutProfileHash } = plan
+    expect(() => ExecutionPlan.parse(withoutProfileHash)).toThrow()
+    expect(() => ExecutionPlan.parse({ ...plan, lease: { owner: plan.lease.owner, generation: plan.lease.generation, expires_at: null } })).toThrow()
+    const { memory_mb: _memory, ...partialLimits } = plan.limits
+    expect(() => ExecutionPlan.parse({ ...plan, limits: partialLimits })).toThrow()
+  })
+
+  it('缺失或非法 project_config_pin 时拒绝构建，调用方不能覆盖 Kernel pin', () => {
+    const withoutPin = makeJob()
+    delete withoutPin.payload.project_config_pin
+    expect(() => buildExecutionPlan(withoutPin, {
+      run_id: 'run_missing_pin',
+      lease: { owner: 'runner-1', generation: 3, token: 'tok-123', expires_at: null },
+      timeout_ms: 60000,
+    })).toThrow()
+
+    const invalidPin = makeJob({ payload: { project_config_pin: 'sha256:not-a-pin' } })
+    expect(() => buildExecutionPlan(invalidPin, {
+      run_id: 'run_invalid_pin',
+      lease: { owner: 'runner-1', generation: 3, token: 'tok-123', expires_at: null },
+      timeout_ms: 60000,
+    })).toThrow()
+
+    const attemptedOverride = makePlan({ config_pin: `sha256:${'f'.repeat(64)}` })
+    expect(attemptedOverride.config_pin).toBe(PROJECT_CONFIG_PIN)
+  })
+
+  it('缺失 target pin 时拒绝构建，调用方不能覆盖 Kernel target', () => {
+    const incomplete = makeJob()
+    delete incomplete.payload.runner_target_id
+    expect(() => buildExecutionPlan(incomplete, {
+      run_id: 'run_missing_target',
+      lease: { owner: 'runner-1', generation: 3, token: 'tok-123', expires_at: null },
+      timeout_ms: 60000,
+    })).toThrow()
+
+    const attemptedOverride = makePlan({ target_id: 'remote-caller-override' })
+    expect(attemptedOverride.target_id).toBe('local-docker')
   })
 
   it('.strict() 拒绝计划外字段（address/certificate/凭据不得进入 plan）', () => {
@@ -225,27 +289,18 @@ describe('ExecutionPlan schema（research-schemas）', () => {
     expect(unsigned.reason).toContain('not signed')
   })
 
-  it('验签兼容 compute 字段发布前签署的 schema_version=1 CPU plan', () => {
-    const key = generateKeyPairSync('ed25519')
-    const publicKeyPem = key.publicKey.export({ type: 'spki', format: 'pem' }).toString()
-    const { compute: _newField, ...legacy } = makePlan()
-    const unsigned = { ...legacy, payload_sha256: null, signature: null, signed_by: null }
-    const payloadSha256 = createHash('sha256').update(canonicalPlanJson(unsigned)).digest('hex')
-    const signed = { ...unsigned, payload_sha256: payloadSha256, signed_by: 'legacy-runner-key' }
-    const signature = nodeSign(null, Buffer.from(canonicalPlanJson(signed), 'utf8'), key.privateKey).toString('base64')
-    const parsed = ExecutionPlan.parse({ ...signed, signature })
-
-    expect(parsed.compute).toEqual({ mode: 'cpu' })
-    expect(verifyExecutionPlanSignature(parsed, publicKeyPem)).toEqual({ valid: true, reason: null })
-  })
-
-  it('runner_compute 缺失才默认 CPU，存在但 malformed 时 fail closed', () => {
+  it('runner_compute 缺失或 malformed 时都 fail closed', () => {
     expect(makePlan().compute).toEqual({ mode: 'cpu' })
+    const missing = makeJob({ payload: { runner_compute: undefined } })
+    expect(() => buildExecutionPlan(missing, {
+      run_id: 'run_missing_compute',
+      lease: { owner: 'runner-1', generation: 1, token: 'tok', expires_at: null },
+      timeout_ms: 1000,
+    })).toThrow()
     const malformed = makeJob({ payload: { runner_compute: { mode: 'nvidia', devices: '--privileged' } } })
     expect(() => buildExecutionPlan(malformed, {
       run_id: 'run_bad_compute',
       lease: { owner: 'runner-1', generation: 1, token: 'tok', expires_at: null },
-      image_digest: 'node@sha256:' + 'c'.repeat(64),
       timeout_ms: 1000,
     })).toThrow()
   })
@@ -266,6 +321,7 @@ describe('LocalDockerAdapter（ExecutionTarget port 本地实现）', () => {
     const received: Array<{ plan: ExecutionPlanType; exec: DockerExecContext }> = []
     const adapter = new LocalDockerAdapter({
       jobId: 'job_test_1',
+      targetId: 'local-docker',
       dockerRun: async (plan, exec) => {
         received.push({ plan, exec })
         return fakeOutcome(plan.run_id)
@@ -284,7 +340,7 @@ describe('LocalDockerAdapter（ExecutionTarget port 本地实现）', () => {
     expect(exec.jobId).toBe('job_test_1')
     expect(exec.cwd).toBe('/tmp/work')
     expect(exec.runEnv).toEqual({ DSH_RUN_ID: plan.run_id })
-    // dockerRun 收到的是 schema 校验过的 plan（含默认值归一化）
+    // dockerRun receives the exact schema-validated current plan.
     expect(gotPlan.limits.timeout_ms).toBe(60000)
     expect(gotPlan.image.digest).toBe(plan.image.digest)
   })
@@ -296,30 +352,32 @@ describe('LocalDockerAdapter（ExecutionTarget port 本地实现）', () => {
     })
     await expect(adapter.prepare(makePlan())).rejects.toThrow(/refuses plan pinned/)
     const wrongKind = buildExecutionPlan(makeJob({ payload: {
+      project_config_pin: PROJECT_CONFIG_PIN,
+      runner_target_id: 'target_local_docker_v1',
       runner_target_kind: 'remote-ssh', runner_target_revision: 1,
       runner_target_hash: `sha256:${'b'.repeat(64)}`,
     } }), {
-      run_id: 'run_wrong_kind', lease: { owner: 'o', generation: 1, token: null, expires_at: null },
-      image_digest: 'node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32',
-      timeout_ms: 60000, target_id: 'target_local_docker_v1',
+      run_id: 'run_wrong_kind', lease: { owner: 'o', generation: 1, token: 'tok-wrong-kind', expires_at: null },
+      timeout_ms: 60000,
     })
     await expect(adapter.prepare(wrongKind)).rejects.toThrow(/refuses remote-ssh/)
   })
 
   it('start() 未先 prepare() → ExecutionPlanMutationError', async () => {
-    const adapter = new LocalDockerAdapter({ jobId: 'j1', dockerRun: async () => fakeOutcome(), cancel: () => false })
+    const adapter = new LocalDockerAdapter({ jobId: 'j1', targetId: 'local-docker', dockerRun: async () => fakeOutcome(), cancel: () => false })
     await expect(adapter.start(makePlan())).rejects.toThrow(ExecutionPlanMutationError)
   })
 
   it('plan 在 prepare() 与 start() 之间被改写 → ExecutionPlanMutationError（plan 不可变断言）', async () => {
-    const adapter = new LocalDockerAdapter({ jobId: 'j1', dockerRun: async () => fakeOutcome(), cancel: () => false })
+    const adapter = new LocalDockerAdapter({ jobId: 'j1', targetId: 'local-docker', dockerRun: async () => fakeOutcome(), cancel: () => false })
     const original = makePlan()
     await adapter.prepare(original)
     // 构造内容改变的新 plan 对象（模拟改写）
-    const mutated = buildExecutionPlan(makeJob(), {
+    const mutated = buildExecutionPlan(makeJob({ payload: {
+      image_digest: 'node@sha256:2222222222222222222222222222222222222222222222222222222222222222',
+    } }), {
       run_id: original.run_id,
       lease: original.lease,
-      image_digest: 'node@sha256:2222222222222222222222222222222222222222222222222222222222222222',
       timeout_ms: original.limits.timeout_ms,
       created_at: original.created_at,
     })
@@ -333,6 +391,7 @@ describe('LocalDockerAdapter（ExecutionTarget port 本地实现）', () => {
     let resolveOutcome!: (r: RunOutcome) => void
     const adapter = new LocalDockerAdapter({
       jobId: 'job_cancel_1',
+      targetId: 'local-docker',
       dockerRun: () => new Promise<RunOutcome>(resolve => { resolveOutcome = resolve }),
       cancel: jobId => jobId === 'job_cancel_1',
     })
@@ -390,13 +449,17 @@ describe('LocalDockerAdapter（ExecutionTarget port 本地实现）', () => {
     })
     expect(cpuArgs).not.toContain('--gpus')
 
-    const allPlan = makePlan({ compute: { mode: 'nvidia', devices: 'all' } })
+    const allPlan = buildExecutionPlan(makeJob({ payload: { runner_compute: { mode: 'nvidia', devices: 'all' } } }), {
+      run_id: 'run_gpu_all', lease: { owner: 'runner-1', generation: 3, token: 'tok-123', expires_at: null }, timeout_ms: 60000,
+    })
     const allArgs = buildLocalDockerArgs({
       plan: allPlan, cwd: '/tmp/work', containerName: 'gpu-all', env: {}, command: ['true'],
     })
     expect(allArgs.slice(allArgs.indexOf('--gpus'), allArgs.indexOf('--gpus') + 2)).toEqual(['--gpus', 'all'])
 
-    const selectedPlan = makePlan({ compute: { mode: 'nvidia', devices: ['0', '2'] } })
+    const selectedPlan = buildExecutionPlan(makeJob({ payload: { runner_compute: { mode: 'nvidia', devices: ['0', '2'] } } }), {
+      run_id: 'run_gpu_selected', lease: { owner: 'runner-1', generation: 3, token: 'tok-123', expires_at: null }, timeout_ms: 60000,
+    })
     const selectedArgs = buildLocalDockerArgs({
       plan: selectedPlan, cwd: '/tmp/work', containerName: 'gpu-selected', env: {}, command: ['true'],
     })
@@ -408,15 +471,23 @@ describe('LocalDockerAdapter（ExecutionTarget port 本地实现）', () => {
 describe('signed manifest compute provenance', () => {
   const base = {
     run_id: 'run_manifest', project_id: 'prj_manifest', contract_id: null, job_id: 'job_manifest',
+    config_pin: PROJECT_CONFIG_PIN,
     command: ['true'], code_commit: '', code_snapshot_id: null,
     container_digest: 'docker:node@sha256:' + 'c'.repeat(64), data_hash: '', seed: null,
     started_at: '2026-08-15T00:00:00.000Z', finished_at: '2026-08-15T00:00:01.000Z', exit_code: 0,
   }
 
-  it('preserves the legacy CPU shape and records selected NVIDIA devices', () => {
+  it('records the exact config pin and selected compute resources', () => {
+    expect(buildRunManifest({ ...base, compute: { mode: 'cpu' } }).config_pin).toBe(PROJECT_CONFIG_PIN)
     expect(buildRunManifest({ ...base, compute: { mode: 'cpu' } }).resources)
       .toEqual({ gpu: 0, cpu: 1, memory_gb: 1 })
     expect(buildRunManifest({ ...base, compute: { mode: 'nvidia', devices: ['0', '2'] } }).resources)
       .toEqual({ gpu: 2, gpu_mode: 'nvidia', gpu_devices: ['0', '2'], cpu: 1, memory_gb: 1 })
+  })
+
+  it('accepts only lease generation and rejects a plaintext lease token', () => {
+    const manifest = { ...buildRunManifest({ ...base, compute: { mode: 'cpu' } }), contract_id: 'expc_manifest', code_commit: 'commit_manifest' }
+    expect(RunManifest.parse({ ...manifest, lease: { generation: 3 } }).lease).toEqual({ generation: 3 })
+    expect(() => RunManifest.parse({ ...manifest, lease: { generation: 3, token: 'lt_secret' } })).toThrow()
   })
 })

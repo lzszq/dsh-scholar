@@ -4,10 +4,10 @@
  * init-resume-intake-grill; hardening-v0.2-status.md §3 ONBOARD-01).
  *
  * Covers the plugin-side prepare pipeline exposed to agents:
- *   research_intake_begin / stage / scan / answers / propose
- * and the authoritative boundary that there is NO adopt tool — the Agent has
- * no accept (research-onboarding.md §2.1: only the Human PI, via the
- * authenticated BFF/UI, may adopt an intake). Also covers the ACL (unknown
+ *   research_intake_begin / stage / scan / propose
+ * and the authoritative boundary that there is NO Human answer or adopt
+ * tool — only the Human PI, via the authenticated BFF/UI, may answer/adopt.
+ * Also covers the ACL (unknown
  * agent role=none deny on every intake write tool; the researcher/scholar
  * role allowed), and the stable error-code copy mapping (same machine codes
  * as the kernel, stable agent-facing text).
@@ -28,7 +28,6 @@ const INTAKE_TOOL_NAMES = [
   'research_intake_begin',
   'research_intake_stage',
   'research_intake_scan',
-  'research_intake_answers',
   'research_intake_propose',
 ] as const
 
@@ -103,7 +102,7 @@ function requiredAnswers(questions: Array<{ question_code: string; required: boo
 }
 
 describe('ONBOARD-01 agent tool registration (research-onboarding.md §2)', () => {
-  it('registers the five prepare tools and NO adopt tool', () => {
+  it('registers four prepare tools and no Human answer/adopt tool', () => {
     const client = { getProjectBySession: async () => null } as unknown as ResearchClient
     const registered = registerTools(client, new RoleRegistry())
     const names = registered.map(t => t.name)
@@ -114,7 +113,9 @@ describe('ONBOARD-01 agent tool registration (research-onboarding.md §2)', () =
     // The authoritative boundary: no accept/adopt tool exists anywhere.
     expect(names).not.toContain('research_intake_adopt')
     expect(names).not.toContain('research_intake_accept')
+    expect(names).not.toContain('research_intake_answers')
     expect(RESEARCH_TOOLS).not.toContain('research_intake_adopt')
+    expect(RESEARCH_TOOLS).not.toContain('research_intake_answers')
     expect(names.some(n => /intake.*(adopt|accept)/.test(n))).toBe(false)
   })
 
@@ -149,7 +150,7 @@ describe('ONBOARD-01 agent tool registration (research-onboarding.md §2)', () =
 describe('ONBOARD-01 intake tool ACL (unknown=none deny, researcher allowed)', () => {
   it('denies every intake tool to unknown/unregistered agents (role none)', async () => {
     const roles = new RoleRegistry()
-    // The 5 intake tools are write tools: role=none must be denied on each.
+    // The four intake tools are write tools: role=none must be denied on each.
     for (const name of INTAKE_TOOL_NAMES) {
       expect(roles.allows(DEFAULT_ROLE, name), `${name} denied for none`).toBe(false)
     }
@@ -159,7 +160,7 @@ describe('ONBOARD-01 intake tool ACL (unknown=none deny, researcher allowed)', (
     }
   })
 
-  it('allows the researcher (scholar) role on begin/scan/answers/propose (no adopt to grant)', async () => {
+  it('allows the researcher (scholar) role on begin/stage/scan/propose only', async () => {
     const roles = new RoleRegistry()
     roles.set('researcher-session', 'scholar')
     for (const name of INTAKE_TOOL_NAMES) {
@@ -170,6 +171,7 @@ describe('ONBOARD-01 intake tool ACL (unknown=none deny, researcher allowed)', (
     // No role has an adopt tool surface (nothing to allow, nothing to deny).
     for (const role of Object.keys(ROLE_TOOLS) as ResearchRole[]) {
       expect(ROLE_TOOLS[role]).not.toContain('research_intake_adopt')
+      expect(ROLE_TOOLS[role]).not.toContain('research_intake_answers')
     }
   })
 
@@ -186,9 +188,15 @@ describe('ONBOARD-01 intake tool ACL (unknown=none deny, researcher allowed)', (
 })
 
 describe('ONBOARD-01 intake tools end-to-end (real kernel + ResearchClient)', () => {
-  it('begin (idempotent) → stage (base64) → scan → answers → propose; no adopt tool', async () => {
+  it('begin (idempotent) → stage → scan → trusted Human answer → agent propose; no Human tool', async () => {
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief(), session_id: 'researcher-session' })
+    const project = kernel.createProject({
+      name: 't',
+      workspace: '/w',
+      brief: makeBrief(),
+      session_id: 'researcher-session',
+      creator_principal_id: 'researcher-session',
+    })
     await withServer(kernel, async (base) => {
       const client = new ResearchClient({ endpoint: base })
       const roles = new RoleRegistry()
@@ -230,13 +238,14 @@ describe('ONBOARD-01 intake tools end-to-end (real kernel + ResearchClient)', ()
       expect(scanned.artifacts[0].quarantine).toBe('clean')
       expect(Array.isArray(scanned.questions)).toBe(true)
 
-      // answers: required Grill Me answers (revision from the projection).
-      const answered = await exec('research_intake_answers', {
-        intake_id: b1.intake.intake_id,
-        answers_json: JSON.stringify(requiredAnswers(scanned.questions)),
-      })
-      expect(answered.ok).toBe(true)
-      expect(answered.status).toBe('proposal_ready')
+      expect(registered.some(t => t.name === 'research_intake_answers')).toBe(false)
+      // Unit setup stands in for the separately tested trusted Human BFF
+      // boundary; the Agent surface cannot perform this write.
+      kernel.submitIntakeAnswers(
+        b1.intake.intake_id,
+        requiredAnswers(scanned.questions),
+        { principal_id: 'human-test', auth_method: 'dsh-session', session_id: 'human-session' },
+      )
 
       // propose: deterministic PhaseProposal; DRAFT safe status (the kernel
       // state machine never fabricates approved gates).
@@ -277,7 +286,13 @@ describe('ONBOARD-01 intake tools end-to-end (real kernel + ResearchClient)', ()
 describe('ONBOARD-01 intake tools stable error-code copy', () => {
   it('maps intake_not_found, question_required and question_revision_conflict to stable copy', async () => {
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief(), session_id: 'researcher-session' })
+    const project = kernel.createProject({
+      name: 't',
+      workspace: '/w',
+      brief: makeBrief(),
+      session_id: 'researcher-session',
+      creator_principal_id: 'researcher-session',
+    })
     await withServer(kernel, async (base) => {
       const client = new ResearchClient({ endpoint: base })
       const registered = registerTools(client, new RoleRegistry())
@@ -295,19 +310,13 @@ describe('ONBOARD-01 intake tools stable error-code copy', () => {
         content_base64: Buffer.from('epoch=1 loss=0.1\n').toString('base64'),
         media_type: 'text/plain',
       })
-      const scanned = await exec('research_intake_scan', { intake_id: b.intake.intake_id })
+      await exec('research_intake_scan', { intake_id: b.intake.intake_id })
 
       // Propose before answering → stable question_required copy.
       await expect(exec('research_intake_propose', { intake_id: b.intake.intake_id }))
         .rejects.toThrow(`intake question_required: ${INTAKE_ERROR_COPY.question_required}`)
 
-      // Answers with a stale question revision → stable
-      // question_revision_conflict copy.
-      const stale = scanned.questions.find((q: { question_code: string }) => q.question_code === 'seed')
-      await expect(exec('research_intake_answers', {
-        intake_id: b.intake.intake_id,
-        answers_json: JSON.stringify([{ question_code: stale.question_code, answer: '42', question_revision: 999 }]),
-      })).rejects.toThrow(`intake question_revision_conflict: ${INTAKE_ERROR_COPY.question_revision_conflict}`)
+      expect(registered.some(tool => tool.name === 'research_intake_answers')).toBe(false)
     })
     kernel.close()
   })

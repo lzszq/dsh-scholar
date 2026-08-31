@@ -1,9 +1,10 @@
 /**
  * Research Kernel entry — sidecar process (design §9.1 Local Desktop Profile).
- * Usage: node lib/bin/kernel.js --db <path> --cas <dir> [--port 7412] [--token <t>]
- *        [--service-token <t>] [--endpoint-file <path>]
- *        (or DSH_SCHOLAR_KERNEL_TOKEN / DSH_SCHOLAR_SERVICE_TOKEN;
- *         DSH_SCHOLAR_DSH_PLUGIN_TOKEN is the route-specific create/link secret)
+ * Usage: node lib/bin/kernel.js --db <path> --cas <dir> [--port 7412]
+ *        [--endpoint-file <path>]
+ *        Secrets are supplied out-of-band via DSH_SCHOLAR_KERNEL_TOKEN /
+ *        DSH_SCHOLAR_SERVICE_TOKEN; DSH_SCHOLAR_DSH_PLUGIN_TOKEN is the
+ *        route-specific create/link secret.
  *
  * CONFIG-01: the CLI surface is parsed by the canonical Config Registry
  * (parseCli) — flags, defaults and validation are the registry's single
@@ -52,10 +53,9 @@ const casRoot = (cli['kernel.cas'] as string | undefined) ?? join(process.cwd(),
 const secretRoot = (cli['kernel.secret_root'] as string | undefined) ?? process.env.DSH_SCHOLAR_SECRET_ROOT ?? null
 const port = (cli['kernel.port'] as number | undefined) ?? 7412
 const host = (cli['kernel.host'] as string | undefined) ?? '127.0.0.1'
-// Sidecars pass the token out-of-band from argv so it is not exposed by
-// process listings. The CLI flag remains for explicit backwards compatibility.
-const token = (cli['kernel.token'] as string | undefined) ?? process.env.DSH_SCHOLAR_KERNEL_TOKEN
-const serviceToken = (cli['kernel.service_token'] as string | undefined) ?? process.env.DSH_SCHOLAR_SERVICE_TOKEN
+// Secrets are never accepted on argv, where process listings can expose them.
+const token = process.env.DSH_SCHOLAR_KERNEL_TOKEN
+const serviceToken = process.env.DSH_SCHOLAR_SERVICE_TOKEN
 const dshPluginToken = process.env.DSH_SCHOLAR_DSH_PLUGIN_TOKEN
 const orchestratorToken = process.env.DSH_SCHOLAR_ORCHESTRATOR_TOKEN
 const endpointFile = (cli['kernel.endpoint_file'] as string | undefined) ?? process.env.DSH_SCHOLAR_KERNEL_ENDPOINT_FILE
@@ -69,8 +69,7 @@ const endpointFile = (cli['kernel.endpoint_file'] as string | undefined) ?? proc
 // objects can be correlated with the config that produced them
 // (docs/config-registry.md). The redacted effective config travels with the
 // pin for the HTTP surface — secrets never leave the process in plaintext.
-let configPin: string
-let configRedacted: Record<string, unknown>
+let configEffective: Record<string, unknown>
 try {
   const resolved = validateConfig({
     'kernel.host': host,
@@ -83,8 +82,7 @@ try {
     'kernel.endpoint_file': endpointFile ?? '',
     'kernel.require_signed_manifest': true,
   }, { scopes: ['global', 'project', 'kernel'] })
-  configPin = resolved.pinHash
-  configRedacted = resolved.redacted
+  configEffective = resolved.effective
 } catch (error) {
   console.error(`[research-kernel] invalid config: ${error instanceof ConfigRegistryError ? error.message : (error as Error).message}`)
   process.exit(1)
@@ -115,6 +113,7 @@ const kernel = new ResearchKernel({
   serviceToken,
   dshPluginToken,
   orchestratorToken,
+  runtimeConfig: configEffective,
   // OCR-CONFIG-01: the first built-in provider is MinerU's official Open API.
   // Other DNS providers remain fail-closed unless a future instance policy
   // explicitly allowlists them; loopback remains disabled here.
@@ -148,8 +147,8 @@ const kernel = new ResearchKernel({
 }
 
 try {
-  const { server, url, port: actualPort } = await startKernelServer({ kernel, host, port, token, configPinHash: configPin, configRedacted })
-  console.error(`[research-kernel] listening on ${url} (db=${dbPath}, cas=${casRoot}, instance=${kernel.instanceId}, config=${configPin})`)
+  const { server, url, port: actualPort } = await startKernelServer({ kernel, host, port, token })
+  console.error(`[research-kernel] listening on ${url} (db=${dbPath}, cas=${casRoot}, instance=${kernel.instanceId}, config=${kernel.configPinHash})`)
   if (endpointFile !== undefined && endpointFile !== '') {
     // SIDE-01: server.address().port is the REAL port even when --port 0 was
     // requested. The 0600 file is the sidecar's only identity source: the
@@ -164,7 +163,7 @@ try {
       database: basename(dbPath),
       dataDir: resolve(dirname(dbPath)),
       // CONFIG-01: pin of the effective config that produced this kernel.
-      configPin,
+      configPin: kernel.configPinHash,
       pid: process.pid,
       started_at: new Date().toISOString(),
     }, null, 2) + '\n', { mode: 0o600 })

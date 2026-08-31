@@ -4,9 +4,7 @@
  * (next-action-cards.ts, unit-tested); this file only maps the model to DOM
  * nodes and wires the route CTA through the existing navigation mechanism
  * (state.activeTab + tabSave + rerender, plus the stable `#tab=<key>` deep
- * link from nav.ts that parseDeepLink/hashchange consume). Legacy
- * `next_actions: string[]` projects keep rendering (resolveNextActionInput
- * fallback) so older kernels are not broken.
+ * link from nav.ts that parseDeepLink/hashchange consume).
  */
 import type { NextActionV2, Projection } from '../types'
 import { el, rootHost } from '../ui'
@@ -114,28 +112,12 @@ export function nextActionCardNode(model: NextActionCardModel): HTMLElement {
 }
 
 /**
- * Render the Overview "next actions" section: v2 structured cards when the
- * projection carries `next_actions_v2`, the legacy string list otherwise
- * (backward compatibility). Empty input renders the none state.
+ * Render the Overview "next actions" section from the structured authority.
+ * Empty or malformed input renders the safe none state.
  */
 export function renderNextActionSection(body: HTMLElement, p: Projection): void {
   body.appendChild(el('div', 'section-label', t('overview', 'overview.nextActions')))
   const input = resolveNextActionInput(p)
-  if (input.kind === 'legacy') {
-    if (input.labels.length === 0) {
-      body.appendChild(el('div', 'empty', t('overview', 'overview.nextActions.none')))
-      return
-    }
-    for (const action of input.labels) {
-      const card = el('div', 'card')
-      const row = el('div', 'row')
-      row.appendChild(el('span', '', '➡️'))
-      row.appendChild(el('span', 'grow', action))
-      card.appendChild(row)
-      body.appendChild(card)
-    }
-    return
-  }
   if (input.actions.length === 0) {
     body.appendChild(el('div', 'empty', t('overview', 'overview.nextActions.none')))
     return

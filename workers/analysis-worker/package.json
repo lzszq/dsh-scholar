@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "DSH Scholar Analysis Worker — deterministic statistics engine (design DSH_Scholar_v2.0 §12.5, §13, §17.3): MetricSpec/RunSet/AnalysisPlan validation, fixed-schema metrics-file parsing, and paired mean-difference analysis with a seeded percentile bootstrap CI.",
   "type": "module",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {
@@ -21,6 +21,9 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "analysis-worker": "node lib/bin/analysis-worker.js"
+  },
+  "dependencies": {
+    "@dsh-scholar/analysis-engine": "workspace:^"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

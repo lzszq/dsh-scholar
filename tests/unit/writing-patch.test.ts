@@ -36,7 +36,9 @@ function projectWithDocument(kernel: ResearchKernel, name: string) {
 }
 
 function completeReview(kernel: ResearchKernel, projectId: string, documentId: string) {
-  kernel.linkSession('session_writing_review', projectId)
+  kernel.linkSession('session_writing_review', projectId, {
+    principal_id: 'pi-writing', tenant_id: '', issuer: 'kernel',
+  })
   const roles: WritingReviewerRole[] = ['claim-evidence', 'citation', 'statistics', 'reproducibility']
   for (const role of roles) {
     kernel.registerChildLink({

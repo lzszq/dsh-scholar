@@ -73,16 +73,14 @@ export type PtyCloseReason = 'explicit' | 'idle_ttl' | 'permission_revoked' | 'a
 /** POST /v1/pty/sessions body (PtyOpenRequest — profile/target are opaque
  *  ids resolved server-side; cwd is root-relative inside the workspace). */
 export interface PtyOpenParams {
-  project_id: string
+  context_id: string
   workspace_id: string
-  profile: string
-  target: string
+  label: string
+  purpose?: string
   preset: PtyPreset
   cwd: string
   cols: number
   rows: number
-  idle_ttl_s?: number
-  retention_bytes?: number
 }
 
 /** GET session / open response projection (PtySession). */
@@ -92,6 +90,11 @@ export interface PtySessionWire {
   tenant_id?: string
   project_id: string
   workspace_id: string
+  context_kind: 'research' | 'chat' | 'subagent'
+  context_id: string
+  parent_session_id: string | null
+  label: string
+  purpose: string
   profile: string
   target: string
   preset: string
@@ -118,6 +121,7 @@ export interface PtySessionWire {
 /** One control frame body (PtyControlRequest — no session id/timestamps;
  *  the server fills them). */
 export interface PtyControlFrame {
+  expected_generation: number
   client_seq: number
   type: PtyControlKind
   payload: Record<string, unknown>
@@ -159,9 +163,12 @@ export type PtyResult<T> =
  *  tests can drive the model with scripted responses (no fetch/DOM). */
 export interface PtyTransport {
   open(params: PtyOpenParams): Promise<PtyResult<PtySessionWire>>
-  getSession(sessionId: string, lease: string): Promise<PtyResult<PtySessionWire>>
+  attach(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>>
+  detach(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>>
+  close(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>>
+  getSession(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>>
   control(sessionId: string, lease: string, frame: PtyControlFrame): Promise<PtyResult<{ delivered?: boolean; idempotent?: boolean }>>
-  frames(sessionId: string, lease: string, afterSeq: number): Promise<PtyResult<PtyFramesPageWire>>
+  frames(sessionId: string, lease: string, afterSeq: number, expectedGeneration: number): Promise<PtyResult<PtyFramesPageWire>>
 }
 
 /** Timer abstraction (global setTimeout in the browser, injected/fake in
@@ -242,7 +249,17 @@ export function ptyErrorKey(code: string | null | undefined): string {
   switch (code) {
     case 'lease_invalid':
     case 'lease_required':
+    case 'pty_lease_expired':
       return 'pty.error.lease'
+    case 'pty_generation_stale':
+      return 'pty.error.generation'
+    case 'pty_context_mismatch':
+    case 'pty_exact_parent_mismatch':
+    case 'pty_context_not_found':
+      return 'pty.error.context'
+    case 'pty_target_unavailable':
+    case 'pty_target_unsupported':
+      return 'pty.error.target'
     case 'pty_session_not_found':
       return 'pty.error.notFound'
     case 'pty_session_closed':
@@ -402,7 +419,23 @@ export class PtyClientModel {
       this.notify()
       return false
     }
-    this.applySession(result.data)
+    const opened = result.data
+    if (opened.context_id !== params.context_id || opened.lease_token === null || opened.lease_token === '') {
+      this.state = 'error'
+      this.lastError = { code: opened.context_id !== params.context_id ? 'pty_context_mismatch' : 'lease_required', status: 409 }
+      this.notify()
+      return false
+    }
+    this.applySession(opened, false)
+    const attached = await this.transport.attach(opened.pty_session_id, opened.lease_token, opened.generation)
+    if (this.disposed || this.sessionId !== opened.pty_session_id) return false
+    if (!attached.ok) {
+      this.state = 'error'
+      this.lastError = { code: attached.error.code ?? 'http_error', status: attached.error.status ?? 0 }
+      this.notify()
+      return false
+    }
+    this.applySession(attached.data)
     return true
   }
 
@@ -413,34 +446,79 @@ export class PtyClientModel {
     return this.open(this.lastOpenParams)
   }
 
+  /** Restore one server-listed tab. A persisted PTY lease is hash-only, so
+   * a list item without its ephemeral token is intentionally non-writable;
+   * reopen() creates a new session in the same exact context. */
+  restore(session: PtySessionWire): void {
+    this.reset()
+    this.lastOpenParams = {
+      context_id: session.context_id,
+      workspace_id: session.workspace_id,
+      label: session.label,
+      purpose: session.purpose,
+      preset: session.preset as PtyPreset,
+      cwd: session.cwd,
+      cols: 80,
+      rows: 24,
+    }
+    this.applySession(session, false)
+    if (session.state !== 'closed' && (session.lease_token === null || session.lease_token === '')) {
+      this.state = 'error'
+      this.lastError = { code: 'lease_required', status: 403 }
+      this.notify()
+    }
+  }
+
   /** Wire down (leaving the tab) — the process keeps running server-side;
    *  reconnect() resumes the after_seq replay (SSE stream or poll). */
-  detach(): void {
-    if (this.state !== 'open') return
+  async detach(): Promise<boolean> {
+    if (this.state !== 'open' || this.sessionId === null) return false
     this.stopPolling()
     this.stopStreaming()
     this.state = 'detached'
     this.notify()
+    const result = await this.transport.detach(this.sessionId, this.leaseToken ?? '', this.generation)
+    if (this.disposed) return false
+    if (!result.ok) {
+      this.failFatal(result.error.code ?? 'http_error', result.error.status ?? 0)
+      return false
+    }
+    this.applySession(result.data, false)
+    return true
   }
 
   /** Wire up again — state → open, frames consumption resumes from
    *  serverSeq (the after_seq replay contract; generation bumps are
    *  surfaced as notices). */
-  reconnect(): void {
-    if (!this.hasSession || this.state === 'error' || this.state === 'closed') return
-    this.state = 'open'
+  async reconnect(): Promise<boolean> {
+    if (!this.hasSession || this.sessionId === null || this.state !== 'detached') return false
+    const result = await this.transport.attach(this.sessionId, this.leaseToken ?? '', this.generation)
+    if (this.disposed) return false
+    if (!result.ok) {
+      this.failFatal(result.error.code ?? 'http_error', result.error.status ?? 0)
+      return false
+    }
     this.controlAttempts = 0
     this.pollCount = 0
     this.pollBackoffMs = 0
     this.streamError = null
-    this.notify()
-    this.startFrames()
+    this.applySession(result.data)
+    return true
   }
 
   /** Explicit close control (queue + flush; acked → closed, reason
    *  'explicit'). Returns false when the session is not controllable. */
-  close(): boolean {
-    return this.enqueueControl({ type: 'close', payload: {} })
+  async close(): Promise<boolean> {
+    if ((this.state !== 'open' && this.state !== 'detached') || this.sessionId === null) return false
+    const result = await this.transport.close(this.sessionId, this.leaseToken ?? '', this.generation)
+    if (this.disposed) return false
+    if (!result.ok) {
+      this.failFatal(result.error.code ?? 'http_error', result.error.status ?? 0)
+      return false
+    }
+    this.stopFrames()
+    this.applySession(result.data, false)
+    return true
   }
 
   /** Send terminal input bytes (queued control with exact byte_length). */
@@ -524,9 +602,14 @@ export class PtyClientModel {
   }
 
   /** Fold a fresh session row into the model (open response / refresh). */
-  private applySession(session: PtySessionWire): void {
+  private applySession(session: PtySessionWire, consumeFrames = true): void {
     this.sessionId = session.pty_session_id
-    this.leaseToken = session.lease_token ?? null
+    // The plaintext lease exists only in the open response; durable rows and
+    // every later lifecycle response intentionally expose hash-only state.
+    // Keep the in-memory token across attach/detach/refresh responses. A
+    // restore starts from reset(), so a persisted session still has no token
+    // and remains non-writable until it is reopened.
+    if (session.lease_token !== null && session.lease_token !== '') this.leaseToken = session.lease_token
     this.leaseExpiresAt = session.lease_expires_at ?? null
     this.generation = session.generation
     this.clientSeq = session.last_client_seq
@@ -534,9 +617,12 @@ export class PtyClientModel {
     this.retainedFromSeq = session.retained_from_seq
     this.droppedBytes = session.dropped_bytes
     this.totalBytes = session.total_bytes
-    this.state = 'open'
+    this.state = session.state === 'closed'
+      ? 'closed'
+      : (session.state === 'detached' ? 'detached' : 'open')
+    this.closeReason = session.close_reason
     this.notify()
-    this.startFrames()
+    if (consumeFrames && this.state === 'open') this.startFrames()
   }
 
   /* ─────────────────────────── control queue ─────────────────────────── */
@@ -544,7 +630,7 @@ export class PtyClientModel {
   /** Assign the next monotonic seq (clientSeq + queue depth + in-flight),
    *  enqueue and flush. Rejected (false) when the session is not
    *  controllable (idle/opening/closed/error). */
-  private enqueueControl(frame: Omit<PtyControlFrame, 'client_seq'>): boolean {
+  private enqueueControl(frame: Omit<PtyControlFrame, 'client_seq' | 'expected_generation'>): boolean {
     if (this.state !== 'open' && this.state !== 'detached') return false
     if (this.lastControlError !== null) {
       // a new user action resets the stalled retry state
@@ -554,7 +640,7 @@ export class PtyClientModel {
     // Every queued frame (incl. the one in flight at pending[0]) has
     // consumed a seq — the next one is clientSeq + queue depth + 1.
     const seq = this.clientSeq + this.pending.length + 1
-    this.pending.push({ ...frame, client_seq: seq })
+    this.pending.push({ ...frame, expected_generation: this.generation, client_seq: seq })
     this.notify()
     void this.flushControl()
     return true
@@ -591,9 +677,13 @@ export class PtyClientModel {
       return
     }
     const code = result.error.code ?? 'http_error'
-    if (code === 'lease_invalid' || code === 'lease_required') {
+    if (code === 'lease_invalid' || code === 'lease_required' || code === 'pty_lease_expired') {
       // Fatal: the session lease is unusable — prompt to reopen.
-      this.failFatal('lease_invalid')
+      this.failFatal(code, result.error.status ?? 403)
+      return
+    }
+    if (code === 'pty_generation_stale' || code === 'pty_context_mismatch' || code === 'pty_exact_parent_mismatch') {
+      this.failFatal(code, result.error.status ?? 409)
       return
     }
     if (code === 'pty_session_closed' || code === 'pty_session_not_found') {
@@ -635,7 +725,7 @@ export class PtyClientModel {
       this.failFatal('pty_client_seq_out_of_order')
       return
     }
-    const result = await this.transport.getSession(this.sessionId, this.leaseToken ?? '')
+    const result = await this.transport.getSession(this.sessionId, this.leaseToken ?? '', this.generation)
     if (this.disposed) return
     if (!result.ok) {
       this.lastError = { code: result.error.code ?? 'http_error', status: result.error.status ?? status }
@@ -678,10 +768,10 @@ export class PtyClientModel {
 
   /** Fatal session failure (lease invalid / unresolvable desync): stop
    *  everything, drop queued controls, land in `error`. */
-  private failFatal(code: string): void {
+  private failFatal(code: string, status = 403): void {
     this.stopFrames()
     this.state = 'error'
-    this.lastError = { code, status: 403 }
+    this.lastError = { code, status }
     this.pending = []
     this.inflight = null
     this.notify()
@@ -717,7 +807,7 @@ export class PtyClientModel {
     this.streamError = null
     const sessionId = this.sessionId
     const client = new SseClient({
-      url: () => `/v1/pty/sessions/${encodeURIComponent(sessionId)}/frames/stream?after_seq=${this.serverSeq}`,
+      url: () => `/v1/pty/sessions/${encodeURIComponent(sessionId)}/frames/stream?after_seq=${this.serverSeq}&expected_generation=${this.generation}`,
       fetchImpl: this.streamTransport.fetch,
       headers: () => Promise.resolve({ 'x-pty-lease': this.leaseToken ?? '' }),
       scheduler: this.scheduler as SseScheduler,
@@ -739,6 +829,10 @@ export class PtyClientModel {
         // fatal — the session lease is unusable.
         if (error.status === 403) {
           this.failFatal('lease_invalid')
+          return
+        }
+        if (error.status === 409) {
+          this.failFatal('pty_generation_stale', 409)
           return
         }
         this.streamError = { code: error.code, status: error.status }
@@ -903,12 +997,16 @@ export class PtyClientModel {
   private async pollOnce(): Promise<void> {
     if (this.disposed || this.state !== 'open' || this.sessionId === null) return
     const lease = this.leaseToken ?? ''
-    const result = await this.transport.frames(this.sessionId, lease, this.serverSeq)
+    const result = await this.transport.frames(this.sessionId, lease, this.serverSeq, this.generation)
     if (this.disposed || this.state !== 'open') return // detached/closed in flight
     if (!result.ok) {
       const code = result.error.code ?? 'http_error'
-      if (code === 'lease_invalid' || code === 'lease_required') {
-        this.failFatal('lease_invalid')
+      if (code === 'lease_invalid' || code === 'lease_required' || code === 'pty_lease_expired') {
+        this.failFatal(code, result.error.status ?? 403)
+        return
+      }
+      if (code === 'pty_generation_stale' || code === 'pty_context_mismatch' || code === 'pty_exact_parent_mismatch') {
+        this.failFatal(code, result.error.status ?? 409)
         return
       }
       if (code === 'pty_session_not_found') {
@@ -1004,12 +1102,20 @@ export class PtyClientModel {
    *  revocation / adapter failure) and generation bumps surface here. */
   private async refreshSession(): Promise<void> {
     if (!this.hasSession || this.sessionId === null) return
-    const result = await this.transport.getSession(this.sessionId, this.leaseToken ?? '')
-    if (this.disposed || !result.ok) return
+    const result = await this.transport.getSession(this.sessionId, this.leaseToken ?? '', this.generation)
+    if (this.disposed) return
+    if (!result.ok) {
+      const code = result.error.code ?? 'http_error'
+      if (code === 'pty_generation_stale' || code === 'pty_context_mismatch'
+        || code === 'pty_exact_parent_mismatch' || code === 'pty_lease_expired') {
+        this.failFatal(code, result.error.status ?? 409)
+      }
+      return
+    }
     const session = result.data
     if (session.generation !== this.generation) {
-      this.generation = session.generation
-      this.generationChanged = true
+      this.failFatal('pty_generation_stale', 409)
+      return
     }
     this.idleTtlS = session.idle_ttl_s
     this.leaseExpiresAt = session.lease_expires_at

@@ -17,10 +17,7 @@ global:
 
 project:
   execution:
-    # Execution profile of the project (v1 enum; superseded by execution.runner_profile_id).
-    # sources: http/ui/file
-    runner_profile: local-docker-cpu
-    # Opaque registered RunnerProfile id (domain-model.md §2/§9.1): overrides execution.runner_profile when set; unknown ids are rejected 422 runner_profile_unknown at project create and job submit. Job references only this opaque id — docker flags/endpoints never travel in project/job data.
+    # Explicit opaque registered RunnerProfile id. null means an unconfigured DRAFT and is never resolved to a local runner implicitly; execution remains blocked until Settings saves a registered id.
     # sources: http/ui/file
     runner_profile_id: null
     # Opaque registered RunnerTarget id. The registry resolves local-process/local-docker/remote-ssh connection metadata server-side and pins its revision/hash at job submission.
@@ -83,12 +80,15 @@ runner-profile:
     # Ed25519 signing key file (0600); an ephemeral key is generated when absent.
     # sources: cli/env/file
     key_file: ''
-    # Kernel bearer token for the runner client.
-    # sources: cli/env/file; secret
+    # Kernel bearer token for the runner client; injected by environment or a managed 0600 config file, never argv.
+    # sources: env/file; secret
     token: ''
-    # Service identity for internal kernel routes.
-    # sources: cli/env/file; secret
+    # Service identity for internal kernel routes; never argv.
+    # sources: env/file; secret
     service_token: ''
+    # Target-scoped service identity for RunnerTarget heartbeat; independent from the shared internal-route token and never argv.
+    # sources: env/file; secret
+    target_token: ''
     # Fleet server listen port (0 = ephemeral); when provided the runner runs RemoteFleetServer instead of the local claim loop.
     # sources: cli/env/file
     fleet_server_port: 0
@@ -156,11 +156,11 @@ kernel:
   # Kernel HTTP listen port (0 = ephemeral, published via endpoint file).
   # sources: cli/env/file
   port: 7412
-  # Kernel bearer token; never logged, never in argv when the env path is used.
-  # sources: cli/env/file; secret
+  # Kernel bearer token; supplied only through environment or managed config files, never argv.
+  # sources: env/file; secret
   token: ''
-  # Internal-route service identity (x-service-token).
-  # sources: cli/env/file; secret
+  # Internal-route service identity (x-service-token); never accepted on argv.
+  # sources: env/file; secret
   service_token: ''
   # SQLite database path; empty = ephemeral temp database.
   # sources: cli/env/file
@@ -168,12 +168,24 @@ kernel:
   # CAS root for immutable artifacts.
   # sources: cli/env/file
   cas: .research-cas
+  # Server-only SecretRef root for target identities, model credentials and SSH connection material; never returned in plaintext.
+  # sources: cli/env/file; secret
+  secret_root: ''
   # 0600 endpoint identity file written after bind (SIDE-01).
   # sources: cli/env/file
   endpoint_file: ''
   # Reject unsigned run manifests at completion (RUN-01: default true).
   # sources: file/http/ui; security-floor
   require_signed_manifest: true
+  # Idle lifetime in seconds pinned into each newly opened PTY session; existing sessions are unchanged.
+  # sources: file/http/ui
+  pty_idle_ttl_s: 900
+  # Bounded output bytes pinned into each newly opened PTY session; existing replay windows are unchanged.
+  # sources: file/http/ui
+  pty_retention_bytes: 1048576
+  # Lease lifetime in seconds pinned into each newly opened PTY session; existing lease expiry is unchanged.
+  # sources: file/http/ui
+  pty_lease_ttl_s: 3600
 
 standalone:
   # Standalone BFF listen host.
@@ -191,8 +203,8 @@ standalone:
   # Standalone BFF state directory (browser token/session/model only); empty = $DSH_HOME/research-ui-standalone or ~/.dsh-scholar-standalone/research-ui-standalone.
   # sources: cli/env/file
   data_dir: ''
-  # Loopback bearer token; auto-generated and persisted 0600 when empty.
-  # sources: cli/file; secret
+  # Loopback bearer token; auto-generated and persisted in a 0600 managed file, never argv.
+  # sources: file; secret
   token: ''
   # Operator principal identity (GOV-01 local resolver).
   # sources: cli/file

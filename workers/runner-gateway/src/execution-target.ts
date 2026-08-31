@@ -25,7 +25,6 @@ import {
   dockerGpuArgument,
   ExecutionPlan,
   executionPlanFingerprint,
-  LOCAL_DOCKER_TARGET_ID,
   type ExecutionPlan as ExecutionPlanType,
 } from '@dsh-scholar/research-schemas'
 
@@ -199,11 +198,11 @@ export class LocalDockerAdapter implements ExecutionTarget {
       jobId: string
       dockerRun: DockerRunFn
       cancel: CancelRunFn
-      /** Opaque registry id; legacy callers retain local-docker. */
-      targetId?: string
+      /** Exact opaque registry id configured for this adapter. */
+      targetId: string
     },
   ) {
-    this.target_id = deps.targetId ?? LOCAL_DOCKER_TARGET_ID
+    this.target_id = deps.targetId
   }
 
   private preparedFingerprint: string | null = null

@@ -4,7 +4,7 @@
  *
  * 本地 runner（index.ts executeJob）与远端 Agent（remote-agent.ts
  * executeClaim）必须产出同一形状的 canonical manifest 基座——run_id/
- * project_id/contract_id/job_id/code_commit/code_snapshot_id/
+ * project_id/contract_id/job_id/config_pin/code_commit/code_snapshot_id/
  * container_digest/data_hash/seed/command/resources/started_at/finished_at/
  * exit_code。调用方再追加各自路径的 log_artifact/metrics_artifact/tex/
  * lease，并经 signManifest 签名（§12.7）。
@@ -21,6 +21,8 @@ export interface RunManifestInput {
   run_id: string
   project_id: string
   job_id: string
+  /** Exact Project effective config pin fixed in the claimed ExecutionPlan. */
+  config_pin: string
   contract_id: string | null
   command: string[]
   code_commit: string
@@ -42,11 +44,9 @@ export function buildRunManifest(input: RunManifestInput): Record<string, unknow
   return {
     run_id: input.run_id,
     project_id: input.project_id,
-    // §12.7: contract_id is emitted only for contract-bound jobs — a
-    // contract-less job must NOT carry a null contract_id (the kernel treats
-    // a present null as a mismatch).
-    ...(input.contract_id !== null ? { contract_id: input.contract_id } : {}),
+    contract_id: input.contract_id,
     job_id: input.job_id,
+    config_pin: input.config_pin,
     code_commit: input.code_commit,
     code_snapshot_id: input.code_snapshot_id ?? null,
     container_digest: input.container_digest,
@@ -61,9 +61,7 @@ export function buildRunManifest(input: RunManifestInput): Record<string, unknow
           cpu: 1,
           memory_gb: 1,
         }
-      // Preserve the legacy CPU manifest shape.  Besides keeping existing
-      // signatures stable, omitting redundant compute metadata prevents old
-      // bounded remote spools from rejecting otherwise identical manifests.
+      // CPU has no device selector; omit GPU-specific metadata.
       : { gpu: 0, cpu: 1, memory_gb: 1 },
     started_at: input.started_at,
     finished_at: input.finished_at,

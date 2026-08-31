@@ -17,6 +17,7 @@ function run(args: string[], env: Record<string, string> = {}) {
       DSH_PRIVATE_REGISTRY_URL: env.DSH_PRIVATE_REGISTRY_URL ?? '',
       DSH_PRIVATE_REGISTRY_TOKEN: env.DSH_PRIVATE_REGISTRY_TOKEN ?? '',
       NPM_TOKEN: '',
+      DSH_PRIVATE_DSH_SPEC: env.DSH_PRIVATE_DSH_SPEC ?? '',
       DSH_SCHOLAR_PLUGIN_SPEC: env.DSH_SCHOLAR_PLUGIN_SPEC ?? '',
     },
   })
@@ -65,6 +66,33 @@ describe('private @deepseek-ai registry compatibility harness', () => {
     expect(local.stdout).toContain('NOT_RUN_MANUAL_PENDING')
     expect(run([]).status).toBe(2)
     expect(run(['--allow-pending'], { CI: 'true' }).status).toBe(2)
+  })
+
+  it('requires an explicit exact DSH host spec instead of silently testing an obsolete default', () => {
+    const result = run([], {
+      DSH_PRIVATE_REGISTRY_URL: 'https://registry.example.test',
+      DSH_PRIVATE_REGISTRY_TOKEN: 'short-lived-token',
+      DSH_SCHOLAR_PLUGIN_SPEC: '@dsh-scholar/research-plugin@0.1.0',
+    })
+    expect(result.status).toBe(2)
+    expect(result.stdout).toContain('DSH_PRIVATE_DSH_SPEC is not configured')
+  })
+
+  it('rejects an exact but non-baseline DSH host before contacting the registry', () => {
+    const baseline = JSON.parse(readFileSync(join(repo, 'config/dsh-baseline.json'), 'utf8')) as {
+      version: string
+    }
+    const mismatched = baseline.version === '0.1.0' ? '0.1.1' : '0.1.0'
+    const result = run([], {
+      DSH_PRIVATE_REGISTRY_URL: 'https://registry.example.test',
+      DSH_PRIVATE_REGISTRY_TOKEN: 'short-lived-token',
+      DSH_PRIVATE_DSH_SPEC: `@deepseek-ai/dsh@${mismatched}`,
+      DSH_SCHOLAR_PLUGIN_SPEC: '@dsh-scholar/research-plugin@0.1.0',
+      PNPM_BIN: '/definitely/not/a/pnpm/binary',
+    })
+    expect(result.status).toBe(2)
+    expect(result.stderr).toContain(`must equal @deepseek-ai/dsh@${baseline.version}`)
+    expect(result.stderr).not.toContain('/definitely/not/a/pnpm/binary')
   })
 
   it('rejects an unsafe registry before package execution and never prints the token', () => {

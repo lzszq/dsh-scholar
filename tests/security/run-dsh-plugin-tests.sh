@@ -4,7 +4,7 @@
 # handlers, headless tools and skill provider resolution.
 #
 #   1. Tool catalog == reconstruction-contracts.md §17 canonical registry
-#      (42 canonical names incl. dsh_scholar, session-bound methodology and
+#      (41 canonical names incl. dsh_scholar, session-bound methodology and
 #      the ONBOARD-01 prepare surface);
 #      removed claim_verify/analysis_build/release_bundle names stay absent.
 #   2. No Human Decision / gate-decision tool exists; no intake adopt/accept
@@ -70,11 +70,11 @@ const CANONICAL = [
   'evidence_note_create', 'claim_create', 'claim_verify_request', 'analysis_request',
   'manuscript_build', 'manuscript_review', 'release_bundle_request',
   // ONBOARD-01 intake prepare surface (research-onboarding.md §2): agents
-  // begin/stage/scan/answers/propose; NO adopt tool (Agent has no accept).
+  // begin/stage/scan/propose; Human answers/adopt are not Agent tools.
   'research_intake_begin', 'research_intake_stage', 'research_intake_scan',
-  'research_intake_answers', 'research_intake_propose',
+  'research_intake_propose',
 ]
-if (CANONICAL.length !== 42) throw new Error(`§17 registry has ${CANONICAL.length} entries, expected 42`)
+if (CANONICAL.length !== 41) throw new Error(`§17 registry has ${CANONICAL.length} entries, expected 41`)
 
 const registered = []
 // Tool defs capture `client` at registration time; one registration serves
@@ -120,7 +120,7 @@ if (Object.prototype.hasOwnProperty.call(assuranceTool?.parameters?.properties ?
 // 3b. ONBOARD-01 (research-onboarding.md §2.1): the Agent has NO accept —
 //     no adopt tool exists and every intake tool is prepare-only copy.
 const intakeNames = names.filter(n => n.startsWith('research_intake'))
-if (intakeNames.length !== 5) problems.push(`expected exactly 5 intake tools, got ${intakeNames.length}`)
+if (intakeNames.length !== 4) problems.push(`expected exactly 4 intake tools, got ${intakeNames.length}`)
 if (intakeNames.some(n => /adopt|accept/.test(n))) problems.push(`adopt/accept intake tools must not exist: ${intakeNames.join(',')}`)
 for (const n of intakeNames) {
   const t = registered.find(x => x.name === n)
@@ -137,7 +137,8 @@ for (const role of Object.keys(ROLE_TOOLS)) {
   }
 }
 // 4b. intake ACL: unknown/none denied on every intake tool; the researcher
-//     (scholar) role may prepare (begin/scan/answers/propose); no adopt in
+//     (scholar) role may prepare (begin/stage/scan/propose); Human answers and
+//     adoption remain on the trusted BFF boundary and no accept exists in
 //     any role surface.
 for (const n of intakeNames) {
   if (roles.allows(DEFAULT_ROLE, n)) problems.push(`unknown agent may call ${n}`)
@@ -182,17 +183,17 @@ EOF
 NAMES=$(printf '%s' "$CATALOG" | jnode -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).names.join(',')))")
 PROBLEMS=$(printf '%s' "$CATALOG" | jnode -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).problems.join('|')))")
 if [ -z "$PROBLEMS" ]; then
-  ok "all 42 §17 canonical tools registered; obsolete names absent; ACL consistent"
+  ok "all 41 §17 canonical tools registered; obsolete names absent; ACL consistent"
 else
   bad "catalog/ACL problems: $PROBLEMS"
 fi
-for C in claim_verify_request analysis_request release_bundle_request research_project research_gate_request research_budget research_intake_begin research_intake_stage research_intake_scan research_intake_answers research_intake_propose; do
+for C in claim_verify_request analysis_request release_bundle_request research_project research_gate_request research_budget research_intake_begin research_intake_stage research_intake_scan research_intake_propose; do
   case ",$NAMES," in
     *",$C,"*) ok "canonical tool $C registered" ;;
     *) bad "canonical tool $C missing" ;;
   esac
 done
-for A in claim_verify analysis_build release_bundle; do
+for A in claim_verify analysis_build release_bundle research_intake_answers; do
   case ",$NAMES," in
     *",$A,"*) bad "obsolete tool $A is still registered" ;;
     *) ok "obsolete tool $A absent" ;;
@@ -206,8 +207,8 @@ case ",$NAMES," in
   *",research_intake_adopt,"*|*",research_intake_accept,"*) bad "intake adopt/accept tool present in catalog (Agent has no accept)" ;;
   *) ok "no intake adopt/accept tool in catalog (research-onboarding §2.1)" ;;
 esac
-if probe "$CATALOG" "j.names.filter(n=>n.startsWith('research_intake')).length === 5"; then
-  ok "exactly 5 intake prepare tools registered (begin/stage/scan/answers/propose)"
+if probe "$CATALOG" "j.names.filter(n=>n.startsWith('research_intake')).length === 4"; then
+  ok "exactly 4 intake prepare tools registered (begin/stage/scan/propose)"
 else
   bad "intake prepare tool count wrong"
 fi
@@ -390,7 +391,7 @@ fi
 #     client (no module-level tool-context ref), roles and ACL listeners are
 #     per-instance (granting a role in B never leaks into A);
 #   - reload: cordis update() unloads (kills the old kernel, unregisters
-#     tools) then re-applies — no duplicate registration (still exactly 42
+#     tools) then re-applies — no duplicate registration (still exactly 41
 #     tools / 1 skill provider), data persists in the same dataDir;
 #   - dispose: sidecar kernel dead, endpoint.json removed, port released,
 #     tools/commands/skills/pre-execute listeners all gone, the other
@@ -476,12 +477,19 @@ try {
   if (epA.origin === epB.origin) problems.push('dual instance endpoints must differ (port=0)')
   if (epFileA.pid === epFileB.pid) problems.push('dual instance kernels must be distinct processes')
   if (rootA.research.client.endpoint !== epA.origin) problems.push('client endpoint must be the resolved real port')
-  const projA = await rootA.research.client.createProject({ name: 'proj-a', workspace: '/research/proj-a', brief: projectBrief, session_id: 's-a' })
+  // This lifecycle probe needs durable data, not a DSH session authority.
+  // Session binding is exercised below through the authenticated internal
+  // create/link route; a generic create must never invent an unauthenticated
+  // session link merely to seed the fixture.
+  const projA = await rootA.research.client.createProject({
+    name: 'proj-a', workspace: '/research/proj-a', brief: projectBrief,
+    creator_principal_id: 'fixture:cordis-a',
+  })
   if ((await rootA.research.client.listProjects()).length < 1) problems.push('client not usable against the real kernel after start (instance A)')
 
   // ── tools / commands / skills registered exactly once ────────────────────
   const toolsA = rootA.tools.schemas().map(s => s.name)
-  if (toolsA.length !== 42) problems.push(`instance A tool count ${toolsA.length} != 42`)
+  if (toolsA.length !== 41) problems.push(`instance A tool count ${toolsA.length} != 41`)
   if (rootA.tools.get('research_project') === undefined) problems.push('research_project tool not registered')
   const expectedCommands = ['help','new','list','status','gates','jobs','claims','survey','ideas','reproduce','contract','run','evidence','write','review','release-bundle','release']
   const registeredCommands = rootA.commands.list({}).map(c => c.name).sort()
@@ -512,7 +520,7 @@ try {
   trackedPids.push(epFileA2.pid)
   if (alive(oldPid)) problems.push('reload must stop the old kernel (sidecar disposer)')
   if (epFileA2.pid === oldPid) problems.push('reload must spawn/reuse a fresh kernel instance')
-  if (rootA.tools.schemas().length !== 42) problems.push(`reload re-registered tools (${rootA.tools.schemas().length} != 42, duplicate risk)`)
+  if (rootA.tools.schemas().length !== 41) problems.push(`reload re-registered tools (${rootA.tools.schemas().length} != 41, duplicate risk)`)
   if ((await rootA.skills.list()).length !== 4) problems.push('reload leaked or lost research skills')
   if (!(await rootA.research.client.listProjects()).some(p => p.project_id === projA.project_id)) problems.push('reload must keep kernel data (same dataDir)')
   if ((rootA.events._hooks['tools/pre-execute'] ?? []).length !== 1) problems.push('reload must not duplicate the pre-execute listener')
@@ -531,14 +539,14 @@ try {
   const healthAfter = await fetch(`${lastEndpoint}/v1/health`).then(r => r.ok).catch(() => false)
   if (healthAfter) problems.push('dispose must release the kernel port (health still answering)')
   // the sibling instance is untouched
-  if (rootB.tools.schemas().length !== 42) problems.push('disposing A must not affect B tools')
+  if (rootB.tools.schemas().length !== 41) problems.push('disposing A must not affect B tools')
   if (rootB.research === undefined) problems.push('disposing A must not affect B research service')
 
   // ── re-apply on the same root: usable again, still exactly once ──────────
   handleA2 = await rootA.plugin(pluginMod, cfgA)
   const epFileA3 = readEp(dirA)
   trackedPids.push(epFileA3.pid)
-  if (rootA.tools.schemas().length !== 42) problems.push(`re-apply tool count ${rootA.tools.schemas().length} != 42`)
+  if (rootA.tools.schemas().length !== 41) problems.push(`re-apply tool count ${rootA.tools.schemas().length} != 41`)
   if (!(await rootA.research.client.listProjects()).some(p => p.project_id === projA.project_id)) problems.push('re-apply must restore the client against the same dataDir')
   await handleA2.dispose()
   handleA2 = undefined
@@ -598,7 +606,10 @@ fi
 # ── §9: direct slash-command handlers against a real kernel ────────────────
 say "direct research commands (kernel-backed)"
 PORT=$((21500 + $$ % 400))
-nohup node "$KERNEL_BIN" --db "$WORK/kernel.db" --cas "$WORK/cas" --port "$PORT" > "$WORK/kernel.log" 2>&1 &
+SERVICE_TOKEN='plugin-fixture-service-token'
+DSH_PLUGIN_TOKEN='plugin-fixture-dsh-token'
+DSH_SCHOLAR_SERVICE_TOKEN="$SERVICE_TOKEN" DSH_SCHOLAR_DSH_PLUGIN_TOKEN="$DSH_PLUGIN_TOKEN" \
+  nohup node "$KERNEL_BIN" --db "$WORK/kernel.db" --cas "$WORK/cas" --port "$PORT" > "$WORK/kernel.log" 2>&1 &
 KERNEL_PID=$!
 READY=0
 for _ in $(seq 1 50); do
@@ -612,37 +623,54 @@ else
   exit 1
 fi
 
-CMDS=$(jnode - "$REPO" "$PORT" <<'EOF'
+CMDS=$(jnode - "$REPO" "$PORT" "$SERVICE_TOKEN" "$DSH_PLUGIN_TOKEN" <<'EOF'
 const repo = process.argv[2]
 const port = process.argv[3]
+const serviceToken = process.argv[4]
+const dshPluginToken = process.argv[5]
 const { registerResearchCommands } = await import(`${repo}/lib/plugin/commands.js`)
 const { ResearchClient } = await import('@dsh-scholar/research-client')
 
-const client = new ResearchClient({ endpoint: `http://127.0.0.1:${port}` })
+const client = new ResearchClient({
+  endpoint: `http://127.0.0.1:${port}`,
+  serviceToken,
+  dshPluginToken,
+})
 const captured = new Map()
 registerResearchCommands({ commands: { register: def => { captured.set(def.name, def) } } },
-  { client, cache: {}, unattended: false })
+  { client, cache: {}, unattended: false, operatorPrincipal: 'fixture:plugin-operator' })
 // DSH commands hand the handler the text AFTER the slash command name
 // (parseCommand: rawInput = line.slice(match[0].length)).
-const run = async (name, rawInput = '') => {
+const run = async (name, rawInput = '', agentId = 'plugin-test-agent') => {
   const def = captured.get(name)
   if (def === undefined) return { kind: 'not-registered', text: name }
-  return def.handler({ agent: { id: 'plugin-test-agent' }, rawInput })
+  return def.handler({ agent: { id: agentId }, rawInput })
 }
 
 const results = {}
 results.help = await run('help')
 results.listEmpty = await run('list')
-results.claimsNoProject = await run('claims')
-results.new = await run('new', 'mlproj {"domain":"machine-learning","target_venue":"iclr-2026"}')
-const projId = /rsp_[a-z0-9_]+/.exec(results.new.text)?.[0] ?? ''
-results.status = await run('status', projId)
-results.gates = await run('gates', projId)
-results.jobs = await run('jobs', projId)
-results.claims = await run('claims', projId)
+results.claimsNoProject = await run('claims', '', 'plugin-unbound-agent')
+// Name-only creation must use the same authenticated internal route as the
+// real plugin and atomically link this exact DSH session.
+results.new = await run('new', 'mlproj-empty', 'plugin-name-only-agent')
+const nameOnlyId = /rsp_[a-z0-9_]+/.exec(results.new.text)?.[0] ?? ''
+// A complete Brief is a distinct command invocation/session. It exercises
+// deterministic skill selection and the initial Scope Gate without trying
+// to rebind the already-linked name-only session.
+results.newConfigured = await run(
+  'new',
+  'mlproj {"domain":"machine-learning","target_venue":"iclr-2026"}',
+  'plugin-configured-agent',
+)
+const projId = /rsp_[a-z0-9_]+/.exec(results.newConfigured.text)?.[0] ?? ''
+results.status = await run('status', projId, 'plugin-configured-agent')
+results.gates = await run('gates', projId, 'plugin-configured-agent')
+results.jobs = await run('jobs', projId, 'plugin-configured-agent')
+results.claims = await run('claims', projId, 'plugin-configured-agent')
 results.list = await run('list')
 results.aggregate = await run('research', 'help')
-console.log(JSON.stringify({ results, projId, commandNames: [...captured.keys()].sort() }))
+console.log(JSON.stringify({ results, projId, nameOnlyId, commandNames: [...captured.keys()].sort() }))
 EOF
 )
 if [ -z "$CMDS" ]; then
@@ -660,7 +688,12 @@ else
   else
     bad "/claims missing-project path"
   fi
-  if probe "$CMDS" "/domain-machine-learning/.test(j.results.new.text) && /venue-templates/.test(j.results.new.text)"; then
+  if probe "$CMDS" "j.nameOnlyId !== '' && /collecting|Grill Me/.test(j.results.new.text)"; then
+    ok "name-only /new uses authenticated atomic create/link and starts Grill"
+  else
+    bad "name-only /new did not create the collecting session project"
+  fi
+  if probe "$CMDS" "j.results.newConfigured.kind === 'success' && /domain-machine-learning/.test(j.results.newConfigured.text) && /venue-templates/.test(j.results.newConfigured.text)"; then
     ok "new echoes deterministic domain/venue skill selection"
   else
     bad "new lacks deterministic skill selection"

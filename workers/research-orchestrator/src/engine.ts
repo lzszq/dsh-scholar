@@ -47,7 +47,6 @@ const ProjectionSchema = z.object({
     artifacts: z.number().int().nonnegative(),
     corpus_snapshots: z.number().int().nonnegative(),
   }).strict(),
-  next_actions: z.array(z.string()),
   next_actions_v2: z.array(NextAction),
 }).strict()
 

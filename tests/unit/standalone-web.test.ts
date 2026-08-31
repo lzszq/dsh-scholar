@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { chmodSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -70,9 +70,10 @@ describe('standalone web application', () => {
   })
 
   it('parses only an explicit principal; startup derives the stable default later', () => {
-    const dir = join(tmpdir(), `dsh-standalone-principal-${Date.now()}`)
-    expect(loadOptions(['--data-dir', dir, '--token', 'token-only']).principal).toBeNull()
-    expect(loadOptions(['--data-dir', dir, '--token', 'token-with-principal', '--principal', 'ops-1']).principal).toBe('ops-1')
+    const anonymousDir = join(tmpdir(), `dsh-standalone-principal-anon-${Date.now()}`)
+    const principalDir = join(tmpdir(), `dsh-standalone-principal-explicit-${Date.now()}`)
+    expect(loadOptions(['--data-dir', anonymousDir]).principal).toBeNull()
+    expect(loadOptions(['--data-dir', principalDir, '--principal', 'ops-1']).principal).toBe('ops-1')
   })
 
   it('loads explicit --port / --kernel-port / --kernel-data-dir / --data-dir', () => {
@@ -98,11 +99,10 @@ describe('standalone web application', () => {
     expect(o2.token).toBe(o.token)
   })
 
-  it('honors --token over generation and persists it', () => {
+  it('rejects a standalone token on argv without persisting the secret', () => {
     const dir = join(tmpdir(), `dsh-standalone-explicit-${Date.now()}`)
-    const o = loadOptions(['--data-dir', dir, '--token', 'my-secret'])
-    expect(o.token).toBe('my-secret')
-    expect(readFileSync(join(dir, 'standalone-token'), 'utf8').trim()).toBe('my-secret')
+    expect(() => loadOptions(['--data-dir', dir, '--token', 'argv-secret-canary'])).toThrow(/unknown CLI flag/)
+    expect(existsSync(join(dir, 'standalone-token'))).toBe(false)
   })
 
   it('repairs an existing token file to 0600 before reading it', () => {
@@ -140,9 +140,7 @@ describe('standalone web application', () => {
   it('loadOptions writes the data dir when token file is created', () => {
     const dir = join(tmpdir(), `dsh-standalone-mkdir-${Date.now()}`)
     expect(() => loadOptions(['--data-dir', dir])).not.toThrow()
-    // mkdirSync happened inside loadOptions for the token file.
-    const o = loadOptions(['--data-dir', dir, '--token', 'x'])
-    void o
+    expect(existsSync(join(dir, 'standalone-token'))).toBe(true)
     // Re-run on the existing dir is idempotent.
     expect(() => loadOptions(['--data-dir', dir])).not.toThrow()
   })

@@ -16,25 +16,17 @@
  *
  * 2. `settingsConfigModel()` — the CONFIG-01 dynamic model generated from
  *    `GET /v1/config/schema` (registry JSON Schema, leaf annotations
- *    x-dsh-scope / x-dsh-secret / x-dsh-security-floor / x-dsh-env /
+ *    x-dsh-key / x-dsh-scope / x-dsh-secret / x-dsh-security-floor / x-dsh-env /
  *    default / description) + `GET /v1/config/effective` (redacted
  *    plaintext + config_pin). One section per ConfigScope
  *    (global/project/job/runner-profile/orchestrator/kernel/standalone),
  *    every field carries the current (server-redacted) value, its scope,
- *    declared sources, secret/security-floor markers, hot-reload verdict,
- *    schema default and validation metadata. `sources`/`hot-reload` are NOT
- *    in the served schema (the registry does not emit them yet, CONFIG-01
- *    server untouched) — they are inferred here from scope + per-key
- *    overrides that mirror `packages/research-schemas/src/config-registry.ts`
- *    (tests/unit/settings-model.test.ts pins the inference to the REAL
- *    registry so the mirror can never drift).
- *
- *    The write path (PUT /v1/config or project-level PATCH) does not exist
- *    in this revision — `settingsConfigWrite()` reports read-only and the
- *    modal disables the submit button with the honest note ("经 CLI/env
- *    提供"). The local-validation and server-error-mapping machinery below
- *    is therefore built and unit-tested now and activates with the future
- *    /bff/research/config/* surface.
+ *    declared sources, secret/security-floor markers, allowed write layers,
+ *    authoritative hot/restart verdict, schema default and validation
+ *    metadata. These values are emitted by the canonical registry; the
+ *    browser has no metadata mirror or source-based inference. Generic
+ *    config, OCR and Runner editors submit the same strict Settings
+ *    transaction contract with exact revision CAS.
  *
  * Unit tests assert the group ids, default-collapsed contract, key parity
  * (zh/en dictionaries), every row/field key resolving, the schema→field
@@ -215,14 +207,14 @@ export interface SettingsEffectiveWire {
   config_pin?: string
   config?: Record<string, unknown>
   generated_at?: string
+  revisions?: { global: number; project: number | null; runtime: Record<string, number> }
 }
 
 /** Field value kinds the registry's zod subset can declare. */
 export type SettingsConfigKind = 'string' | 'number' | 'boolean' | 'enum' | 'unknown'
 
-/** Hot-reload verdict (docs note — the registry has no hot_reload marker
- *  yet; see settingsConfigReload for the documented inference rule). */
 export type SettingsConfigReload = 'hot' | 'restart'
+export type SettingsConfigWriteScope = 'global' | 'project' | 'runtime'
 
 /** One schema leaf projected into the Settings surface. */
 export interface SettingsConfigField {
@@ -250,9 +242,11 @@ export interface SettingsConfigField {
   securityFloor: boolean
   /** DSH_* env alias when the registry declares one. */
   env: string | undefined
-  /** Declared configuration sources (mirror of the registry `sources`). */
+  /** Declared configuration sources emitted by the registry. */
   sources: readonly string[]
-  /** Hot-reload verdict inferred from `sources`. */
+  /** Durable layers at which the field may be changed. */
+  writeScopes: readonly SettingsConfigWriteScope[]
+  /** Authoritative apply verdict emitted by the registry. */
   reload: SettingsConfigReload
   /** Raw registry description (wire text — displayed verbatim, §8 line 115). */
   description: string
@@ -277,72 +271,16 @@ export const SETTINGS_CONFIG_SCOPES = [
   'global', 'project', 'job', 'runner-profile', 'orchestrator', 'kernel', 'standalone',
 ] as const
 
-/**
- * Declared sources per scope — mirror of the registry's per-key `sources`
- * (config-registry.ts). Keys whose sources differ from their scope's common
- * set live in CONFIG_SOURCE_OVERRIDES; tests/unit/settings-model.test.ts
- * asserts the FULL mirror against the real registry (no drift possible).
- */
-const CONFIG_SOURCE_DEFAULTS: Readonly<Record<string, readonly string[]>> = {
-  global: ['file'],
-  project: ['http', 'ui', 'file'],
-  'runner-profile': ['cli', 'env', 'file'],
-  orchestrator: ['cli'],
-  kernel: ['cli', 'env', 'file'],
-  standalone: ['cli', 'file'],
-}
-
-const CONFIG_SOURCE_OVERRIDES: Readonly<Record<string, readonly string[]>> = {
-  'global.images_lock.path': ['env', 'file'],
-  'global.images_lock.node_fixture': ['file'],
-  'global.images_lock.texlive': ['file'],
-  'runner.network': ['file', 'http', 'ui'],
-  'runner.privileged': ['file', 'http', 'ui'],
-  'runner.docker_socket': ['file', 'http', 'ui'],
-  'orchestrator.kernel': ['cli', 'env', 'file'],
-  'orchestrator.db': ['cli', 'env', 'file'],
-  'orchestrator.poll_ms': ['cli', 'env', 'file'],
-  'orchestrator.token_file': ['cli', 'file'],
-  'kernel.require_signed_manifest': ['file', 'http', 'ui'],
-  'standalone.host': ['cli', 'env', 'file'],
-  'standalone.port': ['cli', 'env', 'file'],
-  'standalone.kernel_port': ['cli', 'env', 'file'],
-  'standalone.kernel_data_dir': ['cli', 'env', 'file'],
-  'standalone.data_dir': ['cli', 'env', 'file'],
-  'standalone.frame_ancestors': ['cli', 'env', 'file'],
-}
-
-/** Declared sources of one canonical key (scope default + per-key
- *  overrides). Mirrors config-registry.ts; pinned by the unit test. */
-export function settingsConfigSources(key: string, scope: string): readonly string[] {
-  return CONFIG_SOURCE_OVERRIDES[key] ?? CONFIG_SOURCE_DEFAULTS[scope] ?? []
-}
-
-/**
- * Hot-reload verdict inferred from the declared sources (documented rule —
- * the registry has no hot_reload marker in this revision): a key reachable
- * via HTTP/UI is read per request / per new object (project create, job
- * submit, manifest complete), so a change applies WITHOUT restarting a
- * binary → 'hot'; CLI/env/file-only keys are read at process start → the
- * owning binary must be restarted → 'restart'.
- */
-export function settingsConfigReload(sources: readonly string[]): SettingsConfigReload {
-  return sources.includes('http') || sources.includes('ui') ? 'hot' : 'restart'
-}
-
-/** The write surface for config keys. This revision ships NO write endpoint
- *  (the kernel serves only GET /v1/config/effective + GET /v1/config/schema;
- *  unknown config sub-resources 404) — the modal renders read-only with the
- *  honest note and disables the submit button. The future /bff/research/
- *  config/* surface flips `available` and wires the submit. */
+/** The single atomic endpoint shared by generated config, OCR and Runner
+ * editors. */
 export interface SettingsConfigWriteMode {
-  available: boolean
+  available: true
   noteKey: string
-  endpoint: string | undefined
+  endpoint: string
 }
 
 export function settingsConfigWrite(): SettingsConfigWriteMode {
-  return { available: false, noteKey: 'shell.settings.readonlyNote', endpoint: undefined }
+  return { available: true, noteKey: 'shell.settings.writeHint', endpoint: '/v1/settings/transactions' }
 }
 
 /** True when the effective pin changed since the previously seen pin (the
@@ -361,39 +299,21 @@ function schemaLeafKind(leaf: Record<string, unknown>): SettingsConfigKind {
   return 'unknown'
 }
 
-/** Scopes whose canonical keys are prefixed with the scope name itself
- *  (global.images_lock.* / orchestrator.* / kernel.* / standalone.*) — the
- *  registry strips that prefix when nesting the JSON Schema (config-registry
- *  generateJsonSchema: `segments[0] === def.scope ? slice(1) : segments`);
- *  the other scopes keep the full key inside the scope node (project →
- *  execution./integrity., runner-profile → runner.*). Mirrored here and
- *  pinned by tests/unit/settings-model.test.ts against the REAL registry so
- *  the reconstruction can never drift. */
-const SCOPE_PREFIXED_KEYS = new Set(['global', 'orchestrator', 'kernel', 'standalone'])
-
-/** Reconstruct the canonical dotted key from the schema path
- *  [scope, …inner] (inverse of generateJsonSchema's nesting rule). */
-function canonicalKeyFromSchemaPath(scope: string, path: readonly string[]): string {
-  const rest = path.slice(1).join('.')
-  return SCOPE_PREFIXED_KEYS.has(scope) ? `${scope}.${rest}` : rest
-}
-
-/** Collect the x-dsh-scope leaf nodes of the served JSON Schema (nested by
- *  scope/subgroup). */
+/** Collect canonical x-dsh-key leaf nodes from the served JSON Schema. The
+ * browser never reconstructs domain identifiers from presentation nesting. */
 function collectSchemaLeaves(
   node: Record<string, unknown>,
-  path: readonly string[],
   out: Array<{ key: string; leaf: Record<string, unknown> }>,
 ): void {
-  if (typeof node['x-dsh-scope'] === 'string') {
-    out.push({ key: canonicalKeyFromSchemaPath(node['x-dsh-scope'], path), leaf: node })
+  if (typeof node['x-dsh-scope'] === 'string' && typeof node['x-dsh-key'] === 'string') {
+    out.push({ key: node['x-dsh-key'], leaf: node })
     return
   }
   const props = node.properties
   if (typeof props !== 'object' || props === null) return
-  for (const [name, child] of Object.entries(props as Record<string, unknown>)) {
+  for (const child of Object.values(props as Record<string, unknown>)) {
     if (typeof child === 'object' && child !== null) {
-      collectSchemaLeaves(child as Record<string, unknown>, [...path, name], out)
+      collectSchemaLeaves(child as Record<string, unknown>, out)
     }
   }
 }
@@ -413,9 +333,9 @@ export function settingsConfigModel(
   const leaves: Array<{ key: string; leaf: Record<string, unknown> }> = []
   const props = schema.properties
   if (typeof props === 'object' && props !== null) {
-    for (const [scope, node] of Object.entries(props)) {
+    for (const node of Object.values(props)) {
       if (typeof node === 'object' && node !== null) {
-        collectSchemaLeaves(node as Record<string, unknown>, [scope], leaves)
+        collectSchemaLeaves(node as Record<string, unknown>, leaves)
       }
     }
   }
@@ -424,7 +344,13 @@ export function settingsConfigModel(
   for (const scope of SETTINGS_CONFIG_SCOPES) byScope.set(scope, [])
   for (const { key, leaf } of leaves) {
     const scope = typeof leaf['x-dsh-scope'] === 'string' ? leaf['x-dsh-scope'] as string : ''
-    const sources = settingsConfigSources(key, scope)
+    const sources = Array.isArray(leaf['x-dsh-sources'])
+      ? leaf['x-dsh-sources'].filter((value): value is string => typeof value === 'string')
+      : []
+    const writeScopes = Array.isArray(leaf['x-dsh-write-scopes'])
+      ? leaf['x-dsh-write-scopes'].filter((value): value is SettingsConfigWriteScope =>
+        value === 'global' || value === 'project' || value === 'runtime')
+      : []
     const field: SettingsConfigField = {
       key,
       labelKey: `shell.settings.key.${key}`,
@@ -438,7 +364,8 @@ export function settingsConfigModel(
       securityFloor: leaf['x-dsh-security-floor'] === true,
       env: typeof leaf['x-dsh-env'] === 'string' ? leaf['x-dsh-env'] : undefined,
       sources,
-      reload: settingsConfigReload(sources),
+      writeScopes,
+      reload: leaf['x-dsh-apply'] === 'hot' ? 'hot' : 'restart',
       description: typeof leaf.description === 'string' ? leaf.description : '',
       minimum: typeof leaf.minimum === 'number' ? leaf.minimum : undefined,
       maximum: typeof leaf.maximum === 'number' ? leaf.maximum : undefined,
@@ -471,6 +398,105 @@ export function settingsSectionsForData(hasConfig: boolean): SettingsSectionDef[
   const all = settingsSections()
   if (!hasConfig) return all
   return all.filter(section => !section.rows.some(row => row.id.endsWith('.placeholder')))
+}
+
+export interface SettingsConfigWriteContext {
+  projectId?: string
+}
+
+export interface SettingsConfigTransactionInput {
+  operations: Array<{
+    kind: 'config'
+    scope: SettingsConfigWriteScope
+    scope_id: string
+    expected_revision: number
+    changes: Record<string, unknown>
+  }>
+}
+
+export class SettingsConfigInputError extends TypeError {
+  constructor(readonly key: string, readonly code: string) {
+    super(`invalid Settings value for ${key}: ${code}`)
+    this.name = 'SettingsConfigInputError'
+  }
+}
+
+/** Parse one generated control into the canonical JSON value. Secret fields
+ * accept strict SecretRef JSON metadata only; plaintext is never a valid
+ * browser Settings value. */
+export function settingsParseFieldValue(field: SettingsConfigField, raw: string): unknown {
+  const input = raw.trim()
+  if (field.secret) {
+    let parsed: unknown
+    try { parsed = JSON.parse(input) as unknown } catch { throw new TypeError('SecretRef must be JSON metadata') }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new TypeError('SecretRef must be an object')
+    const record = parsed as Record<string, unknown>
+    const keys = Object.keys(record)
+    if (keys.some(key => !['scheme', 'name', 'version', 'scope'].includes(key))
+      || !['file', 'keyring', 'vault'].includes(String(record.scheme))
+      || typeof record.name !== 'string' || record.name.trim() === ''
+      || (record.version !== undefined && typeof record.version !== 'string')
+      || (record.scope !== undefined && typeof record.scope !== 'string')) {
+      throw new TypeError('SecretRef accepts only scheme, name, version and scope metadata')
+    }
+    return {
+      scheme: record.scheme,
+      name: record.name.trim(),
+      ...(record.version === undefined || record.version === '' ? {} : { version: record.version }),
+      ...(record.scope === undefined || record.scope === '' ? {} : { scope: record.scope }),
+    }
+  }
+  if (input === 'null' && field.default === null) return null
+  const error = validateSettingsField(field, input)
+  if (error !== null) throw new TypeError(error.code)
+  if (field.kind === 'number') return Number(input)
+  if (field.kind === 'boolean') return input === 'true'
+  if (field.kind === 'enum' || field.kind === 'string') return input
+  throw new TypeError(`config field ${field.key} has no editable control`)
+}
+
+/** Build one atomic multi-layer config transaction from dirty generated
+ * controls. Missing revisions/context and read-only fields fail closed. */
+export function settingsConfigTransaction(
+  fields: readonly SettingsConfigField[],
+  edits: ReadonlyMap<string, string>,
+  effective: SettingsEffectiveWire,
+  context: SettingsConfigWriteContext,
+): SettingsConfigTransactionInput {
+  const revisions = effective.revisions
+  if (revisions === undefined) throw new TypeError('config revisions are unavailable')
+  const groups = new Map<string, { scope: SettingsConfigWriteScope; scope_id: string; expected_revision: number; changes: Record<string, unknown> }>()
+  for (const [key, raw] of edits) {
+    const field = fields.find(candidate => candidate.key === key)
+    if (field === undefined) throw new TypeError(`unknown config field ${key}`)
+    if (field.writeScopes.length !== 1) throw new TypeError(`config field ${key} is not writable`)
+    const scope = field.writeScopes[0]!
+    const scopeId = scope === 'global' ? 'global' : scope === 'project' ? context.projectId : field.scope
+    const revision = scope === 'global' ? revisions.global : scope === 'project' ? revisions.project : revisions.runtime[scopeId ?? '']
+    if (scopeId === undefined || revision === null) throw new TypeError(`config ${scope} write context is unavailable`)
+    if (revision === undefined) throw new TypeError(`config ${scope}/${scopeId} revision is unavailable`)
+    const groupKey = `${scope}\u0000${scopeId}`
+    let group = groups.get(groupKey)
+    if (group === undefined) {
+      group = { scope, scope_id: scopeId, expected_revision: revision, changes: {} }
+      groups.set(groupKey, group)
+    }
+    if (group.scope_id !== scopeId) throw new TypeError(`config ${scope} write context is ambiguous`)
+    try {
+      group.changes[key] = settingsParseFieldValue(field, raw)
+    } catch (error) {
+      const knownCode = error instanceof TypeError && /^[a-z_]+$/.test(error.message)
+        ? error.message
+        : field.secret ? 'secret_ref_required' : 'validation_error'
+      throw new SettingsConfigInputError(key, knownCode)
+    }
+  }
+  const order: Readonly<Record<SettingsConfigWriteScope, number>> = { global: 0, project: 1, runtime: 2 }
+  return {
+    operations: [...groups.values()]
+      .sort((left, right) => order[left.scope] - order[right.scope] || left.scope_id.localeCompare(right.scope_id))
+      .map(group => ({ kind: 'config' as const, ...group })),
+  }
 }
 
 /* ── local validation + server-error mapping (write-path machinery) ────── */
@@ -534,12 +560,9 @@ export interface SettingsServerErrorMap {
   unmatched: SettingsServerFieldError[]
 }
 
-/** Map a kernel error envelope ({code, message}) onto Settings fields. The
- *  kernel envelope does not carry a structured key today — the canonical key
- *  is parsed from the registry's message shapes (`invalid value for config
- *  key X: …`, `unknown config key "X" (…)`, security-floor rules name the
- *  rule key at the message start). A future surface that sends
- *  `envelope.key` is honoured directly. */
+/** Map a kernel error envelope ({code, message, key}) onto Settings fields.
+ * The structured key is authoritative; display text is never parsed as a
+ * second protocol. */
 export function mapSettingsServerErrors(
   fields: readonly SettingsConfigField[],
   envelope: { code?: string; message?: string; key?: string },
@@ -549,23 +572,7 @@ export function mapSettingsServerErrors(
   const code = envelope.code ?? 'http_error'
   const message = envelope.message ?? ''
   const knownKeys = new Set(fields.map(f => f.key))
-  let key = envelope.key
-  if (key === undefined) {
-    // 'invalid value for config key X: …' / 'unknown config key "X" (…)'
-    const named = /config key\s*"?([A-Za-z0-9_.-]+)/.exec(message)
-    if (named !== null) key = named[1] ?? undefined
-    else if (code === 'security_floor_violation') {
-      // Security-floor messages name the rule key at the start
-      // (`runner.privileged=true is forbidden: …`); longest match wins.
-      let best: string | undefined
-      for (const candidate of knownKeys) {
-        if (message.startsWith(candidate) || message.startsWith(`${candidate}=`)) {
-          if (best === undefined || candidate.length > best.length) best = candidate
-        }
-      }
-      key = best
-    }
-  }
+  const key = envelope.key
   const entry = { key: key ?? '', code, message }
   if (key !== undefined && knownKeys.has(key)) byKey.set(key, entry)
   else unmatched.push(entry)

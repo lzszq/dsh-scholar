@@ -27,6 +27,18 @@ function fenceArgs(kernel: ResearchKernel, jobId: string): { lease_generation: n
   return { lease_generation: j.lease_generation, lease_token: j.lease_token }
 }
 
+function manifestIdentity(kernel: ResearchKernel, jobId: string): Record<string, unknown> {
+  const job = kernel.getJob(jobId)
+  return {
+    run_id: job.run_id,
+    job_id: job.job_id,
+    project_id: job.project_id,
+    contract_id: job.contract_id,
+    config_pin: job.payload.project_config_pin,
+    lease: { generation: job.lease_generation },
+  }
+}
+
 function makeBrief() {
   return {
     problem: 'p', scope: 's', questions: [], primary_metrics: ['m'],
@@ -362,9 +374,7 @@ describe('latex-compile chain (TEX-02)', () => {
         // §5 RUN-REMOTE-01: secure kinds 的 manifest 必须携带 claim 的 run_id
         // + metrics_artifact（local runner 对 latex-compile 同样注册 metrics
         // artifact——kernel verifySecureRunFacts 强制）。
-        run_id: kernel.getJob(job.job_id).run_id!,
-        job_id: job.job_id,
-        project_id: project.project_id,
+        ...manifestIdentity(kernel, job.job_id),
         exit_code: 0,
         metrics_artifact: log.artifact_id,
         container_digest: `docker:${kernel.getJob(job.job_id).image_digest}`,
@@ -399,7 +409,7 @@ describe('latex-compile chain (TEX-02)', () => {
       status: 'failed',
       failure_class: 'code_error',
       error: 'pdflatex halted on error',
-      run_manifest: { run_id: kernel.getJob(job2.job_id).run_id!, job_id: job2.job_id, project_id: project.project_id, exit_code: 1, tex_diagnostics: [{ level: 'error', message: 'halted' }] },
+      run_manifest: { ...manifestIdentity(kernel, job2.job_id), exit_code: 1, tex_diagnostics: [{ level: 'error', message: 'halted' }] },
     })
     expect(kernel.texGetBuild(build2.build_id).status).toBe('failed')
     kernel.close()

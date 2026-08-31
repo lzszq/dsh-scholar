@@ -74,7 +74,7 @@ Job exit 0 只代表 execution succeeded。只有持久化 Report 的所有 requ
 
 存储新增 reproduction_specs、reproduction_attempts、reproduction_reports 与 source/material links；Report 内容进入 CAS，行保存 hash/ref。所有 project/global ID 先解析 project 再 AuthZ。Plan/Contract approval、Report accepted promotion、clean-room/release Gate 为 Human/verifier 能力；Agent tool 不含 accept/decision。idempotency、revision、attempt generation、lease token 和 signed RunManifest 全部 fencing。
 
-RunManifest 必须补齐 project/spec/attempt、source commit + CodeSnapshot hash、data/image/environment pins、seed、requested/allocated resources、exit code 或 signal、timeout/cancel cause、output refs、runner key/signature。secret-free allowlisted argv 或 command digest进入 Manifest，原始敏感 payload 不进入 Bundle。
+RunManifest 必须补齐 project/spec/attempt、source commit + CodeSnapshot hash、data/image/environment pins（含 exact Project effective `config_pin`）、seed、requested/allocated resources、exit code 或 signal、timeout/cancel cause、output refs、runner key/signature和 lease generation。`config_pin` 必须与 Kernel 提交 Job 时固定的 `payload.project_config_pin` 逐字节一致；lease token、SecretRef 解引用值及其他凭据绝不进入 Manifest/Bundle，secret-free allowlisted argv 或 command digest 才能进入 Manifest。
 
 ## 5. UI、NextAction 与 i18n
 
@@ -86,7 +86,7 @@ NextAction code 至少包括 `reproduction_materials_collect`、`reproduction_pl
 
 ## 6. Session-scoped Terminal
 
-每个权威 Operator/Research/Chat/Subagent session 可绑定零到多个 PTY；Terminal 不是 project 级单例。`PtySession` 增加 server-derived context_kind（operator/research/chat/subagent）、context_id、purpose 和 parent_session_id；客户端不可伪造任意 child/session。服务端提供按 project/context 列表、open/attach/detach/close，所有 control/frame/stream 携带 expected generation 并校验 owner、lease expiry、generation 和 exact-parent capability。
+每个权威 Research/Chat/Subagent session 可绑定零到多个 PTY；Terminal 不是 project 级单例。`PtySession` 增加 server-derived context_kind（research/chat/subagent）、context_id、purpose 和 parent_session_id；客户端不可伪造任意 child/session，也不存在 Operator context 或 project fallback。服务端提供按 project/context 列表、open/attach/detach/close，所有 control/frame/stream 携带 expected generation 并校验 owner、lease expiry、generation 和 exact-parent capability。
 
 UI 为每个 context 保存 PTY 标签集合和 active PTY，支持 `#tab=pty&session=<pty_id>`；Chat/Topology 的“打开终端”只打开对应 context 的 PTY。切换 Chat/Subagent/项目不会复用旧输入目标。远端 PTY 使用同一 owner/generation/token/target fencing。Interactive PTY 永远不生成正式 Metrics/RunManifest/Evidence；正式论文复现输出只来自 Job/Run Terminal 与 output contract。
 
