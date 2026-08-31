@@ -624,7 +624,7 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
   /** run_id → 执行中句柄（cancel/wait 用）。 */
   private readonly inflight = new Map<string, { controller: AbortController; outcome: Promise<RunOutcome> }>()
   /** run_id → lease（spool gap frame 上报用；有界 10k 条 FIFO）。 */
-  private readonly leaseByRun = new Map<string, { owner: string; token: string | null; generation: number }>()
+  private readonly leaseByRun = new Map<string, { owner: string; token: string; generation: number }>()
   /**
    * run_id → 已完成/终局失败结果（resume 幂等：断连恢复后 poll 回放同一 claim
    * 时不重复执行；有界 10k 条 FIFO）。
@@ -1217,6 +1217,7 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
           project_id: plan.project_id,
           contract_id: plan.output_contract.contract_id,
           job_id: plan.job_id,
+          config_pin: plan.config_pin,
           command: plan.command,
           code_commit: plan.code_commit,
           code_snapshot_id: plan.snapshot.code_snapshot_id,
@@ -1231,7 +1232,7 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
         // 同上：log artifact id 内容寻址，spool 时仍可确定。
         ...{ log_artifact: finalized?.artifact_id ?? `sha256:${logSha256}` },
         ...metricsArtifactId !== undefined ? { metrics_artifact: metricsArtifactId } : {},
-        lease: { generation: fencing.generation, token: fencing.token },
+        lease: { generation: fencing.generation },
       }
       const finalManifest = this.signingKey !== undefined
         ? signManifest({ ...manifest, signed_by: fencing.owner }, this.signingKey)

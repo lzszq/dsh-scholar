@@ -89,8 +89,13 @@ function fakeSession(over: Partial<PtySessionWire> = {}): PtySessionWire {
     tenant_id: '',
     project_id: 'rsp_demo',
     workspace_id: 'ws_scratch_1',
-    profile: 'local',
-    target: 'local',
+    context_kind: 'chat',
+    context_id: 'chat_demo',
+    parent_session_id: 'dsh_session_demo',
+    label: 'Experiment shell',
+    purpose: 'inspect experiment',
+    profile: 'profile_local',
+    target: 'target_local_process_v1',
     preset: 'bash',
     cwd: '.',
     config_hash: 'sha256:' + 'a'.repeat(64),
@@ -130,11 +135,17 @@ function framesPage(over: Partial<PtyFramesPageWire> = {}): PtyFramesPageWire {
 /** Scriptable transport: queues of responses (null = auto-ok default). */
 class FakeTransport implements PtyTransport {
   openCalls: PtyOpenParams[] = []
+  attachCalls: Array<{ sessionId: string; lease: string; expectedGeneration: number }> = []
+  detachCalls: Array<{ sessionId: string; lease: string; expectedGeneration: number }> = []
+  closeCalls: Array<{ sessionId: string; lease: string; expectedGeneration: number }> = []
   controlCalls: Array<{ lease: string; frame: PtyControlFrame }> = []
-  framesCalls: Array<{ lease: string; afterSeq: number }> = []
+  framesCalls: Array<{ lease: string; afterSeq: number; expectedGeneration: number }> = []
   sessionCalls: string[] = []
 
   openQueue: Array<PtyResult<PtySessionWire>> = []
+  attachQueue: Array<PtyResult<PtySessionWire>> = []
+  detachQueue: Array<PtyResult<PtySessionWire>> = []
+  closeQueue: Array<PtyResult<PtySessionWire>> = []
   controlQueue: Array<PtyResult<{ delivered?: boolean; idempotent?: boolean }>> = []
   framesQueue: Array<PtyResult<PtyFramesPageWire>> = []
   sessionQueue: Array<PtyResult<PtySessionWire>> = []
@@ -147,12 +158,45 @@ class FakeTransport implements PtyTransport {
     this.openCalls.push(params)
     const next = this.openQueue.shift()
     if (next !== undefined) return next
-    this.currentSession = fakeSession({ project_id: params.project_id, workspace_id: params.workspace_id })
+    this.currentSession = fakeSession({ context_id: params.context_id, workspace_id: params.workspace_id, label: params.label, purpose: params.purpose ?? '' })
     this.serverClientSeq = 0
     return { ok: true, data: this.currentSession }
   }
 
-  async getSession(sessionId: string, _lease: string): Promise<PtyResult<PtySessionWire>> {
+  async attach(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
+    this.attachCalls.push({ sessionId, lease, expectedGeneration })
+    const next = this.attachQueue.shift()
+    if (next !== undefined) {
+      if (next.ok) this.currentSession = next.data
+      return next
+    }
+    this.currentSession = { ...this.currentSession, state: 'attached', generation: expectedGeneration + 1 }
+    return { ok: true, data: this.currentSession }
+  }
+
+  async detach(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
+    this.detachCalls.push({ sessionId, lease, expectedGeneration })
+    const next = this.detachQueue.shift()
+    if (next !== undefined) {
+      if (next.ok) this.currentSession = next.data
+      return next
+    }
+    this.currentSession = { ...this.currentSession, state: 'detached', generation: expectedGeneration + 1 }
+    return { ok: true, data: this.currentSession }
+  }
+
+  async close(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
+    this.closeCalls.push({ sessionId, lease, expectedGeneration })
+    const next = this.closeQueue.shift()
+    if (next !== undefined) {
+      if (next.ok) this.currentSession = next.data
+      return next
+    }
+    this.currentSession = { ...this.currentSession, state: 'closed', closed_at: new Date().toISOString(), close_reason: 'explicit' }
+    return { ok: true, data: this.currentSession }
+  }
+
+  async getSession(sessionId: string, _lease: string, _expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
     this.sessionCalls.push(sessionId)
     const next = this.sessionQueue.shift()
     if (next !== undefined) return next
@@ -170,9 +214,9 @@ class FakeTransport implements PtyTransport {
     return { ok: true, data: { delivered: true, idempotent: false } }
   }
 
-  async frames(sessionId: string, lease: string, afterSeq: number): Promise<PtyResult<PtyFramesPageWire>> {
+  async frames(sessionId: string, lease: string, afterSeq: number, expectedGeneration: number): Promise<PtyResult<PtyFramesPageWire>> {
     void sessionId
-    this.framesCalls.push({ lease, afterSeq })
+    this.framesCalls.push({ lease, afterSeq, expectedGeneration })
     const next = this.framesQueue.shift()
     if (next !== undefined) return next
     return { ok: true, data: framesPage({ pty_session_id: sessionId, after_seq: afterSeq }) }
@@ -190,10 +234,10 @@ function makeModel(transport: FakeTransport, over: Partial<ConstructorParameters
 }
 
 const OPEN_PARAMS: PtyOpenParams = {
-  project_id: 'rsp_demo',
+  context_id: 'chat_demo',
   workspace_id: 'ws_scratch_1',
-  profile: 'local',
-  target: 'local',
+  label: 'Experiment shell',
+  purpose: 'inspect experiment',
   preset: 'bash',
   cwd: 'scratch',
   cols: 80,
@@ -226,7 +270,7 @@ describe('PTY-01 client session state machine (pty-session-model)', () => {
     expect(model.hasSession).toBe(true)
     expect(model.sessionId).toMatch(/^pty_fake_/)
     expect(model.leaseToken).toMatch(/^lease_fake_/)
-    expect(model.generation).toBe(1)
+    expect(model.generation).toBe(2)
     expect(model.clientSeq).toBe(0)
     expect(transport.openCalls).toHaveLength(1)
     // the first poll tick is scheduled after open
@@ -250,13 +294,13 @@ describe('PTY-01 client session state machine (pty-session-model)', () => {
   it('open → detached (wire down, process alive) → reconnect resumes open', async () => {
     const t = new FakeTransport()
     const { model, scheduler } = await openModel(t)
-    model.detach()
+    await model.detach()
     expect(model.state).toBe('detached')
     expect(model.hasSession).toBe(true)
     // no poll timer while detached
     expect(scheduler.pending).toBe(0)
     // reconnect is refused on non-detached states
-    model.reconnect()
+    await model.reconnect()
     expect(model.state).toBe('open')
     expect(scheduler.pending).toBe(1)
   })
@@ -264,8 +308,7 @@ describe('PTY-01 client session state machine (pty-session-model)', () => {
   it('close control ack lands in closed with closeReason explicit', async () => {
     const t = new FakeTransport()
     const { model } = await openModel(t)
-    expect(model.close()).toBe(true)
-    await flush()
+    expect(await model.close()).toBe(true)
     expect(model.state).toBe('closed')
     expect(model.closeReason).toBe('explicit')
     expect(model.hasSession).toBe(true) // the row stays for audit
@@ -274,28 +317,27 @@ describe('PTY-01 client session state machine (pty-session-model)', () => {
   it('controls are rejected when the session is closed', async () => {
     const t = new FakeTransport()
     const { model } = await openModel(t)
-    model.close()
-    await flush()
+    await model.close()
     expect(model.state).toBe('closed')
     expect(model.sendText('ls\n')).toBe(false)
     expect(model.signal('INT')).toBe(false)
     expect(model.resize(100, 40)).toBe(false)
-    expect(model.close()).toBe(false)
-    expect(t.controlCalls).toHaveLength(1) // only the close frame ever went out
+    expect(await model.close()).toBe(false)
+    expect(t.closeCalls).toHaveLength(1)
+    expect(t.controlCalls).toHaveLength(0)
   })
 
   it('reopen after close creates a NEW session (new generation period)', async () => {
     const t = new FakeTransport()
     const { model } = await openModel(t)
-    model.close()
-    await flush()
+    await model.close()
     expect(model.state).toBe('closed')
     const firstId = model.sessionId
     const ok = await model.reopen()
     expect(ok).toBe(true)
     expect(model.state).toBe('open')
     expect(model.sessionId).not.toBe(firstId)
-    expect(model.generation).toBe(1)
+    expect(model.generation).toBe(2)
     expect(model.serverSeq).toBe(0)
   })
 
@@ -581,35 +623,36 @@ describe('PTY-01 client detach/reconnect (generation 语义, after_seq 重放)',
     scheduler.runOnce()
     await flush()
     expect(model.serverSeq).toBe(1)
-    model.detach()
+    await model.detach()
     const callsBefore = t.framesCalls.length
     scheduler.runOnce()
     await flush()
     expect(t.framesCalls.length).toBe(callsBefore) // no polls while detached
-    model.reconnect()
+    await model.reconnect()
     expect(model.state).toBe('open')
     scheduler.runOnce()
     await flush()
     expect(t.framesCalls.at(-1)!.afterSeq).toBe(1) // replayed from the cursor
   })
 
-  it('generation bump during session refresh surfaces the new-period notice', async () => {
+  it('unexpected generation change during refresh fails closed', async () => {
     const t = new FakeTransport()
     const { model, scheduler } = await openModel(t, { sessionRefreshEvery: 1 })
-    t.sessionQueue = [{ ok: true, data: fakeSession({ generation: 2, state: 'attached' }) }]
-    scheduler.runOnce() // frames poll → then refreshSession reads generation 2
+    t.sessionQueue = [{ ok: true, data: fakeSession({ generation: 3, state: 'attached' }) }]
+    scheduler.runOnce() // frames poll → then refreshSession reads generation 3
     await flush()
     expect(model.generation).toBe(2)
-    expect(model.generationChanged).toBe(true)
+    expect(model.state).toBe('error')
+    expect(model.lastError?.code).toBe('pty_generation_stale')
     const view = ptyStatusView(model)
-    expect(view.noticeText).toContain('2')
+    expect(view.errorText).toBe(ptyEn['pty.error.generation'])
     expect(missing).toEqual([])
   })
 
   it('server-side close (idle TTL) detected by the session refresh → closed + notice', async () => {
     const t = new FakeTransport()
     const { model, scheduler } = await openModel(t, { sessionRefreshEvery: 1 })
-    t.sessionQueue = [{ ok: true, data: fakeSession({ state: 'closed', close_reason: 'idle_ttl', idle_ttl_s: 900 }) }]
+    t.sessionQueue = [{ ok: true, data: fakeSession({ generation: 2, state: 'closed', close_reason: 'idle_ttl', idle_ttl_s: 900 }) }]
     scheduler.runOnce()
     await flush()
     expect(model.state).toBe('closed')
@@ -625,7 +668,7 @@ describe('PTY-01 client detach/reconnect (generation 语义, after_seq 重放)',
   it('lease expiry close (lease_expired reason) maps to the reopen prompt', async () => {
     const t = new FakeTransport()
     const { model, scheduler } = await openModel(t, { sessionRefreshEvery: 1 })
-    t.sessionQueue = [{ ok: true, data: fakeSession({ state: 'closed', close_reason: 'lease_expired' }) }]
+    t.sessionQueue = [{ ok: true, data: fakeSession({ generation: 2, state: 'closed', close_reason: 'lease_expired' }) }]
     scheduler.runOnce()
     await flush()
     expect(model.state).toBe('closed')
@@ -830,8 +873,8 @@ function sse(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
 }
 
-function streamUrl(sessionId: string, afterSeq: number): string {
-  return `/v1/pty/sessions/${encodeURIComponent(sessionId)}/frames/stream?after_seq=${afterSeq}`
+function streamUrl(sessionId: string, afterSeq: number, expectedGeneration = 2): string {
+  return `/v1/pty/sessions/${encodeURIComponent(sessionId)}/frames/stream?after_seq=${afterSeq}&expected_generation=${expectedGeneration}`
 }
 
 /** Open a model wired to a mock SSE stream transport (the session id is
@@ -995,18 +1038,18 @@ describe('PTY-01 client SSE frames stream (frames/stream — client/sse-client.t
     stream.push(sse('frame', { server_seq: 1, type: 'output', payload: { text: 'one\n', byte_length: 4, channel: 'stdout' } }))
     await flush()
     expect(model.serverSeq).toBe(1)
-    model.detach()
+    await model.detach()
     expect(model.state).toBe('detached')
     expect(model.streamStatus).toBe('closed')
     const callsBefore = fm.calls.length
     scheduler.runOnce()
     await flush()
     expect(fm.calls.length).toBe(callsBefore) // no stream fetches while detached
-    model.reconnect()
+    const stream2 = fm.enqueueStream(streamUrl(sessionId, 1, 4))
+    await model.reconnect()
     expect(model.state).toBe('open')
-    const stream2 = fm.enqueueStream(streamUrl(sessionId, 1))
     await flush()
-    expect(fm.calls.at(-1)!.url).toBe(streamUrl(sessionId, 1))
+    expect(fm.calls.at(-1)!.url).toBe(streamUrl(sessionId, 1, 4))
     stream2.push(sse('frame', { server_seq: 2, type: 'output', payload: { text: 'two\n', byte_length: 4, channel: 'stdout' } }))
     await flush()
     expect(model.serverSeq).toBe(2)

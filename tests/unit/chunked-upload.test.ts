@@ -24,10 +24,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ResearchKernel, KernelError } from '@dsh-scholar/research-kernel'
 import { startKernelServer } from '../../packages/research-kernel/lib/server.js'
-import type { UploadQueueItem, UploadTransport } from '../../packages/dsh-research-ui/src/client/chunked-upload'
+import type {
+  UploadBeginRequest, UploadBeginResult, UploadQueueItem, UploadTransport,
+} from '../../packages/dsh-research-ui/src/client/chunked-upload'
 import {
-  applyAppendResult, chatAttachmentRef, driveUpload, enqueueFiles, markHashed, markUploading,
-  browserTransport, nextChunkRange, pauseItem, queueSummary, resumeItem, retryItem,
+  chatAttachmentRef, driveUpload, enqueueFiles, markHashed, markUploading,
+  browserTransport, nextChunkRange, pauseItem, queueSummary, resumeItem, retryItem, uploadFailure,
 } from '../../packages/dsh-research-ui/src/client/chunked-upload'
 
 function freshKernel(): ResearchKernel {
@@ -37,6 +39,25 @@ function freshKernel(): ResearchKernel {
 
 function sha256(content: Uint8Array | string): string {
   return createHash('sha256').update(content).digest('hex')
+}
+
+function beginResult(
+  input: UploadBeginRequest,
+  uploadId: string,
+  committedOffset = 0,
+  chunkSize = input.chunk_size ?? 8 * 1024 * 1024,
+): UploadBeginResult {
+  return {
+    upload_id: uploadId,
+    intake_id: input.intake_id,
+    project_id: input.project_id,
+    file_name: input.file_name,
+    media_type: input.media_type,
+    expected_size: input.expected_size,
+    expected_sha256: input.expected_sha256 ?? null,
+    chunk_size: chunkSize,
+    committed_offset: committedOffset,
+  }
 }
 
 function expectKernelError(fn: () => unknown, status: number, code: string): void {
@@ -579,6 +600,111 @@ describe('CHUNK-01 abort + GC', () => {
 })
 
 describe('CHUNK-01 browser recovery projection', () => {
+  it('rejects malformed successful begin and append responses with a stable protocol failure', async () => {
+    const responses = [
+      new Response(JSON.stringify({ upload_id: 'upl-bad' }), { status: 200 }),
+      new Response(JSON.stringify({ committed_offset: '4', replayed: false }), { status: 200 }),
+    ]
+    const transport = browserTransport({
+      baseImpl: () => 'https://scholar.invalid',
+      authHeadersImpl: async () => ({}),
+      csrfImpl: async () => undefined,
+      fetchImpl: async () => responses.shift()!,
+    })
+
+    await expect(transport.beginSession({
+      project_id: 'project-a', intake_id: 'intake-1', file_name: 'paper.pdf',
+      media_type: 'application/pdf', expected_size: 4, expected_sha256: 'a'.repeat(64),
+    })).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+    await expect(transport.appendChunk({
+      project_id: 'project-a', intake_id: 'intake-1', upload_id: 'upl-1',
+      start: 0, end: 3, total: 4, bytes: new Uint8Array(4), sha256: 'a'.repeat(64),
+    })).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+  })
+
+  it('rejects invalid JSON and out-of-bounds successful offsets as protocol failures', async () => {
+    const identity = {
+      intake_id: 'intake-1', project_id: 'project-a', file_name: 'paper.pdf', media_type: 'application/pdf',
+      expected_size: 4, expected_sha256: 'a'.repeat(64),
+    }
+    const responses = [
+      new Response('{', { status: 200 }),
+      new Response(JSON.stringify({ ...identity, upload_id: 'upl-overflow', chunk_size: 4, committed_offset: 5 }), { status: 200 }),
+      new Response('{', { status: 200 }),
+    ]
+    const transport = browserTransport({
+      baseImpl: () => 'https://scholar.invalid',
+      authHeadersImpl: async () => ({}),
+      csrfImpl: async () => undefined,
+      fetchImpl: async () => responses.shift()!,
+    })
+    const begin = {
+      project_id: 'project-a', intake_id: 'intake-1', file_name: 'paper.pdf',
+      media_type: 'application/pdf', expected_size: 4, expected_sha256: 'a'.repeat(64),
+    }
+
+    await expect(transport.beginSession(begin)).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+    await expect(transport.beginSession(begin)).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+    await expect(transport.appendChunk({
+      project_id: 'project-a', intake_id: 'intake-1', upload_id: 'upl-1',
+      start: 0, end: 3, total: 4, bytes: new Uint8Array(4), sha256: 'a'.repeat(64),
+    })).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+  })
+
+  it('binds begin identity and accepts a valid replay beyond the retried range', async () => {
+    const responses = [
+      new Response(JSON.stringify({
+        upload_id: 'upl-ok', intake_id: 'intake-1', project_id: 'project-a',
+        file_name: 'paper.pdf', media_type: 'application/pdf', expected_size: 8,
+        expected_sha256: 'a'.repeat(64), chunk_size: 4, committed_offset: 0,
+      }), { status: 200 }),
+      new Response(JSON.stringify({ upload_id: 'upl-ok', committed_offset: 8, replayed: true }), { status: 200 }),
+    ]
+    const transport = browserTransport({
+      baseImpl: () => 'https://scholar.invalid', authHeadersImpl: async () => ({}),
+      csrfImpl: async () => undefined, fetchImpl: async () => responses.shift()!,
+    })
+
+    await expect(transport.beginSession({
+      project_id: 'project-a', intake_id: 'intake-1', file_name: 'paper.pdf',
+      media_type: 'application/pdf', expected_size: 8, expected_sha256: 'a'.repeat(64),
+    })).resolves.toMatchObject({ upload_id: 'upl-ok', committed_offset: 0 })
+    await expect(transport.appendChunk({
+      project_id: 'project-a', intake_id: 'intake-1', upload_id: 'upl-ok',
+      start: 0, end: 3, total: 8, bytes: new Uint8Array(4), sha256: 'a'.repeat(64),
+    })).resolves.toEqual({ upload_id: 'upl-ok', committed_offset: 8, replayed: true })
+  })
+
+  it('rejects complete 2xx responses whose begin or append identity is foreign', async () => {
+    const identity = {
+      upload_id: 'upl-ok', intake_id: 'intake-1', project_id: 'project-a',
+      file_name: 'paper.pdf', media_type: 'application/pdf', expected_size: 4,
+      expected_sha256: 'a'.repeat(64), chunk_size: 4, committed_offset: 0,
+    }
+    const responses = [
+      new Response(JSON.stringify({ ...identity, project_id: 'foreign-project' }), { status: 200 }),
+      new Response(JSON.stringify({ ...identity, intake_id: 'foreign-intake' }), { status: 200 }),
+      new Response(JSON.stringify({ ...identity, file_name: 'foreign.pdf' }), { status: 200 }),
+      new Response(JSON.stringify({ upload_id: 'upl-foreign', committed_offset: 4, replayed: false }), { status: 200 }),
+    ]
+    const transport = browserTransport({
+      baseImpl: () => 'https://scholar.invalid', authHeadersImpl: async () => ({}),
+      csrfImpl: async () => undefined, fetchImpl: async () => responses.shift()!,
+    })
+
+    const begin = {
+      project_id: 'project-a', intake_id: 'intake-1', file_name: 'paper.pdf',
+      media_type: 'application/pdf', expected_size: 4, expected_sha256: 'a'.repeat(64),
+    }
+    await expect(transport.beginSession(begin)).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+    await expect(transport.beginSession(begin)).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+    await expect(transport.beginSession(begin)).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+    await expect(transport.appendChunk({
+      project_id: 'project-a', intake_id: 'intake-1', upload_id: 'upl-ok',
+      start: 0, end: 3, total: 4, bytes: new Uint8Array(4), sha256: 'a'.repeat(64),
+    })).rejects.toMatchObject({ failure: { code: 'upload_protocol_invalid' } })
+  })
+
   it('keeps only bounded, internally consistent server sessions', async () => {
     const valid = {
       upload_id: 'upl-ok', intake_id: 'intake-1', file_name: 'paper.pdf', media_type: 'application/pdf',
@@ -738,19 +864,13 @@ describe('client queue model: per-file state machine + chunk ranges', () => {
     expect(nextChunkRange({ ...item, committedOffset: 10 }, 4)).toBeNull()
   })
 
-  it('applyAppendResult advances the committed offset (replayed keeps it)', () => {
-    const item = baseItem({ committedOffset: 4 })
-    expect(applyAppendResult(item, { committed_offset: 8, replayed: false }).committedOffset).toBe(8)
-    expect(applyAppendResult(item, { committed_offset: 4, replayed: true }).committedOffset).toBe(4)
-  })
-
   it('pause/resume/retry transitions only from legal states', () => {
     const uploading = baseItem({ state: 'uploading', uploadId: 'upl_1' })
     expect(pauseItem(uploading).state).toBe('paused')
     expect(pauseItem(baseItem({ state: 'ready' })).state).toBe('ready')
     const resumed = resumeItem(pauseItem(uploading))
     expect(resumed.state).toBe('uploading')
-    const failed = { ...uploading, state: 'failed' as const, lastError: 'boom' }
+    const failed = { ...uploading, state: 'failed' as const, lastError: uploadFailure('upload_failed') }
     const retried = retryItem(failed)
     expect(retried.state).toBe('uploading') // session kept → resume from committed offset
     expect(retried.retryCount).toBe(1)
@@ -794,7 +914,7 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
       async beginSession(input) {
         const session: FakeSession = { upload_id: `upl_${state.sessions.length + 1}`, chunks: [], finalized: false }
         state.sessions.push(session)
-        return { upload_id: session.upload_id, chunk_size: input.chunk_size ?? 8 * 1024 * 1024, committed_offset: 0 }
+        return beginResult(input, session.upload_id)
       },
       async appendChunk(input) {
         if (state.failAppends > 0) {
@@ -803,7 +923,7 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
         }
         const session = state.sessions.find(s => s.upload_id === input.upload_id)!
         session.chunks.push({ start: input.start, bytes: input.bytes, sha256: input.sha256 })
-        return { committed_offset: input.end + 1, replayed: false }
+        return { upload_id: input.upload_id, committed_offset: input.end + 1, replayed: false }
       },
       async finalize(input) {
         const session = state.sessions.find(s => s.upload_id === input.upload_id)!
@@ -853,7 +973,124 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
     const final2 = await driveUpload(item2, fakeTransport(state2), { chunkSize: 4, maxRetries: 2, readBytes: async (_f, s, e) => file.subarray(s, e + 1) })
     expect(final2.state).toBe('failed')
     expect(final2.retryCount).toBe(0)
-    expect(final2.lastError).toContain('network blip')
+    expect(final2.lastError).toEqual({ code: 'upload_chunk_failed' })
+  })
+
+  it('converts browser chunk-read failures into a stable failed queue state', async () => {
+    const item = markHashed(baseItem({ fileSize: 4 }), sha256('data'))
+    const state: { sessions: FakeSession[]; failAppends: number } = { sessions: [], failAppends: 0 }
+
+    const result = await driveUpload(item, fakeTransport(state), {
+      chunkSize: 4,
+      readBytes: async () => { throw new Error('raw browser read failure') },
+    })
+
+    expect(result).toMatchObject({ state: 'failed', lastError: { code: 'upload_chunk_failed' } })
+    expect(state.sessions[0]?.chunks).toEqual([])
+  })
+
+  it('stops instead of repeating a chunk when the server offset regresses', async () => {
+    const file = Buffer.from('01234567')
+    const item = markHashed(baseItem({ fileSize: 8, committedOffset: 4, uploadId: 'upl-1' }), sha256(file))
+    let appends = 0
+    const transport: UploadTransport = {
+      async beginSession() { throw new Error('existing upload must not begin') },
+      async appendChunk(input) { appends += 1; return { upload_id: input.upload_id, committed_offset: 3, replayed: false } },
+      async finalize() { throw new Error('regressed upload must not finalize') },
+      async abort() {},
+    }
+
+    const result = await driveUpload(item, transport, {
+      chunkSize: 4,
+      readBytes: async (_fileId, start, end) => file.subarray(start, end + 1),
+    })
+
+    expect(result).toMatchObject({ state: 'failed', lastError: { code: 'upload_offset_regressed' } })
+    expect(appends).toBe(1)
+  })
+
+  it('accepts a replayed authoritative offset beyond the requested old range', async () => {
+    const file = Buffer.from('01234567')
+    const item = markHashed(baseItem({ fileSize: 8, uploadId: 'upl-1' }), sha256(file))
+    let appends = 0
+    let finalized = false
+    const transport: UploadTransport = {
+      async beginSession() { throw new Error('existing upload must not begin') },
+      async appendChunk(input) {
+        appends += 1
+        return { upload_id: input.upload_id, committed_offset: 8, replayed: true }
+      },
+      async finalize() { finalized = true },
+      async abort() {},
+    }
+
+    const result = await driveUpload(item, transport, {
+      chunkSize: 4,
+      readBytes: async (_fileId, start, end) => file.subarray(start, end + 1),
+    })
+
+    expect(result).toMatchObject({ state: 'scanning', committedOffset: 8 })
+    expect(appends).toBe(1)
+    expect(finalized).toBe(true)
+  })
+
+  it('does not retry an injected successful append response with a foreign identity', async () => {
+    const file = Buffer.from('0123')
+    const item = markHashed(baseItem({ fileSize: 4, uploadId: 'upl-1' }), sha256(file))
+    let appends = 0
+    const transport: UploadTransport = {
+      async beginSession() { throw new Error('existing upload must not begin') },
+      async appendChunk(input) {
+        appends += 1
+        return { upload_id: 'upl-foreign', committed_offset: input.end + 1, replayed: false }
+      },
+      async finalize() { throw new Error('invalid response must not finalize') },
+      async abort() {},
+    }
+
+    const result = await driveUpload(item, transport, {
+      maxRetries: 3,
+      readBytes: async () => file,
+    })
+
+    expect(result).toMatchObject({ state: 'failed', lastError: { code: 'upload_protocol_invalid' } })
+    expect(appends).toBe(1)
+  })
+
+  it('resumes from a validated begin offset and rejects malformed injected begin data', async () => {
+    const file = Buffer.from('01234567')
+    const item = markHashed(baseItem({ fileSize: 8 }), sha256(file))
+    const starts: number[] = []
+    const transport: UploadTransport = {
+      async beginSession(input) { return beginResult(input, 'upl-resume', 4, 4) },
+      async appendChunk(input) {
+        starts.push(input.start)
+        return { upload_id: input.upload_id, committed_offset: input.end + 1, replayed: false }
+      },
+      async finalize() {},
+      async abort() {},
+    }
+    const resumed = await driveUpload(item, transport, {
+      readBytes: async (_id, start, end) => file.subarray(start, end + 1),
+    })
+    expect(resumed.state).toBe('scanning')
+    expect(starts).toEqual([4])
+
+    const malformed: UploadTransport = {
+      ...transport,
+      async beginSession(input) { return beginResult(input, '', 0, 4) },
+    }
+    await expect(driveUpload(item, malformed, {
+      readBytes: async (_id, start, end) => file.subarray(start, end + 1),
+    })).resolves.toMatchObject({ state: 'failed', lastError: { code: 'upload_protocol_invalid' } })
+
+    const foreign: UploadTransport = {
+      ...transport,
+      async beginSession(input) { return { ...beginResult(input, 'upl-foreign', 0, 4), project_id: 'foreign-project' } },
+    }
+    await expect(driveUpload(item, foreign, {
+      readBytes: async (_id, start, end) => file.subarray(start, end + 1),
+    })).resolves.toMatchObject({ state: 'failed', lastError: { code: 'upload_protocol_invalid' } })
   })
 
   it('shouldContinue=false pauses mid-upload; resume continues from the committed offset', async () => {
@@ -883,12 +1120,12 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
     const file = Buffer.from('01234567')
     const item = markHashed(baseItem({ fileSize: 8 }), sha256(file))
     let paused = false
-    let releaseAppend: ((result: { committed_offset: number; replayed: boolean }) => void) | undefined
+    let releaseAppend: ((result: { upload_id: string; committed_offset: number; replayed: boolean }) => void) | undefined
     let signalAppendStarted: (() => void) | undefined
     const appendStarted = new Promise<void>(resolve => { signalAppendStarted = resolve })
     let appends = 0
     const transport: UploadTransport = {
-      async beginSession() { return { upload_id: 'upl_1', chunk_size: 4, committed_offset: 0 } },
+      async beginSession(input) { return beginResult(input, 'upl_1', 0, 4) },
       appendChunk() {
         appends += 1
         signalAppendStarted?.()
@@ -904,7 +1141,7 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
     })
     await appendStarted
     paused = true
-    releaseAppend!({ committed_offset: 4, replayed: false })
+    releaseAppend!({ upload_id: 'upl_1', committed_offset: 4, replayed: false })
     const result = await pending
 
     expect(result).toMatchObject({ state: 'paused', committedOffset: 4 })
@@ -916,11 +1153,11 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
     const item = markHashed(baseItem({ fileSize: file.byteLength }), sha256(file))
     const ranges: Array<[number, number]> = []
     const transport: UploadTransport = {
-      async beginSession() { return { upload_id: 'upl_1', chunk_size: 3, committed_offset: 0 } },
+      async beginSession(input) { return beginResult(input, 'upl_1', 0, 3) },
       async appendChunk(input) {
         ranges.push([input.start, input.end])
         expect(input.bytes.byteLength).toBeLessThanOrEqual(3)
-        return { committed_offset: input.end + 1, replayed: false }
+        return { upload_id: input.upload_id, committed_offset: input.end + 1, replayed: false }
       },
       async finalize() {},
       async abort() {},
@@ -940,10 +1177,14 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
     const item = markHashed(baseItem({ fileSize: file.byteLength }), sha256(file))
     let paused = false
     let acceptState = true
-    let releaseBegin: ((session: { upload_id: string; chunk_size: number; committed_offset: number }) => void) | undefined
+    let releaseBegin: ((session: UploadBeginResult) => void) | undefined
+    let beginInput: UploadBeginRequest | undefined
     const aborted: string[] = []
     const transport: UploadTransport = {
-      beginSession: () => new Promise(resolve => { releaseBegin = resolve }),
+      beginSession: input => {
+        beginInput = input
+        return new Promise(resolve => { releaseBegin = resolve })
+      },
       async appendChunk() { throw new Error('must not append while paused') },
       async finalize() { throw new Error('must not finalize while paused') },
       async abort(input) { aborted.push(input.upload_id) },
@@ -954,7 +1195,7 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
       onState: () => acceptState,
     })
     paused = true
-    releaseBegin!({ upload_id: 'upl-paused', chunk_size: 2, committed_offset: 0 })
+    releaseBegin!(beginResult(beginInput!, 'upl-paused', 0, 2))
     await expect(pending).resolves.toMatchObject({ state: 'paused', uploadId: 'upl-paused', chunkSize: 2 })
     expect(aborted).toEqual([])
 
@@ -965,7 +1206,7 @@ describe('client driveUpload: full lifecycle with an injected fake transport', (
       shouldContinue: () => true,
       onState: () => acceptState,
     })
-    releaseBegin!({ upload_id: 'upl-orphan', chunk_size: 2, committed_offset: 0 })
+    releaseBegin!(beginResult(beginInput!, 'upl-orphan', 0, 2))
     await rejected
     expect(aborted).toEqual(['upl-orphan'])
   })

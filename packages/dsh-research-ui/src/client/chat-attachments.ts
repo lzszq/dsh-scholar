@@ -8,6 +8,11 @@ import {
   resumeItem,
   retryItem,
   sha256File,
+  uploadFailure,
+  UploadFailureError,
+  uploadFailureReason,
+  type UploadFailure,
+  type UploadFailureCode,
   type UploadQueueItem,
   type UploadSessionProjection,
 } from './chunked-upload'
@@ -23,7 +28,7 @@ import {
 import { el, rootHost, showToast } from './ui'
 import { chatAttachmentFlightStore } from './chat-attachment-flight'
 
-const UPLOAD_ERROR_KEYS: Readonly<Record<string, string>> = {
+const UPLOAD_ERROR_KEYS = {
   attachment_intake_unavailable: 'shell.chat.upload.intakeUnavailable',
   upload_file_hash_mismatch: 'shell.chat.upload.hashMismatch',
   upload_file_reselect_required: 'shell.chat.upload.reselectRequired',
@@ -31,12 +36,38 @@ const UPLOAD_ERROR_KEYS: Readonly<Record<string, string>> = {
   upload_session_unavailable: 'shell.chat.upload.sessionUnavailable',
   upload_session_aborted: 'shell.chat.upload.sessionAborted',
   upload_session_expired: 'shell.chat.upload.sessionExpired',
+  upload_begin_failed: 'shell.chat.upload.beginFailed',
+  upload_chunk_failed: 'shell.chat.upload.chunkFailed',
+  upload_finalize_failed: 'shell.chat.upload.finalizeFailed',
+  upload_abort_failed: 'shell.chat.upload.abortFailed',
+  upload_list_failed: 'shell.chat.upload.listFailed',
+  upload_protocol_invalid: 'shell.chat.upload.protocolInvalid',
+  upload_hash_failed: 'shell.chat.upload.hashFailed',
+  upload_hash_required: 'shell.chat.upload.hashRequired',
+  upload_hash_missing: 'shell.chat.upload.hashMissing',
+  upload_chunk_size_invalid: 'shell.chat.upload.chunkSizeInvalid',
+  upload_offset_regressed: 'shell.chat.upload.offsetRegressed',
+  upload_cancelled: 'shell.chat.upload.cancelled',
+  upload_quarantined: 'shell.chat.upload.quarantined',
+  upload_needs_input: 'shell.chat.upload.needsInput',
+  upload_scan_failed: 'shell.chat.upload.scanFailed',
+  upload_failed: 'shell.chat.upload.failed',
+} satisfies Readonly<Record<UploadFailureCode, string>>
+
+export function uploadErrorText(error: UploadFailure | null): string | null {
+  if (error === null) return null
+  const status = error.status === undefined
+    ? ''
+    : t('shell', 'shell.chat.upload.httpStatus', { status: String(error.status) })
+  return t('shell', UPLOAD_ERROR_KEYS[error.code], { status })
 }
 
-function uploadErrorText(error: string | null): string | null {
-  if (error === null) return null
-  const key = UPLOAD_ERROR_KEYS[error]
-  return key === undefined ? error : t('shell', key)
+export async function hashChatAttachmentFile(file: ChatUploadFile, signal?: AbortSignal): Promise<string> {
+  try {
+    return await sha256File(file, undefined, signal)
+  } catch (error) {
+    throw new UploadFailureError(uploadFailureReason(error, 'upload_hash_failed'))
+  }
 }
 
 export interface ChatAttachmentController {
@@ -297,7 +328,9 @@ export function createChatAttachmentController(options: {
     if (needsIntake && intakeId === null) {
       for (const item of items) {
         if (item.intakeId !== null) continue
-        chatUploadStore.update(projectId, sessionId, { ...item, state: 'failed', lastError: 'attachment_intake_unavailable' })
+        chatUploadStore.update(projectId, sessionId, {
+          ...item, state: 'failed', lastError: uploadFailure('attachment_intake_unavailable'),
+        })
       }
       showToast(rootHost(), t('shell', 'shell.chat.attachIntakeFailed'))
     }
@@ -309,18 +342,20 @@ export function createChatAttachmentController(options: {
       if (file === undefined) continue
       let hashed = item
       try {
-        const digest = await sha256File(file, undefined, signal)
+        const digest = await hashChatAttachmentFile(file, signal)
         if (!chatSessionExists(projectId, sessionId)) return
         if (item.expectedSha256 !== null && item.expectedSha256 !== digest) {
           chatUploadStore.update(projectId, sessionId, {
-            ...item, state: 'failed', lastError: 'upload_file_hash_mismatch',
+            ...item, state: 'failed', lastError: uploadFailure('upload_file_hash_mismatch'),
           })
           chatUploadStore.releaseBytes(projectId, sessionId, item.fileId)
           continue
         }
         hashed = markHashed(item, digest)
       } catch (error) {
-        chatUploadStore.update(projectId, sessionId, { ...item, state: 'failed', lastError: (error as Error).message })
+        chatUploadStore.update(projectId, sessionId, {
+          ...item, state: 'failed', lastError: uploadFailureReason(error, 'upload_hash_failed'),
+        })
         continue
       }
       hashed = { ...hashed, intakeId: itemIntakeId, projectId }
@@ -354,7 +389,9 @@ export function createChatAttachmentController(options: {
       let sessions: UploadSessionProjection[]
       try {
         sessions = await transport.listSessions({ project_id: projectId, intake_id: intakeId, signal })
-      } catch {
+      } catch (error) {
+        const failure = uploadFailureReason(error, 'upload_list_failed')
+        showToast(rootHost(), uploadErrorText(failure) ?? t('shell', 'shell.chat.upload.unknown'))
         continue
       }
       if (!chatSessionExists(projectId, sessionId)) return

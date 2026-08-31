@@ -129,6 +129,18 @@ function grillPrompt(projection: ProjectGrillProjection): string {
 /** Per-project guide cache: {projectId → loaded projection+status}. */
 let grillGuideCache: { projectId: string; loaded: GrillGuideLoaded } | null = null
 
+export function cachedGrillGuide(projectId: string): GrillGuideLoaded | null {
+  return grillGuideCache?.projectId === projectId ? grillGuideCache.loaded : null
+}
+
+export function clearCachedGrillGuide(projectId?: string): void {
+  if (projectId === undefined || grillGuideCache?.projectId === projectId) grillGuideCache = null
+}
+
+function cacheGrillGuide(projectId: string, loaded: GrillGuideLoaded): void {
+  grillGuideCache = { projectId, loaded }
+}
+
 /** Stable error-code copy: mapped key → t(), unmapped → verbatim code. */
 function grillErrorText(code: string | undefined, status: number): string {
   const key = grillErrorKey(code)
@@ -149,15 +161,15 @@ async function fillGrillConversationTurn(
   normalPlaceholder: string,
   onRendered: () => void,
 ): Promise<void> {
-  let loaded = grillGuideCache !== null && grillGuideCache.projectId === projectId ? grillGuideCache.loaded : null
+  let loaded = cachedGrillGuide(projectId)
   if (loaded === null) {
     loaded = await loadGrillGuideState((path) => api(path), projectId)
     if (loaded === null) {
       // Silent: Chat keeps working even when the Brief projection is absent.
-      if (grillGuideCache !== null && grillGuideCache.projectId === projectId) grillGuideCache = null
+      clearCachedGrillGuide(projectId)
       return
     }
-    grillGuideCache = { projectId, loaded }
+    cacheGrillGuide(projectId, loaded)
   }
   if (!host.isConnected) return // a panel refresh raced us — stale render
   renderGrillConversationTurn(host, projectId, sessionId, loaded, input, normalPlaceholder)
@@ -245,7 +257,7 @@ function renderGrillConversationTurn(
         error.style.display = 'block'
         return
       }
-      grillGuideCache = { projectId, loaded: { ...loaded, projection: res.data } }
+      cacheGrillGuide(projectId, { ...loaded, projection: res.data })
       chatPushToProjectSession(projectId, sessionId, {
         role: 'user',
         text: t('grill-guide', disposition === 'skipped' ? 'grill-guide.chatSkipped' : 'grill-guide.chatUnknown'),
@@ -294,7 +306,7 @@ function renderGrillConversationTurn(
         confirmError.style.display = 'block'
         return
       }
-      grillGuideCache = null
+      clearCachedGrillGuide()
       chatPushToProjectSession(projectId, sessionId, {
         role: 'assistant',
         text: t('intake', 'grill.confirmed', { gate: res.data.gate.gate_id }),
@@ -414,10 +426,7 @@ export async function executeChatTurn(
     if (!answered.ok || answered.data === null) {
       return { text: answered.ok ? t('intake', 'grill.answerFailed') : grillErrorText(answered.error.code, answered.status) }
     }
-    grillGuideCache = {
-      projectId: activeProjectId,
-      loaded: { projectStatus: 'collecting', projection: answered.data },
-    }
+    cacheGrillGuide(activeProjectId, { projectStatus: 'collecting', projection: answered.data })
     return { text: t('grill-guide', 'grill-guide.chatAnswerRecorded') }
   }
 
@@ -432,8 +441,10 @@ export async function executeChatTurn(
 
   let modelReply: ChatModelTurnReply | null = null
   let images: ScholarChatImage[] = []
+  let loadingImages = true
   try {
     images = await loadImages()
+    loadingImages = false
     const modelPayload: ChatModelTurnRequest = {
       sessionId: frozenContext.sessionId,
       text: input.text,
@@ -453,7 +464,7 @@ export async function executeChatTurn(
       : await chatModelTurn(modelPayload, { signal })
   } catch (error) {
     if (signal?.aborted === true) throw error
-    if (images.length > 0 || error instanceof ChatVisionInputError) {
+    if (loadingImages || images.length > 0 || error instanceof ChatVisionInputError) {
       const code = error instanceof ChatVisionError || error instanceof ChatVisionInputError ? error.code : 'vision_model_unavailable'
       const key = code === 'vision_model_required'
         ? 'shell.chat.vision.modelRequired'
@@ -523,6 +534,7 @@ export async function executeChatCommand(
     case 'new': {
       const name = parts[1] ?? ''
       if (name === '') return 'usage: /new <name>'
+      const originProjectId = state.projectId
       const created = await api<{ project?: { project_id?: string; name?: string; status?: string } }>('/v2/projects', {
         method: 'POST',
         headers: { 'idempotency-key': `chat-init-${crypto.randomUUID()}` },
@@ -530,12 +542,18 @@ export async function executeChatCommand(
       })
       const project = created?.project
       if (project == null || project.project_id === undefined) return 'create failed — kernel unreachable?'
+      // Creation belongs to the command's origin view. If the user has moved
+      // elsewhere while the POST was pending, keep that newer focus intact;
+      // the created project remains available from the authoritative list.
+      if (state.projectId !== originProjectId) {
+        return t('intake', 'grill.projectCreated', { id: project.project_id, name })
+      }
       state.projectId = project.project_id
       const grill = await api<ProjectGrillProjection>(`/v2/projects/${encodeURIComponent(project.project_id)}/grill`)
-      if (grill !== null) {
-        grillGuideCache = { projectId: project.project_id, loaded: { projectStatus: 'collecting', projection: grill } }
+      if (grill !== null && state.projectId === project.project_id) {
+        cacheGrillGuide(project.project_id, { projectStatus: 'collecting', projection: grill })
       }
-      void state.rerender()
+      if (state.projectId === project.project_id) void state.rerender()
       return t('intake', 'grill.projectCreated', { id: project.project_id, name })
     }
     case 'confirm-brief': {
@@ -552,7 +570,7 @@ export async function executeChatCommand(
           expected_intake_revision: current.intake_revision,
         }),
       })
-      if (result?.gate?.gate_id !== undefined) grillGuideCache = null
+      if (result?.gate?.gate_id !== undefined) clearCachedGrillGuide()
       return result?.gate?.gate_id === undefined
         ? t('intake', 'grill.confirmFailed')
         : t('intake', 'grill.confirmed', { gate: result.gate.gate_id })
@@ -569,8 +587,10 @@ export async function executeChatCommand(
       if (p === null || p.project === undefined) return `project ${id} not found`
       const pending = (p.pending_gates ?? []).map(g => `- ${g.type} gate ${g.gate_id}: ${g.title} (${g.status})`).join('\n') || 'none'
       const jobs = (p.jobs ?? []).slice(-5).map(j => `- ${j.job_id} [${j.kind}] ${j.status}`).join('\n') || 'none'
+      const next = (p.next_actions_v2 ?? []).filter(action => action.state !== 'done')
+        .map(action => `- ${action.label ?? action.code ?? 'unknown'}`).join('\n') || 'none'
       return `**${p.project.name}** (\`${id}\`) — phase \`${p.project.status}\` rev ${p.project.revision ?? 0}\n\n`
-        + `Next actions:\n${(p.next_actions ?? []).map(a => `- ${a}`).join('\n') || 'none'}\n\n`
+        + `Next actions:\n${next}\n\n`
         + `Pending gates:\n${pending}\n\n`
         + `Recent jobs:\n${jobs}\n\n`
         + `Budget: $${p.budget?.model_cost_usd ?? 0} / ${p.project.constraints?.max_model_cost_usd ?? '∞'} max, `

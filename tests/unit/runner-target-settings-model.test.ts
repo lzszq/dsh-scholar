@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 import {
   runnerTargetRuntimeDraft,
   runnerTargetRuntimePayload,
+  runnerTargetSettingsOperation,
   runnerTargetSecretRefDraft,
   runnerTargetSecretRefPayload,
 } from '../../packages/dsh-research-ui/src/client/runner-target-settings-model'
@@ -71,5 +72,19 @@ describe('runner target Settings SecretRef model', () => {
       .toEqual({ ok: false, error: 'devices' })
     expect(runnerTargetRuntimePayload('local-docker', { imageDigest: digest, computeMode: 'nvidia', devices: '--privileged' }))
       .toEqual({ ok: false, error: 'devices' })
+  })
+
+  it('wraps create/update in the shared atomic Settings transaction operation', () => {
+    const serviceIdentity = { scheme: 'file' as const, name: 'runner-targets/gpu.token' }
+    expect(runnerTargetSettingsOperation({
+      action: 'create',
+      input: {
+        target_id: 'gpu', display_name: 'GPU', kind: 'local-docker', service_identity: serviceIdentity,
+        capabilities: [], enabled: true, draining: false,
+      },
+    })).toMatchObject({ kind: 'runner-target', action: 'create', input: { target_id: 'gpu' } })
+    expect(runnerTargetSettingsOperation({
+      action: 'update', target_id: 'gpu', patch: { expected_revision: 2, draining: true },
+    })).toEqual({ kind: 'runner-target', action: 'update', target_id: 'gpu', patch: { expected_revision: 2, draining: true } })
   })
 })

@@ -170,7 +170,7 @@ RGSTATUS=$(api "http://127.0.0.1:$PORT/v1/projects/$PROJ/gates" | node -e "let d
 
 say "11. projection shows the full lifecycle"
 PROJSTATUS=$(api "http://127.0.0.1:$PORT/v1/projects/$PROJ/projection" | jqfield "project.status")
-NEXT=$(api "http://127.0.0.1:$PORT/v1/projects/$PROJ/projection" | jqfield "next_actions.length")
+NEXT=$(api "http://127.0.0.1:$PORT/v1/projects/$PROJ/projection" | jqfield "next_actions_v2.length")
 EVENTS=$(api "http://127.0.0.1:$PORT/v1/projects/$PROJ/events" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).length))")
 [[ "$PROJSTATUS" == "REVIEWING" && "$EVENTS" -ge 10 ]] && ok "project $PROJ in $PROJSTATUS with $EVENTS ledger events, $NEXT next actions" || bad "status=$PROJSTATUS events=$EVENTS"
 

@@ -154,7 +154,9 @@ describe('writing assurance execution', () => {
       })
       kernel.db.prepare("UPDATE projects SET status = 'WRITING', revision = 4 WHERE project_id = ?").run(project.project_id)
       kernel.registerArtifact({ project_id: project.project_id, kind: 'paper', content: '# Draft' })
-      kernel.linkSession('session_semantic', project.project_id)
+      kernel.linkSession('session_semantic', project.project_id, {
+        principal_id: 'pi-assurance', tenant_id: '', issuer: 'kernel',
+      })
       const action = kernel.projectProjection(project.project_id).next_actions_v2[0]!
       const receipt = AssuranceSemanticReviewReceipt.parse({
         panel_id: 'panel_missing_provider',
@@ -214,7 +216,9 @@ describe('writing assurance execution', () => {
       })
       kernel.db.prepare("UPDATE projects SET status = 'WRITING', revision = 2 WHERE project_id = ?").run(project.project_id)
       kernel.registerArtifact({ project_id: project.project_id, kind: 'paper', content: '# Draft' })
-      kernel.linkSession('session_semantic', project.project_id)
+      kernel.linkSession('session_semantic', project.project_id, {
+        principal_id: 'pi-assurance', tenant_id: '', issuer: 'kernel',
+      })
       kernel.registerChildLink({
         project_id: project.project_id,
         child_id: 'child_wrong_role',
@@ -270,7 +274,9 @@ describe('writing assurance execution', () => {
       })
       kernel.db.prepare("UPDATE projects SET status = 'WRITING', revision = 3 WHERE project_id = ?").run(project.project_id)
       kernel.registerArtifact({ project_id: project.project_id, kind: 'paper', content: '# Draft' })
-      kernel.linkSession('session_semantic', project.project_id)
+      kernel.linkSession('session_semantic', project.project_id, {
+        principal_id: 'pi-assurance', tenant_id: '', issuer: 'kernel',
+      })
       kernel.registerChildLink({
         project_id: project.project_id, child_id: 'child_identity_missing', parent_id: 'session_semantic',
         mode: 'one-shot', role: 'reviewer', state: 'succeeded',
@@ -309,7 +315,9 @@ describe('writing assurance execution', () => {
       })
       kernel.db.prepare("UPDATE projects SET status = 'WRITING', revision = 3 WHERE project_id = ?").run(project.project_id)
       kernel.registerArtifact({ project_id: project.project_id, kind: 'paper', content: '# Draft' })
-      kernel.linkSession('session_semantic', project.project_id)
+      kernel.linkSession('session_semantic', project.project_id, {
+        principal_id: 'pi-assurance', tenant_id: '', issuer: 'kernel',
+      })
       kernel.registerChildLink({
         project_id: project.project_id,
         child_id: 'child_reviewer_ok',

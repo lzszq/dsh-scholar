@@ -5,10 +5,9 @@
  * `nextActionProjection` is a PURE function of the project's authoritative
  * state: it never reads the database, never throws, and deterministically
  * derives one action set per (status, gates, jobs, budget, contracts,
- * ideas, evidence, claims). The Kernel calls it from `projectProjection`
- * and also derives the legacy `next_actions: string[]` from the structured
- * labels so old UI/API consumers keep working (GUIDE-01 "legacy unknown
- * 安全退化"): unknown/future statuses degrade to `code: 'unknown'` with a
+ * ideas, evidence, claims). The Kernel calls it from `projectProjection` as
+ * the only next-step authority. Unknown/future statuses degrade to
+ * `code: 'unknown'` with a
  * read-only label, never a mutation CTA.
  *
  * Projection rules:
@@ -1134,15 +1133,4 @@ export function nextActionProjection(ctx: NextActionContext): NextAction[] {
     ?? ctx.project.revision
   const overlays = [...ordinaryOverlays, ...directionOverlay(ctx, currentNextActionRevision)]
   return [...base, ...overlays].map(spec => action(ctx.project.project_id, spec))
-}
-
-/**
- * Legacy `next_actions: string[]` derivation (GUIDE-01): the labels of all
- * non-`done` actions in projection order. Stable and derived from the
- * structured actions — never a separate hand-maintained list. A status with
- * no pending work (terminal states) yields `[]`, which UI renders as "no
- * pending actions".
- */
-export function legacyNextActionStrings(actions: NextAction[]): string[] {
-  return actions.filter(a => a.state !== 'done').map(a => a.label)
 }

@@ -670,7 +670,7 @@ function renderPropose(ctx: WizardCtx): void {
     busy(ctx, true)
     const res = await apiResult<{ ok?: boolean }>(`/v1/projects/${encodeURIComponent(ctx.projectId)}/intake/${encodeURIComponent(ctx.intakeId)}/reject`, {
       method: 'POST',
-      body: JSON.stringify({ principal: {} }),
+      body: '{}',
     })
     if (!res.ok) setError(ctx, res.error.code, res.error.message)
     await refresh(ctx)
@@ -724,7 +724,7 @@ function renderAdopt(ctx: WizardCtx): void {
     busy(ctx, true)
     const res = await apiResult<{ ok?: boolean }>(`/v1/projects/${encodeURIComponent(ctx.projectId)}/intake/${encodeURIComponent(ctx.intakeId)}/reject`, {
       method: 'POST',
-      body: JSON.stringify({ principal: {} }),
+      body: '{}',
     })
     if (!res.ok) setError(ctx, res.error.code, res.error.message)
     await refresh(ctx)

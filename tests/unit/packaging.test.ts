@@ -27,14 +27,14 @@ const REPO = fileURLToPath(new URL('../..', import.meta.url))
 const SKILLS = ['research-core', 'domain-machine-learning', 'domain-data-science', 'venue-templates']
 const PACKAGE_NAMES = [
   'research-plugin', 'research-client', 'research-kernel', 'research-schemas', 'scholar-connectors',
-  'research-orchestrator', 'runner-gateway', 'analysis-worker',
+  'research-orchestrator', 'runner-gateway', 'analysis-engine', 'analysis-worker',
 ]
 /** Runtime graph a clean consumer actually receives: the plugin plus its
  * runtime dependencies. runner-gateway/analysis-worker are dev-only workers
  * of the plugin and legitimately absent from a consumer install. */
 const RUNTIME_NAMES = [
   'research-plugin', 'research-client', 'research-kernel', 'research-schemas', 'scholar-connectors',
-  'research-orchestrator', 'analysis-worker',
+  'research-orchestrator', 'analysis-engine',
 ]
 const HOST_PEERS = [
   '@deepseek-ai/cordis',
@@ -133,6 +133,7 @@ async function packAll(): Promise<Packed> {
     [join(REPO, 'packages/research-client'), 'research-client'],
     [join(REPO, 'packages/research-kernel'), 'research-kernel'],
     [join(REPO, 'packages/research-schemas'), 'research-schemas'],
+    [join(REPO, 'packages/analysis-engine'), 'analysis-engine'],
     [join(REPO, 'packages/scholar-connectors'), 'scholar-connectors'],
     [join(REPO, 'workers/research-orchestrator'), 'research-orchestrator'],
     [join(REPO, 'workers/runner-gateway'), 'runner-gateway'],
@@ -173,6 +174,7 @@ function writeConsumerProject(consumer: string, packed: Packed): void {
     `  '@dsh-scholar/research-client': file:${tgz('research-client')}`,
     `  '@dsh-scholar/research-kernel': file:${tgz('research-kernel')}`,
     `  '@dsh-scholar/research-schemas': file:${tgz('research-schemas')}`,
+    `  '@dsh-scholar/analysis-engine': file:${tgz('analysis-engine')}`,
     `  '@dsh-scholar/scholar-connectors': file:${tgz('scholar-connectors')}`,
     `  '@dsh-scholar/research-orchestrator': file:${tgz('research-orchestrator')}`,
     `  '@dsh-scholar/analysis-worker': file:${tgz('analysis-worker')}`,

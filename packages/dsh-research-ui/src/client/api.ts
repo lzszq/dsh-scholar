@@ -64,6 +64,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T | null
 export interface ApiErrorEnvelope {
   code?: string
   message?: string
+  key?: string
   request_id?: string
   retryable?: boolean
 }
@@ -103,6 +104,7 @@ export async function apiResult<T>(path: string, init?: RequestInit): Promise<Ap
           error = {
             code: typeof e.code === 'string' ? e.code : undefined,
             message: typeof e.message === 'string' ? e.message : undefined,
+            key: typeof e.key === 'string' ? e.key : undefined,
             request_id: typeof e.request_id === 'string' ? e.request_id : undefined,
             retryable: typeof e.retryable === 'boolean' ? e.retryable : undefined,
           }
@@ -149,6 +151,7 @@ export async function apiMultipart<T>(path: string, form: FormData): Promise<Api
           error = {
             code: typeof e.code === 'string' ? e.code : undefined,
             message: typeof e.message === 'string' ? e.message : undefined,
+            key: typeof e.key === 'string' ? e.key : undefined,
             retryable: typeof e.retryable === 'boolean' ? e.retryable : undefined,
           }
         } catch { /* non-JSON error body */ }

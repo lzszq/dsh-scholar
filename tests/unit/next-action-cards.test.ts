@@ -8,9 +8,8 @@
  *     (kernel route → panel tab, ideas/contracts/release/overview converge
  *     on the Overview tab), unknown-code safe degradation (read-only, no
  *     CTA, kernel label fallback), blocking note, locale-driven title map;
- *   resolveNextActionInput(p):           v2 structured projection preferred,
- *     legacy `next_actions: string[]` fallback (backward compatible), v2
- *     empty → clean none state, malformed v2 → legacy path;
+ *   resolveNextActionInput(p):           structured projection only; empty,
+ *     missing, or malformed v2 → safe none state without label fallback;
  *   static tables:                        every NEXT_ACTION_LABEL_KEYS /
  *     NEXT_ACTION_GAP_KEYS value exists in BOTH zh and en dictionaries and
  *     zero missing-key reports when every model is evaluated per locale.
@@ -275,35 +274,24 @@ describe('intake_* overlay actions (ONBOARD-01 landing — wizard CTA)', () => {
   })
 })
 
-describe('resolveNextActionInput: v2 preferred, legacy fallback', () => {
-  it('v2 projection wins over legacy strings (both present)', () => {
-    const input = resolveNextActionInput({ next_actions: ['old label'], next_actions_v2: [{ code: 'survey_run' }] })
-    expect(input).toEqual({ kind: 'v2', actions: [{ code: 'survey_run' }] })
+describe('resolveNextActionInput: structured projection only', () => {
+  it('returns valid structured actions', () => {
+    const input = resolveNextActionInput({ next_actions_v2: [{ code: 'survey_run' }] })
+    expect(input).toEqual({ actions: [{ code: 'survey_run' }] })
   })
 
-  it('empty v2 array → clean v2 none state (terminal projects)', () => {
-    const input = resolveNextActionInput({ next_actions: [], next_actions_v2: [] })
-    expect(input).toEqual({ kind: 'v2', actions: [] })
+  it('empty v2 array produces the safe none state', () => {
+    const input = resolveNextActionInput({ next_actions_v2: [] })
+    expect(input).toEqual({ actions: [] })
   })
 
-  it('missing v2 → legacy string list (backward compatibility)', () => {
-    const input = resolveNextActionInput({ next_actions: ['Complete Scope Gate', 'Resolve Budget Gate'] })
-    expect(input).toEqual({ kind: 'legacy', labels: ['Complete Scope Gate', 'Resolve Budget Gate'] })
+  it('missing v2 produces a safe empty state', () => {
+    expect(resolveNextActionInput({})).toEqual({ actions: [] })
   })
 
-  it('empty/missing both → legacy empty list', () => {
-    expect(resolveNextActionInput({})).toEqual({ kind: 'legacy', labels: [] })
-    expect(resolveNextActionInput({ next_actions: [] })).toEqual({ kind: 'legacy', labels: [] })
-  })
-
-  it('legacy labels are filtered to non-empty strings', () => {
-    const input = resolveNextActionInput({ next_actions: [null, '', 'x', 'y'] as unknown as string[] })
-    expect(input).toEqual({ kind: 'legacy', labels: ['x', 'y'] })
-  })
-
-  it('malformed v2 (mixed types) degrades to the legacy path', () => {
-    const input = resolveNextActionInput({ next_actions: ['a'], next_actions_v2: ['bad', 42] as unknown as NextActionV2[] })
-    expect(input).toEqual({ kind: 'legacy', labels: ['a'] })
+  it('malformed v2 never recovers an executable action from labels', () => {
+    const input = resolveNextActionInput({ next_actions_v2: ['bad', 42] as unknown as NextActionV2[] })
+    expect(input).toEqual({ actions: [] })
   })
 })
 

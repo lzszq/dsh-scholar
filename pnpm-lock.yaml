@@ -99,6 +99,18 @@ importers:
       vitest:
         specifier: ^3.0.0
         version: 3.2.7(@types/debug@4.1.13)(@types/node@24.13.3)(tsx@4.23.8)(yaml@2.9.0)
+      yaml:
+        specifier: 2.9.0
+        version: 2.9.0
+
+  packages/analysis-engine:
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.3
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
 
   packages/dsh-research-ui:
     dependencies:
@@ -146,9 +158,9 @@ importers:
 
   packages/research-kernel:
     dependencies:
-      '@dsh-scholar/analysis-worker':
+      '@dsh-scholar/analysis-engine':
         specifier: workspace:^
-        version: link:../../workers/analysis-worker
+        version: link:../analysis-engine
       '@dsh-scholar/research-schemas':
         specifier: workspace:^
         version: link:../research-schemas
@@ -190,6 +202,10 @@ importers:
         version: 5.9.3
 
   workers/analysis-worker:
+    dependencies:
+      '@dsh-scholar/analysis-engine':
+        specifier: workspace:^
+        version: link:../../packages/analysis-engine
     devDependencies:
       '@types/node':
         specifier: ^24.0.0

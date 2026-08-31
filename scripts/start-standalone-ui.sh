@@ -9,11 +9,11 @@
 #
 # Usage: bash scripts/start-standalone-ui.sh [--host 127.0.0.1] [--port 18610]
 #        [--kernel-port 7412] [--kernel-data-dir <path>] [--data-dir <path>]
-#        [--token <value>|--no-token]
+#        [--no-token]
 #
-# SEC-UI-01: a --token value is handed to the server through the 0600 token
-# file (written before spawn), never on the process argv — `ps`/`/proc`
-# must not expose the secret, and the server never prints it.
+# SEC-UI-01: token mode reads or creates the server-owned 0600 token file.
+# Secret values are never accepted on argv, exposed by `ps`/`/proc`, or
+# printed by this launcher.
 set -eu
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,7 +25,6 @@ DATA_DIR="${DSH_SCHOLAR_STANDALONE_DATA:-$HOME/.dsh-scholar-standalone}"
 FRAME_ANCESTORS="${DSH_SCHOLAR_STANDALONE_FRAME_ANCESTORS:-http://127.0.0.1:3080,http://localhost:3080,http://[::1]:3080}"
 SERVER_DATA_DIR="$DATA_DIR/research-ui-standalone"
 PASSTHROUGH=()
-TOKEN_VALUE=''
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -39,8 +38,6 @@ while [ "$#" -gt 0 ]; do
     --kernel-data-dir=*) KERNEL_DATA_DIR=${1#*=}; shift ;;
     --data-dir) SERVER_DATA_DIR=$2; shift 2 ;;
     --data-dir=*) SERVER_DATA_DIR=${1#*=}; shift ;;
-    --token) TOKEN_VALUE=$2; shift 2 ;;
-    --token=*) TOKEN_VALUE=${1#*=}; shift ;;
     --no-token) PASSTHROUGH+=(--no-token); shift ;;
     --principal) PASSTHROUGH+=(--principal "$2"); shift 2 ;;
     --principal=*) PASSTHROUGH+=(--principal "${1#*=}"); shift ;;
@@ -66,15 +63,6 @@ if [ ! -f "$BIN" ]; then
 fi
 
 mkdir -p "$DATA_DIR"
-# SEC-UI-01: pass an explicit --token through the 0600 token file (atomic
-# replace, so a pre-existing symlink cannot be followed), never via argv.
-if [ -n "$TOKEN_VALUE" ]; then
-  mkdir -p "$SERVER_DATA_DIR"
-  TMP_TOKEN="$SERVER_DATA_DIR/.standalone-token.tmp.$$"
-  printf '%s' "$TOKEN_VALUE" > "$TMP_TOKEN"
-  chmod 600 "$TMP_TOKEN"
-  mv -f "$TMP_TOKEN" "$SERVER_DATA_DIR/standalone-token"
-fi
 echo "starting standalone DSH Scholar: $WEB_URL (kernel :$KERNEL_PORT, kernel data: $KERNEL_DATA_DIR, BFF data: $SERVER_DATA_DIR)"
 # GOV-01: without an explicit operator override, the standalone BFF derives
 # the same credential-bound principal as the DSH plugin from the shared

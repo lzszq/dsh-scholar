@@ -30,9 +30,9 @@ bash scripts/start-standalone-ui.sh
 
 - **新建研究（Init）**：只填写项目名，创建 `DRAFT/brief_status=collecting` 空壳并进入项目 Chat；Grill Me 每次只问一个问题，答完后预览 Brief，PI 确认才创建 Scope Gate；
 - **打开已有项目（Resume）**：Start 屏下方列出此内核上的项目，搜索名称或输入完整 project id 后显式选择（不会自动选中某个项目）；选中后进入项目总览（当前不按 status/pending Gate/NextAction 自动跳转页面，tab 恢复只恢复上次使用的面板）；
-- **上传 / 接入（Upload）**：选择目标项目与阶段，批量加入材料；独立页面默认按 8 MiB 分块，可暂停/刷新/恢复，每个文件显示 hash/静态扫描状态，单 Intake 默认总量 2 GiB（管理员最多配置到 10 GiB）。静态扫描与 Grill 后生成 proposal，PI 采用或拒绝；刷新后从服务端投影继续。当前可配置 OCR Provider，但 OCR 请求与文件 OCR 状态尚未实现。
+- **上传 / 接入（Upload）**：选择目标项目与阶段，批量加入材料；独立页面默认按 8 MiB 分块，可暂停/刷新/恢复，每个文件显示 hash/静态扫描状态，单 Intake 默认总量 2 GiB（管理员最多配置到 10 GiB）。静态扫描与 Grill 后生成 proposal，PI 采用或拒绝；刷新后从服务端投影继续。OCR 已具备 durable create/read/cancel、worker 状态恢复和 `observed_unverified` provenance；真实 MinerU 网络与凭据仍为 `NOT_RUN_MANUAL_PENDING`。
 
-Upload 可以创建新项目或选择有权限的现有项目。采用前材料只在 Intake quarantine 中；确认 proposal 后也不会声称历史 Gate 已批准、日志是本平台 TerminalLog、结果是 accepted Evidence。冲突必须选择保留当前、采用上传或重命名。服务端已实现:ONBOARD-01 Intake 全链(begin→stage→scan→grill→propose→adopt/reject,pre-accept 零权威写、静态扫描/quarantine、确定性 taxonomy、单事务 Adoption、7 天过期/24h GC);浏览器向导 UI 已接线(2026-08-11,视觉验收未完成——浏览器拖拽/真实上传交互与断点续接观感待人工环境,记 NOT_RUN_MANUAL_PENDING);**批量分块上传已实现(2026-08-12,CHUNK-01)**——每文件独立队列状态(hashing/queued/uploading/paused/scanning/needs-input/ready/quarantined/failed),默认 8 MiB chunk、单 Intake 默认 2 GiB(管理员可配置,硬上限 10 GiB);断线/刷新从服务端 committed offset 续传,相同 chunk 幂等重放,错误 hash/gap/overlap 稳定 409/422;finalize 由服务端流式重算整体 size/SHA-256,不一致不产生 IntakeArtifact;扫描前字节只在隔离 staging,不进项目 Artifact;**研究包 archive 解包扫描与 TeX/CodeSnapshot 采用物化已实现(commit 98243ff,详见 research-onboarding.md §4.2/§6.1 注记)——scan 生成展开视图(scan_summary.extracted_entries/extracted_bytes),adopt 后 TeX→项目 TeX document、代码→code workspace+可选 CodeSnapshot,receipt.import_mappings 报告 materialized|gap**。**Agent tool 面已实现(commit 98243ff)**——DSH Agent 可经 `research_intake_begin`/`research_intake_stage`(base64 ≤32 MiB)/`research_intake_scan`/`research_intake_answers`/`research_intake_propose` 准备接入(prepare-only,researcher/scholar 角色,错误码稳定文案),但**无 adopt 工具**:research-onboarding.md §2 Agent 无 accept,采用(adopt)只能由 PI 在浏览器/BFF 面完成;v2/BFF accept 面与浏览器向导视觉验收仍属后续(NOT_RUN_MANUAL_PENDING)。不能用普通 Artifact/TeX 上传模拟安全接入。
+Upload 可以创建新项目或选择有权限的现有项目。采用前材料只在 Intake quarantine 中；确认 proposal 后也不会声称历史 Gate 已批准、日志是本平台 TerminalLog、结果是 accepted Evidence。冲突必须选择保留当前、采用上传或重命名。服务端支持 Intake begin→stage→scan→grill→propose→adopt/reject、静态扫描/quarantine、确定性 taxonomy、单事务 Adoption、过期/GC 与可恢复分块上传；扫描前字节只在隔离 staging，不进项目 Artifact。DSH Agent 只能使用 `research_intake_begin`/`research_intake_stage`/`research_intake_scan`/`research_intake_propose` 准备接入；Human Grill answer 与 adopt 必须在可信原生提问 UI/BFF session 中完成。不能用普通 Artifact/TeX 上传模拟安全接入。
 
 ## 3. 创建项目与 Scope Gate
 
@@ -129,7 +129,7 @@ Workspace 与 Interactive Terminal 都可以独立停靠；Dock 不改变 Worksp
 
 执行 target 经项目配置 `execution.runner_target_id`/`execution.runner_profile_id` 选择。先进入 Settings →“实验环境”创建或编辑 target（label、kind、capability、enabled/draining 与 remote SecretRef metadata），再在同一折叠组的“当前项目默认实验环境”选择器保存；页面不输入 SSH 明文、hostname 或任意命令。只覆盖一次运行时，在 `/run` 或 `/reproduce` 的 JSON 中加入 `"runner_target_id":"target_remote_lab_a"`，它优先于项目默认。远端离线时任务明确失败或等待，不会静默改在本机/subprocess 运行。服务端已实现 RUN-REMOTE-01 wire、RemoteFleetServer、RemoteRunnerAgentImpl、持久 Target Registry 和 target-aware claim；真实 mTLS 证书链、跨主机 sandbox/网络分区、Remote PTY 与浏览器视觉验收仍属后续人工阶段。
 
-runner CLI（`node workers/runner-gateway/lib/bin/runner.js`）已接线四个互斥角色（FLEET-01，用法与互斥规则见 remote-runner-wire.md §9）：默认 `--kernel` 本地 claim 循环；`--fleet-server <port>` 启动 Fleet 服务端；`--agent <fleet-url>` 启动已在远端机器上的 Agent；`--agent <fleet-url> --ssh-bootstrap-target <id>` 从受控 SecretRef 通过 SSH 引导远端 Agent。fleet/SSH 角色与本地 `--mode` 互斥；开发 wire 用 `--service-token` 鉴权，生产必须 mTLS。
+runner CLI（`node workers/runner-gateway/lib/bin/runner.js`）已接线四个互斥角色（FLEET-01，用法与互斥规则见 remote-runner-wire.md §9）：默认 `--kernel` 本地 claim 循环；`--fleet-server <port>` 启动 Fleet 服务端；`--agent <fleet-url>` 启动已在远端机器上的 Agent；`--agent <fleet-url> --ssh-bootstrap-target <id>` 从受控 SecretRef 通过 SSH 引导远端 Agent。fleet/SSH 角色与本地 `--mode` 互斥；开发 wire 的共享 service identity 只能经 `DSH_SCHOLAR_SERVICE_TOKEN` 环境或受控 0600 配置文件注入，runner 不接受任何 token/service-token/target-token argv；生产必须 mTLS。
 
 受控 SSH 引导（开发/人工验收）在 Fleet 服务端已经可达且其 plan 公钥已保存后运行：
 
@@ -206,9 +206,9 @@ Review 检查数字、Claim 状态、引用定位、Artifact hash、TeX 编译�
 
 Budget 页面默认隐藏，可在 Settings → Preferences 的“显示预算页面”启用；该浏览器偏好只控制页面可见性，不关闭预算记账或硬限制。启用后页面显示模型费用、GPU 小时与 API 请求用量，以及项目内容计数（corpus 快照/Idea/Contract/Claim/Evidence/Artifact）与详情弹窗中的约束和策略（数据集、并发上限、执行 profile、网络与完整性要求；内核记账的存储用量字段当前未在 UI 展示）。超过硬上限时项目进入 BLOCKED_GATE，正在运行的策略按 Job contract 安全停止或完成；只有 Human Budget Gate 可恢复到 payload 允许的状态，页面隐藏时仍可从 Overview/Approvals 处理。
 
-Overview 顶部以结构化卡片（GUIDE-01 `next_actions_v2`）展示下一步：每张卡含 code 徽标、三态标记（ready 可执行 / blocked 受阻 / done 已完成——done 灰显、blocked 因缺失前置条件而禁用、ready 高亮）、原因、需要 Human/Agent/Runner 徽标（内核 `required_by` 未声明时不显示）、缺失前置条件列表（点击受阻卡展开）、阻断说明和进入可完成动作界面的按钮（chat/gates/runs/evidence/manuscript/budget 直达，ideas/contracts/release 收敛到总览）。其中 `survey_run` 打开项目 Chat 并预填命令，不自动发送。标签优先按字典翻译，未登记 code 原样显示内核 label；未知状态动作（code='unknown'）只读，不提供猜测的执行按钮。旧内核的 `next_actions: string[]` 仍以列表形式兼容显示。
+Overview 顶部以结构化卡片（GUIDE-01 `next_actions_v2`）展示下一步：每张卡含 code 徽标、三态标记（ready 可执行 / blocked 受阻 / done 已完成——done 灰显、blocked 因缺失前置条件而禁用、ready 高亮）、原因、需要 Human/Agent/Runner 徽标（内核 `required_by` 未声明时不显示）、缺失前置条件列表（点击受阻卡展开）、阻断说明和进入可完成动作界面的按钮（chat/gates/runs/evidence/manuscript/budget 直达，ideas/contracts/release 收敛到总览）。其中 `survey_run` 打开项目 Chat 并预填命令，不自动发送。标签优先按字典翻译，未登记 code 原样显示内核 label；未知状态动作（code='unknown'）只读，不提供猜测的执行按钮。缺失或畸形的结构化动作只显示安全空态，不会从字符串 label 恢复操作。
 
-所有配置集中在 Settings，首次进入时所有分组默认折叠：静态分组为 连接 / 外观 / 偏好 / runner / workspace / terminal / TeX / agent / config provenance（runner、workspace、terminal、TeX、agent 五组在 registry 数据可用时由动态 ConfigScope 分组替换），另按 ConfigScope 动态生成 global/project/job（保留，无键）/runner-profile/orchestrator/kernel/standalone 七组折叠面板（覆盖注册表全部键）。每字段显示 effective 当前值（secret 只显示"已设置，不显示明文"掩码，明文永不回显）、scope、声明来源、安全基线标记、env 别名、schema 描述与默认；config pin 显示并在变化时提示；热生效/需重启按声明来源推断（注册表尚无 hot_reload 标记——含 http/ui 来源的键"保存后即时生效"，仅 cli/env/file 的键"需重启生效"，规则见 docs/config-registry.md §6）；per-key revision/hash 与"已修改"标记未展示（只有全局 pin）。修改只影响新 Job/PTY/Build。服务端已实现:canonical Config Registry(CONFIG-01,单一注册表 + parseCli 四二进制接入 + security floor + effective pin/redacted 视图 + 生成物 configs/generated/)与 kernel/standalone 的 x-config-pin 响应头、/v1/config/effective、/v1/config/schema。**Settings UI 已由 /v1/config/schema + /v1/config/effective 动态生成(2026-08-11,只读视图)**；本版本无配置写接口(kernel 仅提供读取面),提交按钮禁用并注明"当前配置只读,经 CLI/env 提供"——修改配置请用各二进制 CLI flag 或 DSH_* env。/bff/research/config/* 写面与 SecretRef 存储层仍属后续阶段(本地校验与错误回显映射机制已就绪)。
+所有配置集中在 Settings，首次进入时所有分组默认折叠：静态分组为连接 / 外观 / 偏好 / runner / workspace / terminal / TeX / agent / config provenance，另按 ConfigScope 动态生成 global/project/job（保留，无键）/runner-profile/orchestrator/kernel/standalone 七组。每字段显示 effective 当前值、scope、声明来源、安全基线、env 别名、schema 描述与默认；secret 只显示 SecretRef metadata/可用性，明文永不回显。Config Registry 明确返回每个变更的 `hot_applied_keys` 与 `restart_required_keys`，UI 不从 sources 猜测生效方式。所有 Config、MinerU Provider/项目 OCR binding 与 RunnerTarget 变更只通过一次 `POST /v1/settings/transactions` 提交，携带 scope revision CAS；任一操作失败则整单回滚。Project execution/integrity 仍以 canonical Project row 为唯一业务权威，Config layer 仅保存 Settings CAS/audit projection。旧 project execution、Provider、RunnerTarget 和 model-binding direct mutation HTTP routes 已删除；读取路由与 Runner heartbeat 保留。
 
 Panel Dock 的打开页面、首选位置与尺寸通过页面上的 Dock 控件即时配置并只保存在当前浏览器；它们不改变任何 Job/PTY/Build 的 config hash，也不出现在 Settings 的 Kernel Config Registry/config pin 中。
 
@@ -216,9 +216,9 @@ Panel Dock 的打开页面、首选位置与尺寸通过页面上的 Dock 控件
 
 Settings 的「模型与 OCR」组当前提供 MinerU 配置：官方 Open API 默认地址为 `https://mineru.net/api/v4`，可启用/禁用并为当前项目选择 Flash、Pipeline 或 VLM。Flash 可不配置凭据；Pipeline/VLM 必须填写服务端 `SecretRef` 的 scheme/name/version/scope。浏览器不接收任何 secret value，提交 `value`/`token`/`password` 会被拒绝；响应只显示 SecretRef metadata 与 available。Provider 和项目 binding 写入只允许 PI/Operator，revision 冲突会要求刷新。
 
-当前项目只提交 `purpose=ocr`、provider/model ID、binding revision 与本次 Provider revision；endpoint/credential 不进入项目。Kernel 校验 MinerU 固定 descriptor、enabled、模型目录、能力和 Pipeline/VLM SecretRef，并快照 provider revision + config hash。Provider 保存与项目 binding 是两次写；若第二步失败，界面会明确提示 Provider 已保存、绑定失败，刷新后可重试。
+当前项目只提交 `purpose=ocr`、provider/model ID、binding revision 与本次 Provider revision；endpoint/credential 不进入项目。Kernel 校验 MinerU 固定 descriptor、enabled、模型目录、能力和 Pipeline/VLM SecretRef，并快照 provider revision + config hash。Provider 保存与项目 binding 是同一个 `ocr-mineru` Settings operation；任一步验证或写入失败都会连同同一 transaction 中的其他配置一起回滚，不存在部分保存。
 
-当前已实现 MinerU Provider 配置、可选 SecretRef、当前项目 binding、双层 PI/Operator 权限与 zh/en Settings 写面。尚未实现 `/v2/intakes/{id}/ocr-requests`、OCR worker、状态恢复和 provenance；因此真实 Provider/OCR 调用仍为 `NOT_RUN_MANUAL_PENDING`，OCR 执行能力不能标记为可用。
+当前已实现 MinerU Provider 配置、可选 SecretRef、当前项目 binding、双层 PI/Operator 权限与 zh/en Settings 写面，以及 `/v2/intakes/{id}/ocr-requests` 的 create/read/cancel、持久队列、重启恢复、幂等和 `observed_unverified` provenance。OCR worker 只通过固定 provider/model/config/source/page/language 的窄 transport port 调用服务；仓库未内置可绕过该 pin 的备用模型。真实 MinerU 网络调用仍为 `NOT_RUN_MANUAL_PENDING`，在真实 Provider 验收前只能把该能力标为“代码可用、外部服务待验收”。
 
 ## 12. 常见问题
 
@@ -232,7 +232,7 @@ Settings 的「模型与 OCR」组当前提供 MinerU 配置：官方 Open API �
 | Claim inconclusive | Evidence 未 accepted 或缺统计字段 |
 | PDF stale | 源文件 revision 晚于 build input，重新 Compile |
 | Kernel unreachable | 检查 instance health、dataDir、port 和 sidecar ownership |
-| 直接访问 kernel 端口 401 | 共享 Kernel（默认 127.0.0.1:7412，数据目录 `~/.dsh/research-kernel`）受 0600 `<dataDir>/kernel-token` 随机 bearer 保护（env 注入、不出 argv）；除 `/v1|v2/health` 外缺失/错误 token 一律 401。浏览器/BFF 无需关心——BFF 自动带上该 token；仅脚本或 orchestrator 直接访问时需要（kernel 用 `--token` 或 `DSH_SCHOLAR_KERNEL_TOKEN`；orchestrator 用 `--token-file` 读取同一 0600 文件）。`x-service-token` 是内部路由专用层，不能替代普通 bearer |
+| 直接访问 kernel 端口 401 | 共享 Kernel（默认 127.0.0.1:7412，数据目录 `~/.dsh/research-kernel`）受 0600 `<dataDir>/kernel-token` 随机 bearer 保护（env 注入、不出 argv）；除 `/v1|v2/health` 外缺失/错误 token 一律 401。浏览器/BFF 无需关心——BFF 自动带上该 token；仅脚本或 orchestrator 直接访问时需要（kernel/runner 用 `DSH_SCHOLAR_KERNEL_TOKEN`，orchestrator 用 `--token-file` 或同一环境变量）。`x-service-token` 是内部路由专用层，不能替代普通 bearer |
 | 页面部分未翻译 | 缺失 key 会显示 key；这是缺陷，应按 docs 规则补资源和测试 |
 | intake/proposal stale | 上传接入期间项目或提案已变化，刷新并重新生成 Proposal |
 | chunk_gap / chunk_offset_conflict | 分块上传乱序或与已提交 offset 冲突；客户端队列会按 committed offset 顺序续传，刷新后从服务端 offset 继续 |

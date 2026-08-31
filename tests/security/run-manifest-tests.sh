@@ -107,19 +107,22 @@ writeFileSync(process.argv[2], privateKey.export({ type: 'pkcs8', format: 'pem' 
 writeFileSync(process.argv[3], publicKey.export({ type: 'spki', format: 'pem' }).toString())
 EOF
 cat > "$WORK/sign-manifest.mjs" <<'EOF'
-// args: jobId projectId metricsArtifact privateKeyPath keyId leaseGeneration mode
+// args: jobId projectId runId configPin metricsArtifact privateKeyPath keyId leaseGeneration mode
 import { createHash, sign } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
-const [jobId, projectId, metricsArtifact, keyPath, keyId, generation, mode] = process.argv.slice(2)
+const [jobId, projectId, runId, configPin, metricsArtifact, keyPath, keyId, generation, mode] = process.argv.slice(2)
 // Reuse the exact production module. A top-level JSON.stringify replacer
 // silently drops nested Manifest fields and would sign different bytes.
 const { canonicalJsonDeep: canonical } = await import(pathToFileURL(process.env.DSH_SCHOLAR_CANONICAL_JSON_MODULE).href)
 const privateKey = readFileSync(keyPath, 'utf8')
 const manifest = {
-  run_id: `run_shell_${Date.now()}`,
+  run_id: runId,
   job_id: jobId,
   project_id: projectId,
+  contract_id: null,
+  config_pin: configPin,
+  lease: { generation: Number(generation) },
   code_commit: 'abc123',
   command: ['echo', 'hello'],
   resources: { gpu: 0, cpu: 1, memory_gb: 1 },
@@ -128,7 +131,6 @@ const manifest = {
   exit_code: 0,
   metrics_artifact: metricsArtifact,
 }
-if (generation !== '' && generation !== '0' && generation !== 'undefined') manifest.lease = { generation: Number(generation) }
 const payloadSha256 = createHash('sha256').update(canonical(manifest)).digest('hex')
 const signed = { ...manifest, runner_key_id: keyId, payload_sha256: payloadSha256 }
 const signature = sign(null, Buffer.from(canonical(signed), 'utf8'), privateKey).toString('base64')
@@ -152,9 +154,11 @@ CLAIM1=$(api -X POST "$BASE/v1/jobs-claim/run" -d '{"owner":"runner-mfa","lease_
 CLAIMED=$(printf '%s' "$CLAIM1" | jfield '[0].job_id')
 G1=$(printf '%s' "$CLAIM1" | jfield '[0].lease_generation')
 T1=$(printf '%s' "$CLAIM1" | jfield '[0].lease_token')
+R1=$(printf '%s' "$CLAIM1" | jfield '[0].run_id')
+P1=$(printf '%s' "$CLAIM1" | jfield '[0].payload.project_config_pin')
 [[ "$CLAIMED" == "$J1" ]] || { echo "claim setup broken: expected $J1 got $CLAIMED"; exit 1; }
 
-SIGNED1=$(node "$WORK/sign-manifest.mjs" "$J1" "$PROJ" "$MISSING_SHA" "$WORK/runner-key.pem" "runner-key-shell" "$G1" good)
+SIGNED1=$(node "$WORK/sign-manifest.mjs" "$J1" "$PROJ" "$R1" "$P1" "$MISSING_SHA" "$WORK/runner-key.pem" "runner-key-shell" "$G1" good)
 CODE=$(curl -s -o "$WORK/resp.json" -w '%{http_code}' -X POST "$BASE/v1/jobs/$J1/status" -H 'content-type: application/json' -d "{\"owner\":\"runner-mfa\",\"status\":\"succeeded\",\"lease_generation\":$G1,\"lease_token\":\"$T1\",\"run_manifest\":$SIGNED1}")
 ERR_CODE=$(jfield '.error.code' < "$WORK/resp.json")
 S1=$(api "$BASE/v1/jobs/$J1" | jfield '.status')
@@ -172,8 +176,10 @@ CLAIM2=$(api -X POST "$BASE/v1/jobs-claim/run" -d '{"owner":"runner-mfa","lease_
 CLAIMED2=$(printf '%s' "$CLAIM2" | jfield '[0].job_id')
 G2=$(printf '%s' "$CLAIM2" | jfield '[0].lease_generation')
 T2=$(printf '%s' "$CLAIM2" | jfield '[0].lease_token')
+R2=$(printf '%s' "$CLAIM2" | jfield '[0].run_id')
+P2=$(printf '%s' "$CLAIM2" | jfield '[0].payload.project_config_pin')
 [[ "$CLAIMED2" == "$J2" ]] || { echo "claim setup broken: expected $J2 got $CLAIMED2"; exit 1; }
-SIGNED2=$(node "$WORK/sign-manifest.mjs" "$J2" "$PROJ" "$ART" "$WORK/runner-key.pem" "runner-key-shell" "$G2" good)
+SIGNED2=$(node "$WORK/sign-manifest.mjs" "$J2" "$PROJ" "$R2" "$P2" "$ART" "$WORK/runner-key.pem" "runner-key-shell" "$G2" good)
 CODE2=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/jobs/$J2/status" -H 'content-type: application/json' -d "{\"owner\":\"runner-mfa\",\"status\":\"succeeded\",\"lease_generation\":$G2,\"lease_token\":\"$T2\",\"run_manifest\":$SIGNED2}")
 S2=$(api "$BASE/v1/jobs/$J2" | jfield '.status')
 if [[ "$CODE2" == "200" && "$S2" == "succeeded" ]]; then
@@ -225,7 +231,9 @@ J4=$(api -X POST "$BASE/v1/projects/$PROJ/jobs" -d '{"idempotency_key":"sig-1","
 C4=$(api -X POST "$BASE/v1/jobs-claim/run" -d '{"owner":"runner-sig","lease_ttl_seconds":60,"limit":8}')
 G4=$(printf '%s' "$C4" | jfield '[0].lease_generation')
 T4=$(printf '%s' "$C4" | jfield '[0].lease_token')
-BAD=$(node "$WORK/sign-manifest.mjs" "$J4" "$PROJ" "$ART2" "$WORK/runner-key.pem" "runner-key-shell" "$G4" bad)
+R4=$(printf '%s' "$C4" | jfield '[0].run_id')
+P4=$(printf '%s' "$C4" | jfield '[0].payload.project_config_pin')
+BAD=$(node "$WORK/sign-manifest.mjs" "$J4" "$PROJ" "$R4" "$P4" "$ART2" "$WORK/runner-key.pem" "runner-key-shell" "$G4" bad)
 CODE5=$(curl -s -o "$WORK/resp5.json" -w '%{http_code}' -X POST "$BASE/v1/jobs/$J4/status" -H 'content-type: application/json' -d "{\"owner\":\"runner-sig\",\"status\":\"succeeded\",\"lease_generation\":$G4,\"lease_token\":\"$T4\",\"run_manifest\":$BAD}")
 ERR5=$(jfield '.error.code' < "$WORK/resp5.json")
 S5=$(api "$BASE/v1/jobs/$J4" | jfield '.status')
@@ -234,7 +242,7 @@ if [[ "$CODE5" == "422" && "$ERR5" == "manifest_signature_invalid" && "$S5" == "
 else
   bad "expected 422 manifest_signature_invalid, got HTTP $CODE5 (error=$ERR5), job status '$S5'"
 fi
-GOOD=$(node "$WORK/sign-manifest.mjs" "$J4" "$PROJ" "$ART2" "$WORK/runner-key.pem" "runner-key-shell" "$G4" good)
+GOOD=$(node "$WORK/sign-manifest.mjs" "$J4" "$PROJ" "$R4" "$P4" "$ART2" "$WORK/runner-key.pem" "runner-key-shell" "$G4" good)
 CODE6=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/jobs/$J4/status" -H 'content-type: application/json' -d "{\"owner\":\"runner-sig\",\"status\":\"succeeded\",\"lease_generation\":$G4,\"lease_token\":\"$T4\",\"run_manifest\":$GOOD}")
 S6=$(api "$BASE/v1/jobs/$J4" | jfield '.status')
 if [[ "$CODE6" == "200" && "$S6" == "succeeded" ]]; then

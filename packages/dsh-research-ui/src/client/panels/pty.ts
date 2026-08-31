@@ -32,6 +32,12 @@ import {
   type PtyDisplayEntry, type PtyOpenParams, type PtyPreset, type PtyResult, type PtySessionWire,
   type PtySignal, type PtyStreamTransport, type PtyTransport,
 } from '../pty-session-model'
+import {
+  PtyContextTabsModel,
+  type PtyContextDescriptor,
+  type PtyContextSessionsWire,
+  type PtyContextTransport,
+} from '../pty-context-model'
 import { createWebTerminalAdapter, type WebTerminalAdapter } from '../web-terminal-adapter'
 import type { SseFetch } from '../sse-client'
 import type { Projection, WorkspaceInfoLite } from '../types'
@@ -43,6 +49,8 @@ const SIGNALS: readonly PtySignal[] = ['INT', 'TERM', 'KILL']
 /** Open-form selections (survive structural re-paints / locale switches). */
 interface PtyFormState {
   workspaceId: string
+  label: string
+  purpose: string
   preset: PtyPreset
   cwd: string
   cols: string
@@ -50,17 +58,45 @@ interface PtyFormState {
 }
 
 interface PtyPanelState {
-  model: PtyClientModel
+  context: PtyContextDescriptor
+  models: Map<string, PtyClientModel>
+  activeSessionId: string | null
+  draftModel: PtyClientModel
   /** GET /v1/projects/{id}/workspaces result (lazy, per project). */
   workspaces: WorkspaceInfoLite[] | null
   workspacesLoading: boolean
   openInflight: boolean
   form: PtyFormState
   live: PtyLiveRefs | null
+  rerender: (() => void) | null
 }
 
-/** Per-project panel state (survives panel re-renders / locale switches). */
+/** Per-context panel state. A project may own many independent Research,
+ * Chat and Subagent contexts; terminal input is never keyed by project. */
 const panelStates = new Map<string, PtyPanelState>()
+
+interface PtyProjectContextsState {
+  tabs: PtyContextTabsModel
+  loading: boolean
+  loaded: boolean
+}
+
+const projectContexts = new Map<string, PtyProjectContextsState>()
+
+function newSessionModel(): PtyClientModel {
+  return new PtyClientModel({
+    transport: ptyTransport(),
+    stream: ptyStreamTransport(),
+    pollIntervalMs: 1000,
+    sessionRefreshEvery: 10,
+    maxControlRetries: 3,
+    maxDisplayFrames: 3000,
+  })
+}
+
+function activeModel(st: PtyPanelState): PtyClientModel {
+  return st.activeSessionId === null ? st.draftModel : (st.models.get(st.activeSessionId) ?? st.draftModel)
+}
 
 /** Live DOM refs for in-place stream/status paints between full renders. */
 interface PtyLiveRefs {
@@ -90,7 +126,7 @@ function disposeTerminalView(st: PtyPanelState): void {
   const live = st.live
   if (live === null) return
   st.live = null
-  st.model.onChange = null
+  activeModel(st).onChange = null
   live.resizeObserver?.disconnect()
   if (live.resizeFrame !== null) cancelAnimationFrame(live.resizeFrame)
   live.terminalAdapter.dispose()
@@ -100,31 +136,32 @@ function disposeTerminalView(st: PtyPanelState): void {
  *  keeps running server-side; the next visit reconnects via after_seq). */
 export function ptyPanelDetachAll(): void {
   for (const st of panelStates.values()) {
-    if (st.model.state === 'open') st.model.detach()
+    for (const model of st.models.values()) {
+      if (model.state === 'open') void model.detach()
+    }
+    if (st.draftModel.state === 'open') void st.draftModel.detach()
     disposeTerminalView(st)
   }
 }
 
-function ensureState(projectId: string): PtyPanelState {
-  let st = panelStates.get(projectId)
+function ensureState(context: PtyContextDescriptor): PtyPanelState {
+  let st = panelStates.get(context.context_id)
   if (st === undefined) {
-    const model = new PtyClientModel({
-      transport: ptyTransport(),
-      stream: ptyStreamTransport(),
-      pollIntervalMs: 1000,
-      sessionRefreshEvery: 10,
-      maxControlRetries: 3,
-      maxDisplayFrames: 3000,
-    })
     st = {
-      model,
+      context,
+      models: new Map(),
+      activeSessionId: null,
+      draftModel: newSessionModel(),
       workspaces: null,
       workspacesLoading: false,
       openInflight: false,
-      form: { workspaceId: '', preset: 'bash', cwd: '', cols: '80', rows: '24' },
+      form: { workspaceId: '', label: '', purpose: '', preset: 'bash', cwd: '', cols: '80', rows: '24' },
       live: null,
+      rerender: null,
     }
-    panelStates.set(projectId, st)
+    panelStates.set(context.context_id, st)
+  } else {
+    st.context = context
   }
   return st
 }
@@ -153,9 +190,27 @@ function ptyTransport(): PtyTransport {
         body: JSON.stringify(params),
       }))
     },
-    async getSession(sessionId: string, lease: string): Promise<PtyResult<PtySessionWire>> {
+    async attach(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
+      return mapResult(await apiResult<PtySessionWire>(
+        `/v1/pty/sessions/${encodeURIComponent(sessionId)}/attach`,
+        { method: 'POST', headers: { 'x-pty-lease': lease }, body: JSON.stringify({ expected_generation: expectedGeneration }) },
+      ))
+    },
+    async detach(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
+      return mapResult(await apiResult<PtySessionWire>(
+        `/v1/pty/sessions/${encodeURIComponent(sessionId)}/detach`,
+        { method: 'POST', headers: { 'x-pty-lease': lease }, body: JSON.stringify({ expected_generation: expectedGeneration }) },
+      ))
+    },
+    async close(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
       return mapResult(await apiResult<PtySessionWire>(
         `/v1/pty/sessions/${encodeURIComponent(sessionId)}`,
+        { method: 'DELETE', headers: { 'x-pty-lease': lease }, body: JSON.stringify({ expected_generation: expectedGeneration }) },
+      ))
+    },
+    async getSession(sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> {
+      return mapResult(await apiResult<PtySessionWire>(
+        `/v1/pty/sessions/${encodeURIComponent(sessionId)}?expected_generation=${expectedGeneration}`,
         { headers: { 'x-pty-lease': lease } },
       ))
     },
@@ -169,13 +224,37 @@ function ptyTransport(): PtyTransport {
         },
       ))
     },
-    async frames(sessionId: string, lease: string, afterSeq: number): Promise<PtyResult<PtyFramesPageWire>> {
+    async frames(sessionId: string, lease: string, afterSeq: number, expectedGeneration: number): Promise<PtyResult<PtyFramesPageWire>> {
       return mapResult(await apiResult<PtyFramesPageWire>(
-        `/v1/pty/sessions/${encodeURIComponent(sessionId)}/frames?after_seq=${afterSeq}`,
+        `/v1/pty/sessions/${encodeURIComponent(sessionId)}/frames?after_seq=${afterSeq}&expected_generation=${expectedGeneration}`,
         { headers: { 'x-pty-lease': lease } },
       ))
     },
   }
+}
+
+function ptyContextTransport(): PtyContextTransport {
+  return {
+    async listContexts(projectId: string): Promise<PtyResult<PtyContextDescriptor[]>> {
+      return mapResult(await apiResult<PtyContextDescriptor[]>(
+        `/v1/pty/contexts?project_id=${encodeURIComponent(projectId)}`,
+      ))
+    },
+    async listSessions(contextId: string): Promise<PtyResult<PtyContextSessionsWire>> {
+      return mapResult(await apiResult<PtyContextSessionsWire>(
+        `/v1/pty/contexts/${encodeURIComponent(contextId)}/sessions`,
+      ))
+    },
+  }
+}
+
+function ensureProjectContexts(projectId: string): PtyProjectContextsState {
+  let state = projectContexts.get(projectId)
+  if (state === undefined) {
+    state = { tabs: new PtyContextTabsModel(ptyContextTransport()), loading: false, loaded: false }
+    projectContexts.set(projectId, state)
+  }
+  return state
 }
 
 /** SSE frames-stream transport (client/sse-client.ts): the authenticated
@@ -259,7 +338,7 @@ function terminalTheme(body: HTMLElement): ITheme {
 }
 
 function paintDynamic(st: PtyPanelState): void {
-  const model = st.model
+  const model = activeModel(st)
   const refs = st.live
   if (refs === null) return
   refs.terminalAdapter.render(model.display)
@@ -306,7 +385,7 @@ async function loadWorkspaces(st: PtyPanelState, projectId: string): Promise<voi
 }
 
 function paintOpenForm(body: HTMLElement, st: PtyPanelState, projection: Projection, projectId: string): void {
-  const model = st.model
+  const model = activeModel(st)
   disposeTerminalView(st)
   body.replaceChildren()
   const panel = el('div')
@@ -328,6 +407,34 @@ function paintOpenForm(body: HTMLElement, st: PtyPanelState, projection: Project
   desc.style.cssText = 'font-size:10.5px;margin-bottom:10px;max-width:620px'
   card.appendChild(desc)
 
+  const labelRow = el('div', 'row')
+  labelRow.style.cssText = 'align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap'
+  const labelText = el('span', '', t('pty', 'pty.form.label'))
+  labelText.style.cssText = 'width:110px;color:var(--text-2);font-size:11px;flex-shrink:0'
+  const labelInput = document.createElement('input')
+  labelInput.type = 'text'
+  labelInput.maxLength = 96
+  labelInput.value = st.form.label
+  labelInput.placeholder = t('pty', 'pty.form.labelPlaceholder')
+  labelInput.style.cssText = 'flex:1;min-width:200px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font:11px/1.4 system-ui,sans-serif;outline:none'
+  labelInput.oninput = () => { st.form.label = labelInput.value }
+  labelRow.append(labelText, labelInput)
+  card.appendChild(labelRow)
+
+  const purposeRow = el('div', 'row')
+  purposeRow.style.cssText = 'align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap'
+  const purposeText = el('span', '', t('pty', 'pty.form.purpose'))
+  purposeText.style.cssText = 'width:110px;color:var(--text-2);font-size:11px;flex-shrink:0'
+  const purposeInput = document.createElement('input')
+  purposeInput.type = 'text'
+  purposeInput.maxLength = 512
+  purposeInput.value = st.form.purpose
+  purposeInput.placeholder = t('pty', 'pty.form.purposePlaceholder')
+  purposeInput.style.cssText = labelInput.style.cssText
+  purposeInput.oninput = () => { st.form.purpose = purposeInput.value }
+  purposeRow.append(purposeText, purposeInput)
+  card.appendChild(purposeRow)
+
   // workspace picker (WORK-01 GET /v1/projects/{id}/workspaces).
   const wsRow = el('div', 'row')
   wsRow.style.cssText = 'align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap'
@@ -340,7 +447,7 @@ function paintOpenForm(body: HTMLElement, st: PtyPanelState, projection: Project
   wsPlaceholder.value = ''
   wsSelect.appendChild(wsPlaceholder)
   if (st.workspaces === null) {
-    void loadWorkspaces(st, projectId).then(() => { if (st.model.state === 'idle' || st.model.state === 'error') paintFull(body, st, projection, projectId) })
+    void loadWorkspaces(st, projectId).then(() => { const model = activeModel(st); if (model.state === 'idle' || model.state === 'error') paintFull(body, st, projection, projectId) })
   }
   for (const ws of st.workspaces ?? []) {
     const opt = el('option', '', `${ws.kind} · ${ws.name}`)
@@ -418,8 +525,8 @@ function paintOpenForm(body: HTMLElement, st: PtyPanelState, projection: Project
   // pinned profile/target (opaque ids resolved server-side).
   const pinnedRow = el('div', 'row')
   pinnedRow.style.cssText = 'align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap'
-  const profile = projection.project?.execution?.runner_profile_id ?? 'unconfigured'
-  const target = 'local'
+  const profile = st.context.runner_profile_id
+  const target = st.context.runner_target_id
   const profileChip = el('span', 'artifact-kind', `${t('pty', 'pty.form.profile')}: ${profile}`)
   const targetChip = el('span', 'artifact-kind', `${t('pty', 'pty.form.target')}: ${target}`)
   pinnedRow.append(profileChip, targetChip)
@@ -430,12 +537,12 @@ function paintOpenForm(body: HTMLElement, st: PtyPanelState, projection: Project
   openBtn.disabled = st.openInflight
   openBtn.onclick = () => {
     const wsId = st.form.workspaceId !== '' ? st.form.workspaceId : (st.workspaces?.[0]?.workspace_id ?? '')
-    if (wsId === '') return
+    if (wsId === '' || st.form.label.trim() === '') return
     const params: PtyOpenParams = {
-      project_id: projectId,
+      context_id: st.context.context_id,
       workspace_id: wsId,
-      profile,
-      target,
+      label: st.form.label.trim(),
+      purpose: st.form.purpose.trim(),
       preset: st.form.preset,
       cwd: st.form.cwd.trim() !== '' ? st.form.cwd.trim() : '.',
       cols: Math.max(1, Math.min(500, Number(st.form.cols) || 80)),
@@ -444,9 +551,14 @@ function paintOpenForm(body: HTMLElement, st: PtyPanelState, projection: Project
     st.openInflight = true
     openBtn.disabled = true
     openBtn.textContent = t('pty', 'pty.form.opening')
-    void model.open(params).then(() => {
+    void model.open(params).then(opened => {
       st.openInflight = false
-      paintFull(body, st, projection, projectId)
+      if (opened && model.sessionId !== null) {
+        st.models.set(model.sessionId, model)
+        st.activeSessionId = model.sessionId
+      }
+      if (st.rerender !== null) st.rerender()
+      else paintFull(body, st, projection, projectId)
     })
   }
   card.appendChild(openBtn)
@@ -457,7 +569,7 @@ function paintOpenForm(body: HTMLElement, st: PtyPanelState, projection: Project
 /* ────────────────────────────── session view ────────────────────────────── */
 
 function paintSession(body: HTMLElement, st: PtyPanelState, projection: Projection, projectId: string): void {
-  const model = st.model
+  const model = activeModel(st)
   const view = ptyStatusView(model)
   const sessionId = model.sessionId ?? ''
   const existing = st.live
@@ -479,13 +591,13 @@ function paintSession(body: HTMLElement, st: PtyPanelState, projection: Projecti
   const sessionChip = el('span', 'artifact-kind', t('pty', 'pty.status.session', { id: sessionId }))
   const detachBtn = el('button', 'hbtn', t('pty', 'pty.action.detach'))
   detachBtn.title = t('pty', 'pty.action.detach')
-  detachBtn.onclick = () => { model.detach(); paintFull(body, st, projection, projectId) }
+  detachBtn.onclick = () => { void model.detach().then(() => paintFull(body, st, projection, projectId)) }
   const attachBtn = el('button', 'hbtn', t('pty', 'pty.action.attach'))
   attachBtn.title = t('pty', 'pty.action.attach')
-  attachBtn.onclick = () => { model.reconnect(); paintFull(body, st, projection, projectId) }
+  attachBtn.onclick = () => { void model.reconnect().then(() => paintFull(body, st, projection, projectId)) }
   const closeBtn = el('button', 'hbtn', t('pty', 'pty.action.close'))
   closeBtn.title = t('pty', 'pty.action.close')
-  closeBtn.onclick = () => { void model.close(); paintFull(body, st, projection, projectId) }
+  closeBtn.onclick = () => { void model.close().then(() => paintFull(body, st, projection, projectId)) }
   const reopenBtn = el('button', 'hbtn', t('pty', 'pty.action.reopen'))
   reopenBtn.title = t('pty', 'pty.action.reopen')
   reopenBtn.onclick = () => { void model.reopen().then(() => paintFull(body, st, projection, projectId)) }
@@ -648,12 +760,12 @@ function paintSession(body: HTMLElement, st: PtyPanelState, projection: Projecti
   scheduleFit()
   model.onChange = () => paintDynamic(st)
   // Reconnect a detached session (tab return): after_seq replay resumes.
-  if (model.state === 'detached' && model.hasSession) model.reconnect()
+    if (model.state === 'detached' && model.hasSession && model.leaseToken !== null) void model.reconnect()
 }
 
 /** Full structural paint (tab render / refresh / open-close transitions). */
 function paintFull(body: HTMLElement, st: PtyPanelState, projection: Projection, projectId: string): void {
-  const model = st.model
+  const model = activeModel(st)
   if (model.state === 'idle' || model.state === 'opening' || model.state === 'error') {
     if (model.state === 'opening') st.openInflight = true
     paintOpenForm(body, st, projection, projectId)
@@ -663,11 +775,106 @@ function paintFull(body: HTMLElement, st: PtyPanelState, projection: Projection,
   paintSession(body, st, projection, projectId)
 }
 
-/** Panel entry (index.ts dispatch): paints from the per-project model and
- *  resumes polling for sessions that were detached while away. */
+function restoreListedSessions(st: PtyPanelState, sessions: PtySessionWire[]): void {
+  for (const session of sessions) {
+    if (st.models.has(session.pty_session_id)) continue
+    const model = newSessionModel()
+    model.restore(session)
+    st.models.set(session.pty_session_id, model)
+  }
+}
+
+function renderSelectedContext(body: HTMLElement, projection: Projection, projectId: string, projectState: PtyProjectContextsState): void {
+  const tabs = projectState.tabs
+  const context = tabs.selectedContext
+  if (context === null) {
+    body.replaceChildren(el('div', 'empty', t('pty', 'pty.context.none')))
+    return
+  }
+  const st = ensureState(context)
+  restoreListedSessions(st, tabs.sessions(context.context_id))
+  if (st.activeSessionId === null && tabs.activeSessionId !== null) st.activeSessionId = tabs.activeSessionId
+  st.rerender = () => renderPty(body, projection, projectId)
+
+  body.replaceChildren()
+  const contextRow = el('div', 'row')
+  contextRow.style.cssText = 'gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px'
+  const contextSelect = el('select', 'picker')
+  contextSelect.style.cssText = 'min-width:220px;margin:0;padding:5px 8px;font-size:11px'
+  contextSelect.setAttribute('aria-label', t('pty', 'pty.context.selectAria'))
+  for (const item of tabs.contexts) {
+    const option = el('option', '', `${item.context_kind} · ${item.context_id}`)
+    option.value = item.context_id
+    contextSelect.appendChild(option)
+  }
+  contextSelect.value = context.context_id
+  contextSelect.onchange = () => {
+    disposeTerminalView(st)
+    void tabs.selectContext(contextSelect.value).then(() => renderPty(body, projection, projectId))
+  }
+  const contextTarget = el('span', 'artifact-kind', `${context.runner_profile_id} · ${context.runner_target_id}`)
+  const newButton = el('button', 'hbtn', t('pty', 'pty.context.newTerminal'))
+  newButton.onclick = () => {
+    disposeTerminalView(st)
+    st.activeSessionId = null
+    st.draftModel.dispose()
+    st.draftModel = newSessionModel()
+    st.form.label = ''
+    st.form.purpose = ''
+    renderPty(body, projection, projectId)
+  }
+  contextRow.append(contextSelect, contextTarget, newButton)
+  body.appendChild(contextRow)
+
+  const sessionRow = el('div', 'row')
+  sessionRow.style.cssText = 'gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px'
+  for (const session of tabs.sessions(context.context_id)) {
+    const button = el('button', session.pty_session_id === st.activeSessionId ? 'hbtn active' : 'hbtn', session.label)
+    button.title = session.purpose
+    button.onclick = () => {
+      disposeTerminalView(st)
+      tabs.selectSession(session.pty_session_id)
+      st.activeSessionId = session.pty_session_id
+      renderPty(body, projection, projectId)
+    }
+    sessionRow.appendChild(button)
+  }
+  for (const [sessionId, model] of st.models) {
+    if (tabs.session(sessionId) !== null || model.sessionId === null) continue
+    const button = el('button', sessionId === st.activeSessionId ? 'hbtn active' : 'hbtn', model.lastOpenParams?.label ?? sessionId)
+    button.onclick = () => {
+      disposeTerminalView(st)
+      st.activeSessionId = sessionId
+      renderPty(body, projection, projectId)
+    }
+    sessionRow.appendChild(button)
+  }
+  body.appendChild(sessionRow)
+
+  const surface = el('div')
+  surface.style.cssText = 'min-width:0'
+  body.appendChild(surface)
+  paintFull(surface, st, projection, projectId)
+  const model = activeModel(st)
+  if (model.state === 'detached' && model.hasSession && model.leaseToken !== null) void model.reconnect()
+}
+
+/** Panel entry: first resolves server-owned Research/Chat/Subagent contexts,
+ * then renders independent per-context terminal tabs. */
 export function renderPty(body: HTMLElement, projection: Projection, projectId: string): void {
-  const st = ensureState(projectId)
-  paintFull(body, st, projection, projectId)
-  const model = st.model
-  if (model.state === 'detached' && model.hasSession) model.reconnect()
+  const state = ensureProjectContexts(projectId)
+  if (!state.loaded) {
+    if (!state.loading) {
+      state.loading = true
+      void state.tabs.loadProject(projectId).then(async loaded => {
+        state.loading = false
+        state.loaded = loaded
+        if (loaded && state.tabs.contexts.length > 0) await state.tabs.selectContext(state.tabs.contexts[0]!.context_id)
+        renderPty(body, projection, projectId)
+      })
+    }
+    body.replaceChildren(el('div', 'empty', t('pty', 'pty.context.loading')))
+    return
+  }
+  renderSelectedContext(body, projection, projectId, state)
 }

@@ -1,14 +1,15 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { dshLockfileDrift, isExactSemver } from './dsh-baseline-lock.mjs'
 
 const repo = dirname(dirname(fileURLToPath(import.meta.url)))
 const check = process.argv.includes('--check')
 const baseline = JSON.parse(await readFile(join(repo, 'config/dsh-baseline.json'), 'utf8'))
 const version = baseline.version
 
-if (typeof version !== 'string' || !/^0\.\d+\.\d+-rc\.\d+$/.test(version)) {
-  throw new Error('config/dsh-baseline.json must contain a valid prerelease version')
+if (!isExactSemver(version)) {
+  throw new Error('config/dsh-baseline.json must contain an exact SemVer version')
 }
 
 const updates = new Map()
@@ -38,6 +39,18 @@ for (const [path, expected] of updates) {
   if (current === expected) continue
   if (check) drift.push(path)
   else await writeFile(path, expected)
+}
+
+if (check) {
+  const lockfilePath = join(repo, 'pnpm-lock.yaml')
+  const lockfile = await readFile(lockfilePath, 'utf8')
+  const directDshPackages = [...new Set([
+    ...Object.keys(manifest.dependencies ?? {}),
+    ...Object.keys(manifest.devDependencies ?? {}),
+    ...Object.keys(manifest.optionalDependencies ?? {}),
+  ].filter(name => name.startsWith('@deepseek-ai/dsh-')))]
+  const lockfileErrors = dshLockfileDrift(lockfile, version, directDshPackages)
+  for (const error of lockfileErrors) drift.push(`${lockfilePath}: ${error}`)
 }
 
 if (drift.length > 0) {

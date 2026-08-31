@@ -91,7 +91,7 @@ export const JobRecord = z.object({
   heartbeat_at: z.string().nullable().default(null),
   /** §12.6: bumped on every claim; old-generation runners are fenced out. */
   lease_generation: z.number().int().nonnegative().nullable().default(null),
-  /** §12.6: opaque lease token returned at claim time; persisted in payload.__lease_token. */
+  /** §12.6: opaque lease token returned only from the live claim process. */
   lease_token: z.string().nullable().default(null),
   // v2 shape (domain-model.md §9): durable submitter identity — the
   // authenticated principal who submitted the job (BFF-injected
@@ -164,6 +164,11 @@ export type KernelEvent = z.infer<typeof KernelEvent>
 export const SessionLink = z.object({
   session_id: z.string().min(1),
   project_id: z.string().min(1),
+  /** Durable authority for session-scoped operations such as PTY. A link
+   * without an authenticated principal is not a valid current link. */
+  principal_id: z.string().min(1),
+  tenant_id: z.string(),
+  issuer: z.enum(['standalone', 'dsh-plugin', 'kernel']),
   linked_at: z.string(),
-})
+}).strict()
 export type SessionLink = z.infer<typeof SessionLink>

@@ -262,7 +262,9 @@ describe('v2 methodology HTTP and typed client', () => {
       expect((await client.listMethodologyPackages('operator-http')).evaluations.records).toHaveLength(1)
 
       await client.recordProtocol(projectId, 'pi-http', { record: protocol(projectId), expected_revision: 0 })
-      kernel.linkSession('session_http', projectId)
+      kernel.linkSession('session_http', projectId, {
+        principal_id: 'pi-http', tenant_id: '', issuer: 'kernel',
+      })
       const activationProject = kernel.getProject(projectId)
       const activationAction = kernel.projectProjection(projectId).next_actions_v2.find(item => item.state === 'ready')
         ?? kernel.projectProjection(projectId).next_actions_v2.find(item => item.state !== 'done')

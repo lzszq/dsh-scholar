@@ -59,8 +59,8 @@ export async function renderPhase(
 
   if (projectId !== undefined) body.appendChild(methodologySummaryNode(methodology, 'overview'))
 
-  // next actions: GUIDE-01 structured v2 cards (panels/overview.ts) with
-  // legacy string[] fallback for old kernels — see next-action-cards.ts.
+  // GUIDE-01: only structured v2 cards are accepted. Missing or malformed
+  // projections stay a safe empty state; labels never reconstruct a CTA.
   renderNextActionSection(body, p)
 
   // history (audit ledger: transitions, gate decisions, renames, archives)

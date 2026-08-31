@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   MINERU_DEFAULT_BASE_URL,
+  mineruSettingsOperation,
   mineruBindingWrite,
   mineruProviderCreate,
   mineruProviderUpdate,
@@ -55,6 +56,20 @@ describe('OCR-CONFIG-01 MinerU Settings model', () => {
       purpose: 'ocr', provider_id: 'mineru', model_id: 'vlm', expected_provider_revision: 4, expected_revision: 2,
     })
     expect(update.credential).not.toHaveProperty('available')
+  })
+
+  it('submits Provider and project binding as one atomic Settings operation', () => {
+    const draft = mineruSettingsDraft(configured, binding)
+    expect(mineruSettingsOperation(draft, configured, binding, 'rsp_1')).toEqual({
+      kind: 'ocr-mineru',
+      provider: {
+        action: 'update', provider_id: 'mineru', expected_revision: 3,
+        patch: expect.objectContaining({ kind: 'mineru', credential: { scheme: 'file', name: 'mineru-token' } }),
+      },
+      binding: {
+        project_id: 'rsp_1', model_id: 'vlm', expected_provider_revision: 4, expected_revision: 2,
+      },
+    })
   })
 
   it('clears a SecretRef explicitly and rejects precision models without one', () => {

@@ -4,6 +4,8 @@
 
 DSH Scholar is an AI research workspace for computational research. It keeps project conversations, research materials, code and data, controlled experiment runs, evidence, and TeX manuscripts in one recoverable project. You can start from a new question or continue work that already exists elsewhere.
 
+> DSH Scholar is still under active development. Use it for supervised computational-research workflows, review every approval and research claim, and keep independent backups of important source material and results.
+
 ![DSH Scholar standalone workspace in English](docs/assets/dsh-scholar-home-en.png)
 
 ## What it provides
@@ -143,24 +145,13 @@ Chat accepts ordinary natural language and top-level slash commands. Explicit co
 
 `/run` executes only when its exact snapshots, Protocol, Runner, target, and budget are ready. `/release` creates or opens a Human Release decision; it does not let an Agent publish automatically.
 
-## Reproduced example: MNIST handwritten-digit classification
+## Example workflow
 
-On 2026-08-20, the repository's isolated reproduction harness ran three baseline and three treatment Jobs in real local Docker. All six Jobs succeeded on their first attempt and all six Run records were signed. The fixture uses a fixed 6,000-train/1,000-test MNIST subset, five CPU training epochs, and preregistered seeds 11, 23, and 47.
-
-| Result | Value |
-|---|---:|
-| Single-convolution baseline | 92.4% mean test accuracy |
-| Two-convolution treatment | 96.8% mean test accuracy |
-| Paired effect | +4.4 percentage points |
-| 95% interval | [1.2, 8.6], n=3 |
+The repository includes a supervised MNIST handwritten-digit workflow that demonstrates project intake, controlled Docker runs, evidence review, and manuscript-ready results without treating the fixture as a benchmark claim.
 
 ![MNIST project overview in English](docs/assets/cnn-mnist-actual-overview-en.png)
 
-![Six successful MNIST runs in English](docs/assets/cnn-mnist-actual-runs-en.png)
-
-![Accepted MNIST evidence in English](docs/assets/cnn-mnist-actual-evidence-en.png)
-
-The screenshots show the same project and revision. See the [reproduction receipt](docs/mnist-reproduction.md) for exact code/data/image/Protocol pins, per-seed results, signed Job/Run IDs, and the rerun command. This is a deterministic product fixture, not a full-MNIST benchmark or a state-of-the-art claim.
+See the [MNIST reproduction guide](docs/mnist-reproduction.md) for the pinned inputs, rerun procedure, and detailed receipts.
 
 ## Workspace areas
 
@@ -188,4 +179,4 @@ The repository's automated acceptance covers builds, schemas, Kernel and Client 
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [BSD 3-Clause License](LICENSE).

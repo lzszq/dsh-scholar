@@ -30,6 +30,19 @@ import { createHash } from 'node:crypto'
 import { isIP } from 'node:net'
 import { parseArgs } from 'node:util'
 import { z } from 'zod'
+import type { ConfigWriteScope } from './config-write.js'
+import { canonicalJsonDeep } from './canonical-json.js'
+import {
+  PTY_DEFAULT_IDLE_TTL_S,
+  PTY_DEFAULT_LEASE_TTL_S,
+  PTY_DEFAULT_RETENTION_BYTES,
+  PTY_MAX_IDLE_TTL_S,
+  PTY_MAX_LEASE_TTL_S,
+  PTY_MAX_RETENTION_BYTES,
+  PTY_MIN_IDLE_TTL_S,
+  PTY_MIN_LEASE_TTL_S,
+  PTY_MIN_RETENTION_BYTES,
+} from './pty.js'
 
 /**
  * ConfigScope of a canonical key. `global`/`project`/`job`/`runner-profile`
@@ -44,6 +57,20 @@ export const CONFIG_SCOPES: readonly ConfigScope[] = ['global', 'project', 'job'
 
 /** Where a key may be set. */
 export type ConfigSource = 'cli' | 'env' | 'file' | 'http' | 'ui'
+
+/** Durable Settings write layer. This is intentionally separate from the
+ * owner ConfigScope above: a project-owned key may only be written at the
+ * project layer, while daemon/runner keys are instance runtime settings. */
+export type ConfigApplyMode = 'hot' | 'restart'
+export type ConfigSecurityMerge = 'replace' | 'more-restrictive-only'
+
+export interface ConfigWriteDescriptor {
+  /** Empty means the field remains visible but is not writable. */
+  allowedScopes: readonly ConfigWriteScope[]
+  /** Authoritative apply verdict; the UI must not infer this from sources. */
+  apply: ConfigApplyMode
+  securityMerge: ConfigSecurityMerge
+}
 
 export interface ConfigCliFlag {
   /** CLI flag without leading dashes, e.g. 'poll-ms'. */
@@ -70,6 +97,8 @@ export interface ConfigKeyDefinition {
   securityFloor?: boolean
   /** Allowed configuration sources (CLI/env/file/HTTP/UI). */
   sources: readonly ConfigSource[]
+  /** Canonical Settings mutation policy generated into JSON Schema. */
+  write: ConfigWriteDescriptor
   /** Environment variable read when the key is not provided (when set). */
   env?: string
   /** CLI flag exposed by the binary owning this scope (when set). */
@@ -94,7 +123,9 @@ const ms = (max?: number): z.ZodNumber => {
  * intentionally has no entries yet: per-job timeouts/retention are currently
  * derived from the runner-profile scope and the job payload.
  */
-export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
+type ConfigKeyDefinitionSource = Omit<ConfigKeyDefinition, 'write'>
+
+const CONFIG_REGISTRY_SOURCE: readonly ConfigKeyDefinitionSource[] = [
   // ── global ───────────────────────────────────────────────────────────────
   {
     key: 'global.images_lock.path',
@@ -300,9 +331,9 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     schema: z.string(),
     default: '',
     secret: true,
-    cli: { flag: 'token' },
-    sources: ['cli', 'env', 'file'],
-    description: 'Kernel bearer token for the runner client.',
+    env: 'DSH_SCHOLAR_KERNEL_TOKEN',
+    sources: ['env', 'file'],
+    description: 'Kernel bearer token for the runner client; injected by environment or a managed 0600 config file, never argv.',
   },
   {
     key: 'runner.service_token',
@@ -310,10 +341,9 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     schema: z.string(),
     default: '',
     secret: true,
-    cli: { flag: 'service-token' },
     env: 'DSH_SCHOLAR_SERVICE_TOKEN',
-    sources: ['cli', 'env', 'file'],
-    description: 'Service identity for internal kernel routes.',
+    sources: ['env', 'file'],
+    description: 'Service identity for internal kernel routes; never argv.',
   },
   {
     key: 'runner.target_token',
@@ -321,10 +351,9 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     schema: z.string(),
     default: '',
     secret: true,
-    cli: { flag: 'target-token' },
     env: 'DSH_SCHOLAR_RUNNER_TARGET_TOKEN',
-    sources: ['cli', 'env', 'file'],
-    description: 'Target-scoped service identity for RunnerTarget heartbeat; independent from the shared internal-route token.',
+    sources: ['env', 'file'],
+    description: 'Target-scoped service identity for RunnerTarget heartbeat; independent from the shared internal-route token and never argv.',
   },
   // ── fleet 模式（FLEET-01，docs/remote-runner-wire.md §9 生产接线）─────────
   // runner 二进制三个互斥角色：本地 claim 循环（默认）、--fleet-server、
@@ -529,10 +558,9 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     schema: z.string(),
     default: '',
     secret: true,
-    cli: { flag: 'token' },
     env: 'DSH_SCHOLAR_KERNEL_TOKEN',
-    sources: ['cli', 'env', 'file'],
-    description: 'Kernel bearer token; never logged, never in argv when the env path is used.',
+    sources: ['env', 'file'],
+    description: 'Kernel bearer token; supplied only through environment or managed config files, never argv.',
   },
   {
     key: 'kernel.service_token',
@@ -540,10 +568,9 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     schema: z.string(),
     default: '',
     secret: true,
-    cli: { flag: 'service-token' },
     env: 'DSH_SCHOLAR_SERVICE_TOKEN',
-    sources: ['cli', 'env', 'file'],
-    description: 'Internal-route service identity (x-service-token).',
+    sources: ['env', 'file'],
+    description: 'Internal-route service identity (x-service-token); never accepted on argv.',
   },
   {
     key: 'kernel.db',
@@ -592,6 +619,30 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     securityFloor: true,
     sources: ['file', 'http', 'ui'],
     description: 'Reject unsigned run manifests at completion (RUN-01: default true).',
+  },
+  {
+    key: 'kernel.pty_idle_ttl_s',
+    scope: 'kernel',
+    schema: z.number().int().min(PTY_MIN_IDLE_TTL_S).max(PTY_MAX_IDLE_TTL_S),
+    default: PTY_DEFAULT_IDLE_TTL_S,
+    sources: ['file', 'http', 'ui'],
+    description: 'Idle lifetime in seconds pinned into each newly opened PTY session; existing sessions are unchanged.',
+  },
+  {
+    key: 'kernel.pty_retention_bytes',
+    scope: 'kernel',
+    schema: z.number().int().min(PTY_MIN_RETENTION_BYTES).max(PTY_MAX_RETENTION_BYTES),
+    default: PTY_DEFAULT_RETENTION_BYTES,
+    sources: ['file', 'http', 'ui'],
+    description: 'Bounded output bytes pinned into each newly opened PTY session; existing replay windows are unchanged.',
+  },
+  {
+    key: 'kernel.pty_lease_ttl_s',
+    scope: 'kernel',
+    schema: z.number().int().min(PTY_MIN_LEASE_TTL_S).max(PTY_MAX_LEASE_TTL_S),
+    default: PTY_DEFAULT_LEASE_TTL_S,
+    sources: ['file', 'http', 'ui'],
+    description: 'Lease lifetime in seconds pinned into each newly opened PTY session; existing lease expiry is unchanged.',
   },
 
   // ── standalone (research-ui BFF, design §15.2/§15.3) ─────────────────────
@@ -655,9 +706,8 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     schema: z.string(),
     default: '',
     secret: true,
-    cli: { flag: 'token' },
-    sources: ['cli', 'file'],
-    description: 'Loopback bearer token; auto-generated and persisted 0600 when empty.',
+    sources: ['file'],
+    description: 'Loopback bearer token; auto-generated and persisted in a 0600 managed file, never argv.',
   },
   {
     key: 'standalone.principal',
@@ -690,6 +740,48 @@ export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = [
     description: 'Tokenless mode — loopback bind only (127.0.0.0/8, ::1, localhost).',
   },
 ]
+
+/**
+ * The write-layer policy is materialized onto every exported descriptor, so
+ * JSON Schema, the server validator and Settings consume exactly the same
+ * metadata. Runtime-owned fields require a daemon/runner restart; project
+ * fields are read from the authoritative project projection for new work and
+ * therefore apply hot. Reserved job keys remain non-writable until they have
+ * a real consumer.
+ */
+const HOT_RUNTIME_KEYS = new Set([
+  'kernel.pty_idle_ttl_s',
+  'kernel.pty_retention_bytes',
+  'kernel.pty_lease_ttl_s',
+])
+
+function configWriteDescriptor(def: ConfigKeyDefinitionSource): ConfigWriteDescriptor {
+  // A Settings write is exposed only after the real owner consumes that
+  // durable layer. Project fields are applied to their canonical Project row
+  // in the write transaction. The Kernel manifest requirement is read before
+  // the reopened Kernel accepts work. All other deployment keys remain
+  // configurable through their existing CLI/env/file bootstrap until their
+  // owner has an equivalent applied-pin/reopen contract; advertising them as
+  // writable earlier would make the effective view lie about runtime state.
+  const allowedScopes: readonly ConfigWriteScope[] = def.scope === 'project'
+    ? ['project']
+    : def.key === 'kernel.require_signed_manifest' || HOT_RUNTIME_KEYS.has(def.key)
+      ? ['runtime']
+      : []
+  return {
+    allowedScopes,
+    apply: def.scope === 'project' || HOT_RUNTIME_KEYS.has(def.key) ? 'hot' : 'restart',
+    securityMerge: def.securityFloor === true ? 'more-restrictive-only' : 'replace',
+  }
+}
+
+export const CONFIG_REGISTRY: readonly ConfigKeyDefinition[] = CONFIG_REGISTRY_SOURCE.map(def => ({
+  ...def,
+  sources: configWriteDescriptor(def).allowedScopes.length === 0
+    ? def.sources
+    : [...new Set<ConfigSource>([...def.sources, 'http', 'ui'])],
+  write: configWriteDescriptor(def),
+}))
 
 /** Registry index by canonical key. */
 const BY_KEY: ReadonlyMap<string, ConfigKeyDefinition> = new Map(CONFIG_REGISTRY.map(def => [def.key, def]))
@@ -795,7 +887,7 @@ export class ConfigRegistryError extends Error {
  * ⇒ different pin. Secrets may be included — the pin is one-way and the
  * redacted view is what leaves the process. */
 export function pinConfig(config: Record<string, unknown>): string {
-  const canonical = JSON.stringify(config, Object.keys(config).sort())
+  const canonical = canonicalJsonDeep(config)
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`
 }
 
@@ -1034,8 +1126,8 @@ export function zodToJsonSchema(schema: z.ZodTypeAny): JsonSchemaNode {
 }
 
 /** JSON Schema (draft-07) of the whole registry (all scopes), nested by
- * dotted key segments. Leaf annotations: default, description, x-dsh-scope,
- * x-dsh-secret, x-dsh-security-floor. */
+ * dotted key segments. Leaf annotations include the canonical x-dsh-key so
+ * consumers never reconstruct identifiers from presentation nesting. */
 export function generateJsonSchema(): JsonSchemaNode {
   const scopeProperties: Record<string, JsonSchemaNode> = {}
   for (const scope of CONFIG_SCOPES) {
@@ -1061,8 +1153,14 @@ export function generateJsonSchema(): JsonSchemaNode {
       const leaf = zodToJsonSchema(def.schema)
       leaf.description = def.description
       leaf.default = def.default
+      leaf['x-dsh-key'] = def.key
       leaf['x-dsh-scope'] = def.scope
+      leaf['x-dsh-sources'] = [...def.sources]
+      leaf['x-dsh-write-scopes'] = [...def.write.allowedScopes]
+      leaf['x-dsh-apply'] = def.write.apply
+      leaf['x-dsh-security-merge'] = def.write.securityMerge
       if (def.secret === true) leaf['x-dsh-secret'] = true
+      if (def.secret === true) leaf['x-dsh-secret-input'] = 'secret-ref'
       if (def.securityFloor === true) leaf['x-dsh-security-floor'] = true
       if (def.env !== undefined) leaf['x-dsh-env'] = def.env
       ;(node.properties as Record<string, JsonSchemaNode>)[inner.at(-1) as string] = leaf

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { gateDecisionErrorKey, gateDecisionRequest } from '../../packages/dsh-research-ui/src/client/gate-decision'
-import { humanGateBffError, humanGateDecisionBody, type OperatorSession } from '../../packages/dsh-research-ui/src/standalone/server'
+import {
+  humanGateBffError, humanGateDecisionBody, humanGateUpstreamError, type OperatorSession,
+} from '../../packages/dsh-research-ui/src/standalone/server'
 
 const session: OperatorSession = {
   session_id: 'sess_real',
@@ -53,6 +55,23 @@ describe('Human Gate Decision BFF', () => {
         message: 'project not found',
         request_id: 'req_gate_preflight',
       },
+    })
+  })
+
+  it('redacts unknown upstream 5xx messages while preserving safe 4xx domain errors', () => {
+    const canary = 'secret=/srv/private/kernel.db SQL=SELECT * FROM credentials'
+    expect(humanGateUpstreamError('req_gate_500', 500, {
+      error: { code: 'internal_error', message: canary },
+    })).toEqual({
+      error: { code: 'internal_error', message: 'research request failed', request_id: 'req_gate_500' },
+    })
+    expect(JSON.stringify(humanGateUpstreamError('req_gate_500', 500, {
+      error: { code: 'internal_error', message: canary },
+    }))).not.toContain(canary)
+    expect(humanGateUpstreamError('req_gate_422', 422, {
+      error: { code: 'validation_error', message: 'invalid gate decision' },
+    })).toEqual({
+      error: { code: 'validation_error', message: 'invalid gate decision', request_id: 'req_gate_422' },
     })
   })
 

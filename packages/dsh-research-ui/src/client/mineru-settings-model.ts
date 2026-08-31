@@ -155,6 +155,51 @@ export function mineruBindingWrite(
   }
 }
 
+/** One Settings transaction operation for the global MinerU descriptor and
+ * optional project OCR binding. The provider's post-write revision is pinned
+ * before the request leaves the browser. */
+export function mineruSettingsOperation(
+  draft: MineruSettingsDraft,
+  provider: ProviderSafeViewLite | undefined,
+  binding: ProjectModelBindingLite | null | undefined,
+  projectId?: string,
+): {
+  kind: 'ocr-mineru'
+  provider:
+    | { action: 'create'; input: MineruProviderCreate }
+    | { action: 'update'; provider_id: 'mineru'; expected_revision: number; patch: MineruProviderWrite }
+  binding?: {
+    project_id: string
+    model_id: MineruModelId
+    expected_provider_revision: number
+    expected_revision?: number
+  }
+} {
+  const nextProviderRevision = provider === undefined ? 1 : provider.revision + 1
+  const providerOperation = provider === undefined
+    ? { action: 'create' as const, input: mineruProviderCreate(draft) }
+    : (() => {
+        const { expected_revision, ...patch } = mineruProviderUpdate(draft, provider.revision)
+        return { action: 'update' as const, provider_id: MINERU_PROVIDER_ID as typeof MINERU_PROVIDER_ID, expected_revision, patch }
+      })()
+  const projectBinding = projectId === undefined || !draft.enabled
+    ? undefined
+    : {
+        project_id: projectId,
+        model_id: draft.modelId,
+        expected_provider_revision: nextProviderRevision,
+        ...(binding === null || binding === undefined ? {} : { expected_revision: binding.revision }),
+      }
+  // Run the existing strict binding validation before returning the atomic
+  // wrapper (its provider revision is deliberately the post-write revision).
+  if (projectBinding !== undefined) mineruBindingWrite(draft, binding, nextProviderRevision)
+  return {
+    kind: 'ocr-mineru',
+    provider: providerOperation,
+    ...(projectBinding === undefined ? {} : { binding: projectBinding }),
+  }
+}
+
 export type MineruSettingsErrorKey =
   | 'shell.settings.ocr.saveFailed'
   | 'shell.settings.ocr.error.permission'

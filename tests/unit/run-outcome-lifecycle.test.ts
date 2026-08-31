@@ -14,6 +14,7 @@ import {
 } from '@dsh-scholar/research-schemas'
 
 const NOW = '2026-08-20T12:00:00.000Z'
+const RUNNER_SERVICE_TOKEN = 'runner-outcome-fixture-service-token'
 
 function brief() {
   return {
@@ -31,7 +32,11 @@ function brief() {
 }
 
 function freshKernel(root: string): ResearchKernel {
-  return new ResearchKernel({ dbPath: join(root, 'kernel.db'), casRoot: join(root, 'cas') })
+  return new ResearchKernel({
+    dbPath: join(root, 'kernel.db'),
+    casRoot: join(root, 'cas'),
+    serviceToken: RUNNER_SERVICE_TOKEN,
+  })
 }
 
 function synthesisForRequest(request: SynthesisRecordRequest) {
@@ -124,7 +129,7 @@ describe('Runner completion → classification → synthesis request lifecycle',
     })
     const { server, url } = await startKernelServer({ kernel, port: 0 })
     try {
-      const client = new ResearchClient({ endpoint: url })
+      const client = new ResearchClient({ endpoint: url, serviceToken: RUNNER_SERVICE_TOKEN })
       expect((await fetch(`${url}/v2/projects/${project.project_id}/run-outcome-observations`)).status).toBe(422)
       expect((await fetch(`${url}/v2/projects/${project.project_id}/run-outcome-observations`, {
         headers: { 'x-principal-id': 'outsider' },
@@ -139,11 +144,22 @@ describe('Runner completion → classification → synthesis request lifecycle',
         runner_target_ids: ['target_local_process_v1'],
       })
       expect(claimed?.job_id).toBe(job.job_id)
+      await expect(executeJob({ ...claimed!, run_id: null } as typeof claimed, {
+        client,
+        owner: 'local-fixture-runner',
+        mode: 'subprocess',
+        targetId: 'target_local_process_v1',
+      })).rejects.toThrow('missing the Kernel claim run_id')
+      await expect(executeJob({ ...claimed!, lease_token: null }, {
+        client,
+        owner: 'local-fixture-runner',
+        mode: 'subprocess',
+        targetId: 'target_local_process_v1',
+      })).rejects.toThrow('missing the Kernel claim lease fencing fields')
       const completed = await executeJob(claimed!, {
         client,
         owner: 'local-fixture-runner',
         mode: 'subprocess',
-        leaseGeneration: claimed!.lease_generation,
         targetId: 'target_local_process_v1',
         signingKey: { keyId: 'runner-local-fixture', privateKey },
       })
@@ -360,9 +376,14 @@ describe('Runner completion → classification → synthesis request lifecycle',
       runner_target_ids: ['target_local_process_v1'],
     })
     expect(claimed?.job_id).toBe(job.job_id)
+    const bound = kernel.getJob(job.job_id)
     const manifest = {
       run_id: claimed!.run_id,
       job_id: job.job_id,
+      project_id: project.project_id,
+      contract_id: null,
+      config_pin: bound.payload.project_config_pin,
+      lease: { generation: claimed!.lease_generation },
       resources: { cpu: 8, memory_gb: 32 },
       environment: { image: 'fixture@sha256:' + 'a'.repeat(64), variables: { LC_ALL: 'C.UTF-8' } },
       outputs: { metrics: { artifact_id: 'sha256:' + 'b'.repeat(64), rows: 1 } },

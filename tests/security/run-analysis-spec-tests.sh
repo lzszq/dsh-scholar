@@ -135,7 +135,7 @@ start_kernel() {
 start_kernel || { echo "kernel failed to start"; exit 1; }
 BASE="http://127.0.0.1:$PORT"
 ok "kernel healthy on port $PORT"
-nohup node "$RUNNER_BIN" --kernel "$BASE" --owner analysis-spec --poll-ms 200 --mode docker --target-id "$FORMAL_FIXTURE_TARGET_ID" --target-token "$FORMAL_FIXTURE_RUNNER_TARGET_TOKEN" --timeout-ms 30000 > "$WORK/runner.log" 2>&1 &
+DSH_SCHOLAR_RUNNER_TARGET_TOKEN="$FORMAL_FIXTURE_RUNNER_TARGET_TOKEN" nohup node "$RUNNER_BIN" --kernel "$BASE" --owner analysis-spec --poll-ms 200 --mode docker --target-id "$FORMAL_FIXTURE_TARGET_ID" --timeout-ms 30000 > "$WORK/runner.log" 2>&1 &
 RUNNER_PID=$!
 if formal_fixture_wait_runner_ready "$BASE"; then
   ok "runner started and target-scoped heartbeat is online (mode=docker, poll-ms=200)"

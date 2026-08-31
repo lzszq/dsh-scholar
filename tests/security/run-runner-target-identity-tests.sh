@@ -41,8 +41,8 @@ api() { curl -sf -H 'content-type: application/json' -H "x-service-token: $DSH_S
 # target allowlist. Secret values never cross this API.
 api -X POST "$BASE/v1/projects" -d '{"name":"target identity admin","workspace":"/w","creator_principal_id":"identity-operator","brief":{"problem":"p","scope":"s","questions":[],"primary_metrics":["m"],"resources":"","risks":[],"target_outputs":["paper"],"target_venue":null,"baseline_repo":null,"domain":"security"},"execution":{"runner_profile_id":"profile_local_docker_cpu_v1","runner_target_id":"target_local_docker_v1"}}' >/dev/null
 for id in a b; do
-  api -X POST "$BASE/v1/runner-targets" -H 'x-principal-id: identity-operator' \
-    -d "{\"target_id\":\"target-$id\",\"display_name\":\"Target $id\",\"kind\":\"local-docker\",\"service_identity\":{\"scheme\":\"file\",\"name\":\"runner/$id.token\"}}" >/dev/null
+  api -X POST "$BASE/v1/settings/transactions" -H 'x-principal-id: identity-operator' \
+    -d "{\"operations\":[{\"kind\":\"runner-target\",\"action\":\"create\",\"input\":{\"target_id\":\"target-$id\",\"display_name\":\"Target $id\",\"kind\":\"local-docker\",\"service_identity\":{\"scheme\":\"file\",\"name\":\"runner/$id.token\"}}}]}" >/dev/null
 done
 
 heartbeat() {

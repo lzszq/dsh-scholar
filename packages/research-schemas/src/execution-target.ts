@@ -17,9 +17,8 @@
  *   schema 用 `.strict()` 让这些字段出现在注册记录/plan 时直接拒绝——
  *   Job/UI 永远只见 opaque profile/target ID 与安全健康摘要。
  * - `scheduledTarget`：纯函数调度决策。capability 匹配、offline 拒绝、
- *   无匹配 → 明确 retryable 错误；绑定 target offline 时不回退
- *   LocalDocker，更不回退 subprocess（除非 policy 显式允许
- *   `allow_bound_fallback_to_local`）。
+ *   无匹配 → 明确 retryable 错误；绑定 target offline 时在任何策略下
+ *   都不回退 LocalDocker，更不回退 subprocess。
  *
  * 本轮为接口/schema 层：真实 mTLS 传输、远端 sandbox、spool、浏览器 UI
  * 不在本模块范围内（见 docs/hardening-v0.2-status.md RUN-REMOTE-01 行）。
@@ -29,9 +28,9 @@
 import { createHash, createPublicKey, sign, verify, type KeyObject } from 'node:crypto'
 import { z } from 'zod'
 import type { JobRecord } from './kernel.js'
-import type { RunnerProfile } from './runner-profile.js'
+import { computeProfileConfigHash, getRunnerProfile, PROFILE_CONFIG_HASH_RE } from './runner-profile.js'
 import { RunnerTargetKind } from './runner-target.js'
-import { DockerCompute } from './runner-environment.js'
+import { DOCKER_IMAGE_DIGEST_RE, DockerCompute } from './runner-environment.js'
 
 /** 本地 Docker target 的稳定 opaque id（Kernel/gateway/注册表共用）。 */
 export const LOCAL_DOCKER_TARGET_ID = 'local-docker'
@@ -45,20 +44,20 @@ export type ExecutionPlanKind = z.infer<typeof ExecutionPlanKind>
 /** Lease 绑定：plan 固定的 owner/generation/token，与 §12.6 fencing 一致。 */
 export const LeaseBinding = z.object({
   owner: z.string().min(1),
-  generation: z.number().int().nonnegative(),
-  token: z.string().nullable().default(null),
-  expires_at: z.string().nullable().default(null),
-})
+  generation: z.number().int().positive(),
+  token: z.string().min(1),
+  expires_at: z.string().nullable(),
+}).strict()
 export type LeaseBinding = z.infer<typeof LeaseBinding>
 
 /** 资源上限（§4.6.1 / RUN-02 容器基线；Kernel 固定，target 不得放宽）。 */
 export const ExecutionLimits = z.object({
   timeout_ms: z.number().int().positive(),
-  memory_mb: z.number().int().positive().default(1024),
-  cpus: z.number().positive().default(1),
-  pids: z.number().int().positive().default(256),
-  max_log_bytes: z.number().int().positive().default(32 * 1024 * 1024),
-})
+  memory_mb: z.number().int().positive(),
+  cpus: z.number().positive(),
+  pids: z.number().int().positive(),
+  max_log_bytes: z.number().int().positive(),
+}).strict()
 export type ExecutionLimits = z.infer<typeof ExecutionLimits>
 
 /**
@@ -68,24 +67,24 @@ export type ExecutionLimits = z.infer<typeof ExecutionLimits>
  */
 export const ExecutionNetwork = z.object({
   policy: z.literal('none'),
-})
+}).strict()
 export type ExecutionNetwork = z.infer<typeof ExecutionNetwork>
 
 /** 输出契约（§12.5 MetricsFileV1）：metrics 路径 + contract/seed 绑定。 */
 export const ExecutionOutputContract = z.object({
   /** output_contract.metrics 路径；secure kind 必须非空（RUN-01c）。 */
-  metrics_path: z.string().nullable().default(null),
-  contract_id: z.string().nullable().default(null),
-  seed: z.number().int().nullable().default(null),
+  metrics_path: z.string().nullable(),
+  contract_id: z.string().nullable(),
+  seed: z.number().int().nullable(),
   /** 允许的 metric 名（kernel 从 approved Contract 注入 payload.contract_metrics）。 */
-  contract_metrics: z.array(z.string()).default([]),
+  contract_metrics: z.array(z.string()),
   /**
    * smoke 显式 trusted fixture（execution-runtime.md §1）：subprocess 的唯一
    * 豁免（与本地 runner 的 payload.trusted_fixture 同一语义，固定进 plan 后
    * 远端 Agent 可判）。其余 kind 一律要求 digest-pinned container。
    */
-  trusted_fixture: z.boolean().default(false),
-})
+  trusted_fixture: z.boolean(),
+}).strict()
 export type ExecutionOutputContract = z.infer<typeof ExecutionOutputContract>
 
 /**
@@ -94,16 +93,16 @@ export type ExecutionOutputContract = z.infer<typeof ExecutionOutputContract>
  * latex-compile 由 kernel 注入锁内 texlive digest。target 不得改写。
  */
 export const ExecutionImage = z.object({
-  digest: z.string().min(1),
-})
+  digest: z.string().regex(DOCKER_IMAGE_DIGEST_RE, 'image digest must be repository@sha256:<64 hex>'),
+}).strict()
 export type ExecutionImage = z.infer<typeof ExecutionImage>
 
 /** 输入绑定：代码快照（CAS artifact id）与可选冻结 TeX snapshot。 */
 export const ExecutionSnapshot = z.object({
-  code_snapshot_id: z.string().nullable().default(null),
+  code_snapshot_id: z.string().nullable(),
   /** latex-compile 的冻结 TeX manifest（TEX-01：字节按 revision 从 snapshot store 取）。 */
-  tex_snapshot: z.record(z.unknown()).nullable().default(null),
-})
+  tex_snapshot: z.record(z.unknown()).nullable(),
+}).strict()
 export type ExecutionSnapshot = z.infer<typeof ExecutionSnapshot>
 
 /**
@@ -120,57 +119,57 @@ export const ExecutionPlan = z.object({
   /** Kernel durable runs 行的 run_id（RUN-01：每次 attempt 一个，跨 target 一致）。 */
   run_id: z.string().min(1),
   kind: ExecutionPlanKind,
-  command: z.array(z.string()).default([]),
+  command: z.array(z.string()),
   /** opaque runner profile id（Config/SecretRef 解析在服务端；Job/UI 只见 opaque id）。 */
   profile_id: z.string().min(1),
   /**
    * §12.2 data binding hash（Job payload.data_hash 固定进 plan；缺省 ''）。
    * 远端 manifest 的 data_hash 与本地 runner 同源——target 不得改写。
    */
-  data_hash: z.string().default(''),
+  data_hash: z.string(),
   /** §12.2 code commit（Job payload.code_commit 固定进 plan；缺省 ''）。 */
-  code_commit: z.string().default(''),
+  code_commit: z.string(),
   /**
    * profile 记录本身的 config hash pin（domain-model.md §9.1：Job 固定
    * profile/config hash；target 按注册表复算校验，不一致拒绝执行）。
-   * 缺省 null = legacy plan（未固定）。
+   * Every current plan carries the exact registered profile hash.
    */
-  profile_config_hash: z.string().nullable().default(null),
-  /** opaque target id（如 'local-docker' 或远端注册的 target_id）。 */
+  profile_config_hash: z.string().regex(PROFILE_CONFIG_HASH_RE, 'profile_config_hash must be sha256:<64 hex>'),
+  /** Kernel Job pin 中的 opaque target id。 */
   target_id: z.string().min(1),
-  /** Target registry pins; null only for pre-registry legacy plans. */
-  target_kind: RunnerTargetKind.nullable().default(null),
-  target_revision: z.number().int().positive().nullable().default(null),
-  target_config_hash: z.string().min(1).nullable().default(null),
+  /** 当前 Target registry pin；三项必须完整存在。 */
+  target_kind: RunnerTargetKind,
+  target_revision: z.number().int().positive(),
+  target_config_hash: z.string().regex(PROFILE_CONFIG_HASH_RE, 'target_config_hash must be sha256:<64 hex>'),
   lease: LeaseBinding,
-  /** effective config 的 sha256 pin（CONFIG-01；未知/未接入时 null）。 */
-  config_pin: z.string().nullable().default(null),
+  /** Kernel 提交 Job 时固定的 exact Project effective config pin（CONFIG-01）。 */
+  config_pin: z.string().regex(PROFILE_CONFIG_HASH_RE, 'config_pin must be sha256:<64 hex>'),
   image: ExecutionImage,
   /** Typed accelerator request; arbitrary Docker flags/devices are not part of the plan. */
-  compute: DockerCompute.default({ mode: 'cpu' }),
+  compute: DockerCompute,
   snapshot: ExecutionSnapshot,
   artifact_refs: z.object({
-    data_artifact_ids: z.array(z.string()).default([]),
-  }),
+    data_artifact_ids: z.array(z.string()),
+  }).strict(),
   limits: ExecutionLimits,
   network: ExecutionNetwork,
   /** 可选平台约束（capability 匹配用；null = 不限）。 */
   platform: z.object({
-    os: z.string().nullable().default(null),
-    arch: z.string().nullable().default(null),
-  }),
+    os: z.string().nullable(),
+    arch: z.string().nullable(),
+  }).strict(),
   /** 可选 runner 版本下限（capability 匹配用；null = 不限）。 */
   requires: z.object({
-    runner_version: z.string().nullable().default(null),
-  }),
+    runner_version: z.string().nullable(),
+  }).strict(),
   output_contract: ExecutionOutputContract,
   // ── 签名（§5.1：plan 固定并签名）───────────────────────────────────────
   /** Ed25519 base64 签名；未签名时 null（接口层允许，生产由 Kernel 强制）。 */
-  signature: z.string().nullable().default(null),
+  signature: z.string().nullable(),
   /** 签名前 canonical JSON 的 sha256。 */
-  payload_sha256: z.string().nullable().default(null),
+  payload_sha256: z.string().nullable(),
   /** 签名者 id（Kernel 的 runner key id 或内核身份）。 */
-  signed_by: z.string().nullable().default(null),
+  signed_by: z.string().nullable(),
   created_at: z.string(),
 }).strict()
 export type ExecutionPlan = z.infer<typeof ExecutionPlan>
@@ -189,19 +188,6 @@ export function canonicalPlanJson(value: unknown): string {
     return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalPlanJson(record[k])}`).join(',')}}`
   }
   return JSON.stringify(value)
-}
-
-/**
- * schema_version=1 plans shipped before typed compute existed.  Zod supplies
- * the CPU default while parsing those plans, so signing must treat that
- * default as an omitted wire field.  NVIDIA remains explicit and signed.
- * Keeping an explicit-CPU variant in verification also accepts plans emitted
- * during a rolling upgrade where the additive field was already present.
- */
-function planSigningShape<T extends Record<string, unknown>>(plan: T): T {
-  if ((plan.compute as { mode?: unknown } | undefined)?.mode !== 'cpu') return plan
-  const { compute: _defaultCompute, ...legacyCompatible } = plan
-  return legacyCompatible as T
 }
 
 /** plan 的确定性 fingerprint（sha256 over canonical JSON）——adapter 用它断言 plan 不可变。 */
@@ -224,9 +210,9 @@ export interface PlanSigningKey {
  */
 export function signExecutionPlan(plan: ExecutionPlan, key: PlanSigningKey): ExecutionPlan {
   const unsigned = { ...plan, payload_sha256: null, signature: null, signed_by: null }
-  const payloadSha256 = createHash('sha256').update(canonicalPlanJson(planSigningShape(unsigned))).digest('hex')
+  const payloadSha256 = createHash('sha256').update(canonicalPlanJson(unsigned)).digest('hex')
   const signed = { ...unsigned, payload_sha256: payloadSha256, signed_by: key.keyId }
-  const signature = sign(null, Buffer.from(canonicalPlanJson(planSigningShape(signed)), 'utf8'), key.privateKey).toString('base64')
+  const signature = sign(null, Buffer.from(canonicalPlanJson(signed), 'utf8'), key.privateKey).toString('base64')
   return { ...signed, signature }
 }
 
@@ -244,19 +230,14 @@ export function verifyExecutionPlanSignature(plan: ExecutionPlan, publicKeyPem: 
     return { valid: false, reason: 'plan is not signed (signature/payload_sha256 missing)' }
   }
   const unsigned = { ...plan, payload_sha256: null, signature: null, signed_by: null }
-  const signingVariants = [planSigningShape(unsigned), unsigned]
-  const matchedVariant = signingVariants.find(variant => createHash('sha256')
-    .update(canonicalPlanJson(variant))
-    .digest('hex') === plan.payload_sha256)
-  if (matchedVariant === undefined) {
+  const actualPayloadSha256 = createHash('sha256').update(canonicalPlanJson(unsigned)).digest('hex')
+  if (actualPayloadSha256 !== plan.payload_sha256) {
     return { valid: false, reason: 'payload_sha256 mismatch (plan content changed after signing)' }
   }
   try {
     const publicKey = createPublicKey(publicKeyPem)
-    const signedVariant = matchedVariant === unsigned
-      ? { ...plan, signature: null }
-      : planSigningShape({ ...plan, signature: null })
-    const ok = verify(null, Buffer.from(canonicalPlanJson(signedVariant), 'utf8'), publicKey, Buffer.from(plan.signature, 'base64'))
+    const signedPayload = { ...plan, signature: null }
+    const ok = verify(null, Buffer.from(canonicalPlanJson(signedPayload), 'utf8'), publicKey, Buffer.from(plan.signature, 'base64'))
     if (!ok) return { valid: false, reason: 'Ed25519 signature verification failed' }
   } catch (error) {
     return { valid: false, reason: `signature verification error: ${(error as Error).message}` }
@@ -267,21 +248,9 @@ export function verifyExecutionPlanSignature(plan: ExecutionPlan, publicKeyPem: 
 /** buildExecutionPlan 的调用方选项（Kernel 未来即由此固定 plan）。 */
 export interface BuildExecutionPlanOptions {
   run_id: string
-  lease: { owner: string; generation: number; token: string | null; expires_at: string | null }
-  image_digest: string
+  lease: { owner: string; generation: number; token: string; expires_at: string | null }
   timeout_ms: number
   command?: string[]
-  config_pin?: string | null
-  target_id?: string
-  profile_id?: string
-  compute?: z.infer<typeof DockerCompute>
-  /**
-   * 已解析的 RunnerProfile 记录（domain-model.md §9.1）：提供时 plan 的
-   * limits/network/profile_id/profile_config_hash 取自 profile（docker
-   * 参数来源 = profile 记录；缺省与现状一致）。调用方负责先按注册表
-   * 校验 profile_config_hash 一致——不一致不得执行。
-   */
-  profile?: RunnerProfile
   created_at?: string
 }
 
@@ -302,9 +271,28 @@ export function buildExecutionPlan(job: JobRecord, options: BuildExecutionPlanOp
     ? (payload.contract_metrics as unknown[]).filter((x): x is string => typeof x === 'string')
     : []
   const seed = typeof payload?.seed === 'number' && Number.isFinite(payload.seed) ? payload.seed : null
-  const payloadCompute = payload?.runner_compute === undefined
-    ? { mode: 'cpu' as const }
-    : DockerCompute.parse(payload.runner_compute)
+  const projectConfigPin = z.string()
+    .regex(PROFILE_CONFIG_HASH_RE, 'project_config_pin must be sha256:<64 hex>')
+    .parse(payload?.project_config_pin)
+  const targetId = z.string().min(1).parse(payload?.runner_target_id)
+  const targetKind = RunnerTargetKind.parse(payload?.runner_target_kind)
+  const targetRevision = z.number().int().positive().parse(payload?.runner_target_revision)
+  const targetConfigHash = z.string()
+    .regex(PROFILE_CONFIG_HASH_RE, 'runner_target_hash must be sha256:<64 hex>')
+    .parse(payload?.runner_target_hash)
+  const profileId = z.string().min(1).parse(payload?.runner_profile_id)
+  const profileConfigHash = z.string()
+    .regex(PROFILE_CONFIG_HASH_RE, 'profile_config_hash must be sha256:<64 hex>')
+    .parse(payload?.profile_config_hash)
+  const profile = getRunnerProfile(profileId)
+  if (profile === null) throw new Error(`runner profile ${profileId} is not registered`)
+  if (computeProfileConfigHash(profile) !== profileConfigHash) {
+    throw new Error(`runner profile ${profileId} config hash does not match the Job pin`)
+  }
+  const imageDigest = z.string()
+    .regex(/^[^@\s]+@sha256:[0-9a-f]{64}$/, 'image_digest must be repository@sha256:<64 hex>')
+    .parse(payload?.image_digest)
+  const payloadCompute = DockerCompute.parse(payload?.runner_compute)
   const plan: ExecutionPlan = {
     schema_version: 1,
     plan_id: `plan_${job.job_id}`,
@@ -313,17 +301,12 @@ export function buildExecutionPlan(job: JobRecord, options: BuildExecutionPlanOp
     run_id: options.run_id,
     kind: job.kind,
     command: options.command ?? job.command,
-    // opaque profile id：显式选项 > 已解析 profile > local-docker target 缺省。
-    profile_id: options.profile_id ?? options.profile?.profile_id ?? LOCAL_DOCKER_TARGET_ID,
-    profile_config_hash: options.profile?.config_hash ?? null,
-    target_id: options.target_id ?? LOCAL_DOCKER_TARGET_ID,
-    target_kind: typeof payload?.runner_target_kind === 'string'
-      ? payload.runner_target_kind as 'local-process' | 'local-docker' | 'remote-ssh'
-      : null,
-    target_revision: typeof payload?.runner_target_revision === 'number' ? payload.runner_target_revision : null,
-    target_config_hash: typeof payload?.runner_target_hash === 'string' && payload.runner_target_hash !== ''
-      ? payload.runner_target_hash
-      : null,
+    profile_id: profile.profile_id,
+    profile_config_hash: profile.config_hash,
+    target_id: targetId,
+    target_kind: targetKind,
+    target_revision: targetRevision,
+    target_config_hash: targetConfigHash,
     data_hash: typeof payload?.data_hash === 'string' ? payload.data_hash : '',
     code_commit: typeof payload?.code_commit === 'string' ? payload.code_commit : '',
     lease: {
@@ -332,11 +315,9 @@ export function buildExecutionPlan(job: JobRecord, options: BuildExecutionPlanOp
       token: options.lease.token,
       expires_at: options.lease.expires_at,
     },
-    config_pin: options.config_pin ?? null,
-    image: { digest: options.image_digest },
-    // Missing is the only backwards-compatible CPU default. Malformed data
-    // must never silently downgrade an intended NVIDIA run to CPU.
-    compute: options.compute ?? payloadCompute,
+    config_pin: projectConfigPin,
+    image: { digest: imageDigest },
+    compute: payloadCompute,
     snapshot: {
       code_snapshot_id: (job as JobRecord & { code_snapshot_id?: string | null }).code_snapshot_id ?? null,
       tex_snapshot: job.kind === 'latex-compile' ? (payload?.tex_snapshot as Record<string, unknown> | undefined) ?? null : null,
@@ -346,12 +327,12 @@ export function buildExecutionPlan(job: JobRecord, options: BuildExecutionPlanOp
     // profile 是 docker 参数来源；缺省值与现状字节级一致）。
     limits: {
       timeout_ms: options.timeout_ms,
-      memory_mb: options.profile?.limits.memory_mb ?? 1024,
-      cpus: options.profile?.limits.cpus ?? 1,
-      pids: options.profile?.limits.pids ?? 256,
+      memory_mb: profile.limits.memory_mb,
+      cpus: profile.limits.cpus,
+      pids: profile.limits.pids,
       max_log_bytes: 32 * 1024 * 1024,
     },
-    network: { policy: options.profile?.network_policy ?? 'none' },
+    network: { policy: profile.network_policy },
     platform: { os: null, arch: null },
     requires: { runner_version: null },
     output_contract: {
@@ -448,12 +429,7 @@ export const TargetSchedulingPolicy = z.object({
   allow_remote: z.boolean().default(true),
   /** last_seen 超过该毫秒数判定 offline。 */
   offline_after_ms: z.number().int().positive().default(30_000),
-  /**
-   * 显式允许 bound target 不可用时回退 local-docker。默认 false——
-   * §5.1：没有显式 PI/Operator 新 attempt 时不回退 LocalDocker。
-   */
-  allow_bound_fallback_to_local: z.boolean().default(false),
-})
+}).strict()
 export type TargetSchedulingPolicy = z.infer<typeof TargetSchedulingPolicy>
 
 export const DEFAULT_TARGET_SCHEDULING_POLICY: TargetSchedulingPolicy = {
@@ -461,7 +437,6 @@ export const DEFAULT_TARGET_SCHEDULING_POLICY: TargetSchedulingPolicy = {
   local_only: false,
   allow_remote: true,
   offline_after_ms: 30_000,
-  allow_bound_fallback_to_local: false,
 }
 
 /** offline 判定：status 非 online 或 last_seen 超过 offline_after_ms。 */
@@ -534,8 +509,7 @@ function rankCandidates(
  * - offline/draining 拒绝（health.status 与 last_seen 时效）；
  * - 无匹配 → 明确 retryable 错误（reason 区分 offline/draining/
  *   capability_mismatch/no_capable_target/policy_blocked），绝不静默回退
- *   subprocess；bound target 不可用时也不回退 LocalDocker，除非 policy
- *   显式 `allow_bound_fallback_to_local`；
+ *   subprocess；bound target 不可用时也不回退 LocalDocker；
  * - policy 可配置（prefer local / local_only / allow_remote）。
  *
  * `now` 显式传入保证确定性（测试固定时间；生产传 Date.now()）。
@@ -554,26 +528,17 @@ export function scheduledTarget(
   if (!policy.allow_remote) {
     candidates = candidates.filter(r => r.target_id === LOCAL_DOCKER_TARGET_ID)
   }
-  const fallbackToLocal = (): TargetSelection | null => {
-    if (!policy.allow_bound_fallback_to_local || plan.target_id === LOCAL_DOCKER_TARGET_ID) return null
-    const local = registrations
-      .filter(r => r.target_id === LOCAL_DOCKER_TARGET_ID)
-      .filter(r => isTargetAvailable(r, now, policy.offline_after_ms))
-      .filter(r => matchesTargetCapability(plan, r))
-    const pick = rankCandidates(local, true)[0]
-    return pick !== undefined ? { assigned: true, target_id: pick.target_id } : null
-  }
   if (candidates.length === 0) {
-    return fallbackToLocal() ?? { assigned: false, retryable: true, reason: 'no_capable_target', target_id: plan.target_id }
+    return { assigned: false, retryable: true, reason: 'no_capable_target', target_id: plan.target_id }
   }
   const available = candidates.filter(r => isTargetAvailable(r, now, policy.offline_after_ms))
   if (available.length === 0) {
     const reason: TargetUnavailableReason = candidates.some(r => r.health.status === 'draining') ? 'draining' : 'offline'
-    return fallbackToLocal() ?? { assigned: false, retryable: true, reason, target_id: plan.target_id }
+    return { assigned: false, retryable: true, reason, target_id: plan.target_id }
   }
   const capable = available.filter(r => matchesTargetCapability(plan, r))
   if (capable.length === 0) {
-    return fallbackToLocal() ?? { assigned: false, retryable: true, reason: 'capability_mismatch', target_id: plan.target_id }
+    return { assigned: false, retryable: true, reason: 'capability_mismatch', target_id: plan.target_id }
   }
   const pick = rankCandidates(capable, policy.prefer_local)[0]
   if (pick === undefined) {

@@ -1,9 +1,16 @@
 import {
   enqueueFiles,
+  isUploadFailure,
+  uploadFailure,
   type FileByteProvider,
   type UploadQueueItem,
   type UploadSessionProjection,
 } from './chunked-upload'
+import {
+  ChatScopeTombstoneRegistry,
+  chatScopeKey,
+  chatScopeTombstoneRegistry,
+} from './chat-scope-abort'
 
 export type ChatUploadFile = Pick<File, 'name' | 'size' | 'type' | 'slice'>
 
@@ -46,7 +53,7 @@ function parseStoredItem(value: unknown, projectId: string): UploadQueueItem | n
     || (item.chunkSize !== null && (!Number.isSafeInteger(item.chunkSize) || (item.chunkSize as number) <= 0))
     || !Number.isSafeInteger(item.committedOffset) || (item.committedOffset as number) < 0
     || !Number.isSafeInteger(item.retryCount) || (item.retryCount as number) < 0
-    || (item.lastError !== null && typeof item.lastError !== 'string')
+    || (item.lastError !== null && !isUploadFailure(item.lastError))
   ) return null
   if (
     (item.fileSize as number) < 0
@@ -63,13 +70,14 @@ function parseStoredItem(value: unknown, projectId: string): UploadQueueItem | n
  * the File handles needed by pause/resume/retry. */
 export class ChatUploadStore {
   private readonly scopes = new Map<string, UploadScope>()
-  private readonly closedScopes = new Set<string>()
-  private readonly closedProjects = new Set<string>()
 
-  constructor(private readonly storage: UploadQueueStorage | null = defaultStorage()) {}
+  constructor(
+    private readonly storage: UploadQueueStorage | null = defaultStorage(),
+    private readonly tombstones = new ChatScopeTombstoneRegistry(),
+  ) {}
 
   private key(projectId: string, sessionId: string): string {
-    return JSON.stringify([projectId, sessionId])
+    return chatScopeKey(projectId, sessionId)
   }
 
   private storageKey(projectId: string, sessionId: string): string {
@@ -78,13 +86,13 @@ export class ChatUploadStore {
 
   private load(projectId: string, sessionId: string): UploadScope | undefined {
     const key = this.key(projectId, sessionId)
-    if (this.closedProjects.has(projectId) || this.closedScopes.has(key) || this.storage === null) return undefined
+    if (this.tombstones.closed(projectId, sessionId) || this.storage === null) return undefined
     try {
       const raw = this.storage.getItem(this.storageKey(projectId, sessionId))
       if (raw === null) return undefined
       const decoded = JSON.parse(raw) as unknown
       if (!Array.isArray(decoded)) return undefined
-      const items = decoded.flatMap(candidate => {
+      const items: UploadQueueItem[] = decoded.flatMap(candidate => {
         const parsed = parseStoredItem(candidate, projectId)
         if (parsed === null) return []
         const needsBytes = ['hashing', 'queued', 'uploading', 'paused', 'finalizing'].includes(parsed.state)
@@ -92,7 +100,7 @@ export class ChatUploadStore {
           ...parsed,
           ...(needsBytes ? {
             state: 'failed' as const,
-            lastError: 'upload_file_reselect_required',
+            lastError: uploadFailure('upload_file_reselect_required'),
           } : {}),
         }]
       })
@@ -121,7 +129,7 @@ export class ChatUploadStore {
 
   private scope(projectId: string, sessionId: string, create = false): UploadScope | undefined {
     const key = this.key(projectId, sessionId)
-    if (this.closedProjects.has(projectId) || this.closedScopes.has(key)) return undefined
+    if (this.tombstones.closed(projectId, sessionId)) return undefined
     const current = this.scopes.get(key)
     if (current !== undefined) return current
     const restored = this.load(projectId, sessionId)
@@ -233,7 +241,7 @@ export class ChatUploadStore {
           committedOffset: 0,
           chunkSize: null,
           state: 'failed',
-          lastError: 'upload_session_unavailable',
+          lastError: { code: 'upload_session_unavailable' },
         })
         scope.files.delete(fileId)
         continue
@@ -251,7 +259,7 @@ export class ChatUploadStore {
           committedOffset: 0,
           chunkSize: null,
           state: 'failed',
-          lastError: 'upload_session_identity_mismatch',
+          lastError: { code: 'upload_session_identity_mismatch' },
         }
         scope.files.delete(fileId)
       } else if (server.status === 'open') {
@@ -262,7 +270,7 @@ export class ChatUploadStore {
           chunkSize: server.chunk_size,
           committedOffset: server.committed_offset,
           state: hasBytes ? 'paused' : 'failed',
-          lastError: hasBytes ? null : 'upload_file_reselect_required',
+          lastError: hasBytes ? null : { code: 'upload_file_reselect_required' },
         }
       } else if (server.status === 'finalized') {
         next = { ...item, committedOffset: item.fileSize, state: 'scanning', lastError: null }
@@ -274,7 +282,7 @@ export class ChatUploadStore {
           committedOffset: 0,
           chunkSize: null,
           state: 'failed',
-          lastError: `upload_session_${server.status}`,
+          lastError: { code: server.status === 'aborted' ? 'upload_session_aborted' : 'upload_session_expired' },
         }
         scope.files.delete(fileId)
       }
@@ -312,8 +320,20 @@ export class ChatUploadStore {
 
   clear(projectId: string, sessionId: string): UploadQueueItem[] {
     const key = this.key(projectId, sessionId)
-    const items = this.list(projectId, sessionId)
-    this.closedScopes.add(key)
+    let items = [...(this.scopes.get(key)?.items.values() ?? [])]
+    if (items.length === 0 && this.storage !== null) {
+      try {
+        const raw = this.storage.getItem(this.storageKey(projectId, sessionId))
+        const decoded = raw === null ? [] : JSON.parse(raw) as unknown
+        if (Array.isArray(decoded)) {
+          items = decoded.flatMap(candidate => {
+            const parsed = parseStoredItem(candidate, projectId)
+            return parsed === null ? [] : [parsed]
+          })
+        }
+      } catch { /* private mode / corrupt queue */ }
+    }
+    this.tombstones.seal(projectId, sessionId)
     this.scopes.delete(key)
     try { this.storage?.removeItem(this.storageKey(projectId, sessionId)) } catch { /* private mode */ }
     return items
@@ -339,7 +359,7 @@ export class ChatUploadStore {
       } catch { /* private mode */ }
     }
     const discarded = [...sessionIds].flatMap(sessionId => this.clear(projectId, sessionId))
-    this.closedProjects.add(projectId)
+    this.tombstones.sealProject(projectId)
     if (this.storage !== null) {
       try {
         const prefix = `${UPLOAD_QUEUE_KEY_PREFIX}${encodeURIComponent(projectId)}:`
@@ -351,4 +371,4 @@ export class ChatUploadStore {
   }
 }
 
-export const chatUploadStore = new ChatUploadStore()
+export const chatUploadStore = new ChatUploadStore(defaultStorage(), chatScopeTombstoneRegistry)

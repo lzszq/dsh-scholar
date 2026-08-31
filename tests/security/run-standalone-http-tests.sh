@@ -46,14 +46,26 @@ kill_test_servers() {
 }
 trap 'kill_test_servers; rm -rf "$WORK"' EXIT
 
+seed_standalone_token() {
+  token_dir=$1
+  token_value=$2
+  mkdir -p "$token_dir"
+  chmod 700 "$token_dir"
+  token_tmp="$token_dir/.standalone-token.test.$$"
+  printf '%s' "$token_value" > "$token_tmp"
+  chmod 600 "$token_tmp"
+  mv -f "$token_tmp" "$token_dir/standalone-token"
+}
+
 # ── OPS-01: custom CLI args + readiness + cleanup ──────────────────────────
 WEB_PORT=$((21000 + RANDOM % 5000))
 KERNEL_PORT=$((WEB_PORT + 1))
 DATA="$WORK/data"
 TOKEN="accept-token-$(date +%s)"
 LOG="$WORK/server.log"
+seed_standalone_token "$DATA" "$TOKEN"
 node "$SERVER_BIN" --host 127.0.0.1 --port "$WEB_PORT" --kernel-port "$KERNEL_PORT" \
-  --kernel-data-dir "$DATA" --data-dir "$DATA" --token "$TOKEN" --principal ops-1 > "$LOG" 2>&1 &
+  --kernel-data-dir "$DATA" --data-dir "$DATA" --principal ops-1 > "$LOG" 2>&1 &
 SPID=$!
 
 ready=0
@@ -72,7 +84,7 @@ MODE=$(stat -c %a "$DATA/standalone-token" 2>/dev/null || echo "?")
 [ "$MODE" = "600" ] && ok "SEC: token file 0600 (got $MODE)" || fail "SEC: token file mode $MODE"
 [ -L "$DATA/standalone-token" ] && fail "SEC: token file is a symlink" || ok "SEC: token file not a symlink"
 [ -s "$DATA/standalone-token" ] && ok "SEC: token file non-empty" || fail "SEC: token file empty"
-[ "$(tr -d '\n' < "$DATA/standalone-token")" = "$TOKEN" ] && ok "SEC: token file matches --token" || fail "SEC: token file mismatch"
+[ "$(tr -d '\n' < "$DATA/standalone-token")" = "$TOKEN" ] && ok "SEC: server reads the pre-provisioned token file" || fail "SEC: token file mismatch"
 
 # ── SEC-UI-01: token-check 401/200 ─────────────────────────────────────────
 R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$WEB_PORT/api/token-check" -H 'content-type: application/json' -d '{"token":"wrong"}')
@@ -245,8 +257,9 @@ fi
 MEM_WEB=$((WEB_PORT + 700))
 MEM_KERNEL=$((WEB_PORT + 701))
 MEM_DATA="$WORK/memdata"
+seed_standalone_token "$MEM_DATA" "$TOKEN"
 node "$SERVER_BIN" --host 127.0.0.1 --port "$MEM_WEB" --kernel-port "$MEM_KERNEL" \
-  --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --token "$TOKEN" --principal ops-1 > "$WORK/mem.log" 2>&1 &
+  --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --principal ops-1 > "$WORK/mem.log" 2>&1 &
 MEM_PID=$!
 memready=0
 for _ in $(seq 1 60); do
@@ -257,7 +270,7 @@ done
 if [ "$memready" = 1 ]; then
   # ops-1 creates a project (creator PI seeded via the kernel API field).
   MP=$(curl -s -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -X POST "http://127.0.0.1:$MEM_WEB/v1/projects" \
-    -d '{"name":"mem-rt","workspace":"/w/mem","mode":"gate-only","creator_principal_id":"ops-1","execution":{"runner_profile_id":"profile_local_docker_cpu_v1"},"brief":{"problem":"p","scope":"s","questions":[],"primary_metrics":["m"],"resources":"","risks":[],"target_outputs":["paper"],"target_venue":null,"baseline_repo":null,"domain":"ml"}}' \
+    -d '{"name":"mem-rt","workspace":"/w/mem","mode":"gate-only","creator_principal_id":"ops-1","execution":{"runner_profile_id":"profile_isolated_subprocess_v1","runner_target_id":"target_local_process_v1"},"brief":{"problem":"p","scope":"s","questions":[],"primary_metrics":["m"],"resources":"","risks":[],"target_outputs":["paper"],"target_venue":null,"baseline_repo":null,"domain":"ml"}}' \
     | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.project_id||'')})")
   [ -n "$MP" ] && ok "API-01: member-created project ($MP)" || fail "API-01: create"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$MEM_WEB/v1/projects/$MP")
@@ -279,7 +292,7 @@ if [ "$memready" = 1 ]; then
 fi
 # A second BFF with a DIFFERENT principal must not see the project (404).
 node "$SERVER_BIN" --host 127.0.0.1 --port "$((MEM_WEB + 2))" --kernel-port "$MEM_KERNEL" \
-  --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --token "$TOKEN" --principal other-user > "$WORK/mem2.log" 2>&1 &
+  --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --principal other-user > "$WORK/mem2.log" 2>&1 &
 MEM2_PID=$!
 for _ in $(seq 1 60); do
   if curl -sf -m 2 -X POST "http://127.0.0.1:$((MEM_WEB + 2))/api/token-check" -H 'content-type: application/json' -d "{\"token\":\"$TOKEN\"}" > /dev/null 2>&1; then break; fi
@@ -413,13 +426,13 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
   # reuse the same kernel sidecar (identity-verified, SIDE-01).
   VROLE_WEB=$((MEM_WEB + 3)); RROLE_WEB=$((MEM_WEB + 4)); AROLE_WEB=$((MEM_WEB + 5))
   node "$SERVER_BIN" --host 127.0.0.1 --port "$VROLE_WEB" --kernel-port "$MEM_KERNEL" \
-    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --token "$TOKEN" --principal viewer-1 > "$WORK/viewer.log" 2>&1 &
+    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --principal viewer-1 > "$WORK/viewer.log" 2>&1 &
   VROLE_PID=$!
   node "$SERVER_BIN" --host 127.0.0.1 --port "$RROLE_WEB" --kernel-port "$MEM_KERNEL" \
-    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --token "$TOKEN" --principal researcher-1 > "$WORK/researcher.log" 2>&1 &
+    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --principal researcher-1 > "$WORK/researcher.log" 2>&1 &
   RROLE_PID=$!
   node "$SERVER_BIN" --host 127.0.0.1 --port "$AROLE_WEB" --kernel-port "$MEM_KERNEL" \
-    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --token "$TOKEN" --principal auditor-1 > "$WORK/auditor.log" 2>&1 &
+    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --principal auditor-1 > "$WORK/auditor.log" 2>&1 &
   AROLE_PID=$!
   for P in "$VROLE_WEB" "$RROLE_WEB" "$AROLE_WEB"; do
     for _ in $(seq 1 60); do
@@ -554,8 +567,9 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
     | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.intake_id||'')})")
   [ -n "$IID" ] && ok "P1: intake session begun on kernel ($IID)" || fail "P1: intake begin"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -H "Authorization: Bearer $MEMKTOKEN" -H 'x-principal-id: researcher-1' \
+    -H "x-service-token: $MEMSTOKEN" -H 'x-service-principal: standalone-human-bff' -H 'x-principal-session: session-researcher-1' \
     -X POST "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/intake/$IID/adopt" \
-    -d '{"principal":{"principal_id":"ops-1"},"expected_proposal_revision":1}')
+    -d '{"expected_proposal_revision":1}')
   [ "$R" = "403" ] && ok "P1: kernel direct adopt as researcher -> 403 role_forbidden" || fail "P1: kernel researcher adopt -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $MEMKTOKEN" -H 'x-principal-id: researcher-1' \
     "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/archive")
@@ -564,14 +578,16 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
     "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/unarchive")
   [ "$R" = "403" ] && ok "P1: kernel direct unarchive as researcher -> 403" || fail "P1: kernel researcher unarchive -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -H "Authorization: Bearer $MEMKTOKEN" \
+    -H "x-service-token: $MEMSTOKEN" -H 'x-service-principal: standalone-human-bff' \
     -X POST "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/intake/$IID/adopt" -d '{"expected_proposal_revision":1}')
   [ "$R" = "422" ] && ok "P1: kernel direct adopt without principal -> 422 principal_required" || fail "P1: kernel no-principal adopt -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $MEMKTOKEN" \
     "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/archive")
   [ "$R" = "422" ] && ok "P1: kernel direct archive without principal -> 422 principal_required" || fail "P1: kernel no-principal archive -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -H "Authorization: Bearer $MEMKTOKEN" -H 'x-principal-id: viewer-1' \
+    -H "x-service-token: $MEMSTOKEN" -H 'x-service-principal: standalone-human-bff' -H 'x-principal-session: session-viewer-1' \
     -X POST "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/intake/$IID/adopt" \
-    -d '{"principal":{"principal_id":"ops-1"},"expected_proposal_revision":1}')
+    -d '{"expected_proposal_revision":1}')
   [ "$R" = "404" ] && ok "P1: kernel direct adopt as non-member -> 404 (no enumeration)" || fail "P1: kernel non-member adopt -> $R"
   # PI positive path through the BFF: the full intake pipeline on PROJ2, then
   # the PI (ops-1) adopts — the BFF forwards with x-principal-id/x-principal-role
@@ -590,7 +606,7 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
     "http://127.0.0.1:$MEM_WEB/v1/projects/$PROJ2/intake/$IID/scan")
   [ "$R" = "200" ] && ok "P1: intake scan -> 200" || fail "P1: scan -> $R"
   ANS=$(curl -s -H "Authorization: Bearer $MEMKTOKEN" "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/intake/$IID/questions" \
-    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const q=(JSON.parse(d).questions)||[];const a=q.filter(x=>x.required).map(x=>({question_code:x.question_code,answer:x.question_code==='observed_phase_claim'?'brief':'yes',question_revision:x.question_revision}));console.log(JSON.stringify({answers:a,principal:{principal_id:'ops-1'}}))})")
+    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const q=(JSON.parse(d).questions)||[];const a=q.filter(x=>x.required).map(x=>({question_code:x.question_code,answer:x.question_code==='observed_phase_claim'?'brief':'yes',question_revision:x.question_revision}));console.log(JSON.stringify({answers:a}))})")
   R=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
     "http://127.0.0.1:$MEM_WEB/v1/projects/$PROJ2/intake/$IID/answers" -d "$ANS")
   [ "$R" = "200" ] && ok "P1: intake grill answers -> 200" || fail "P1: answers -> $R"
@@ -600,7 +616,7 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
   [ "$PROPOSAL" = "201" ] && [ -n "$PREV" ] && ok "P1: intake propose -> 201 (revision $PREV)" || fail "P1: propose -> $PROPOSAL ($(head -c 120 "$WORK/p1-propose.json"))"
   ADOPT=$(curl -s -o "$WORK/p1-adopt.json" -w '%{http_code}' -X POST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
     "http://127.0.0.1:$MEM_WEB/v1/projects/$PROJ2/intake/$IID/adopt" \
-    -d "{\"principal\":{\"principal_id\":\"ops-1\"},\"expected_proposal_revision\":$PREV}")
+    -d "{\"expected_proposal_revision\":$PREV}")
   RECEIPT=$(node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const j=JSON.parse(d);console.log(j.adoption_id||'')}catch(e){console.log('')}})" < "$WORK/p1-adopt.json")
   [ "$ADOPT" = "200" ] && [ -n "$RECEIPT" ] && ok "P1: PI intake adopt via BFF -> 200 (receipt $RECEIPT)" || fail "P1: PI adopt -> $ADOPT ($(head -c 120 "$WORK/p1-adopt.json"))"
   # PI/operator archive + unarchive success through the BFF (200, not 403).
@@ -615,8 +631,9 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
     -X DELETE "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/members/researcher-1" -d '{"actor":"ops-1"}')
   [ "$R" = "200" ] && ok "P1: researcher-1 removed from PI-only project" || fail "P1: remove researcher-1 -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -H "Authorization: Bearer $MEMKTOKEN" -H 'x-principal-id: researcher-1' \
+    -H "x-service-token: $MEMSTOKEN" -H 'x-service-principal: standalone-human-bff' -H 'x-principal-session: session-researcher-1' \
     -X POST "http://127.0.0.1:$MEM_KERNEL/v1/projects/$PROJ2/intake/$IID/adopt" \
-    -d '{"principal":{"principal_id":"ops-1"},"expected_proposal_revision":1}')
+    -d '{"expected_proposal_revision":1}')
   [ "$R" = "404" ] && ok "P1: revoked researcher adopt -> 404 on the very next request (no stale membership)" || fail "P1: revoked researcher adopt -> $R"
 fi
 
@@ -634,7 +651,7 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
   BAPI() { curl -s -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' "$@"; }
   # Foreign project owned by p0-2-foreign (kernel direct) — ops-1 is NOT a member.
   FB=$(KAPI -X POST "http://127.0.0.1:$MEM_KERNEL/v1/projects" \
-    -d '{"name":"p02-foreign","workspace":"/w/p02f","mode":"gate-only","creator_principal_id":"p0-2-foreign","brief":{"problem":"p","scope":"s","questions":[],"primary_metrics":["m"],"resources":"","risks":[],"target_outputs":["paper"],"target_venue":null,"baseline_repo":null,"domain":"ml"}}' \
+    -d '{"name":"p02-foreign","workspace":"/w/p02f","mode":"gate-only","creator_principal_id":"p0-2-foreign","execution":{"runner_profile_id":"profile_isolated_subprocess_v1","runner_target_id":"target_local_process_v1"},"brief":{"problem":"p","scope":"s","questions":[],"primary_metrics":["m"],"resources":"","risks":[],"target_outputs":["paper"],"target_venue":null,"baseline_repo":null,"domain":"ml"}}' \
     | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.project_id||'')})")
   [ -n "$FB" ] && ok "P0-2: foreign project created on kernel ($FB)" || fail "P0-2: foreign project create"
   # Artifacts: one in the foreign project, one in the member project.
@@ -682,33 +699,39 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
   # client's x-pty-lease passes through and the KERNEL enforces it).
   FBWS=$(KAPI -X POST "http://127.0.0.1:$MEM_KERNEL/v1/projects/$FB/workspaces" -d '{"kind":"scratch","name":"s"}' \
     | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.workspace_id||'')})")
+  FBCTX=$(curl -s "http://127.0.0.1:$MEM_KERNEL/v1/pty/contexts?project_id=$FB" \
+    -H "Authorization: Bearer $MEMKTOKEN" -H 'x-principal-id: p0-2-foreign' \
+    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);console.log((Array.isArray(a)?a:[]).find(x=>x.context_kind==='research')?.context_id||'')})")
   PTY_FB=$(curl -s -X POST "http://127.0.0.1:$MEM_KERNEL/v1/pty/sessions" -H 'content-type: application/json' \
     -H "Authorization: Bearer $MEMKTOKEN" -H 'x-principal-id: p0-2-foreign' \
-    -d "{\"project_id\":\"$FB\",\"workspace_id\":\"$FBWS\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\"}" \
+    -d "{\"context_id\":\"$FBCTX\",\"workspace_id\":\"$FBWS\",\"label\":\"foreign\",\"purpose\":\"authz test\",\"preset\":\"sh\",\"cwd\":\".\"}" \
     | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.pty_session_id||'')})")
   MPWS=$(BAPI -X POST "http://127.0.0.1:$MEM_WEB/v1/projects/$MP/workspaces" -d '{"kind":"scratch","name":"s"}' \
     | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.workspace_id||'')})")
+  MPCTX=$(BAPI "http://127.0.0.1:$MEM_WEB/v1/pty/contexts?project_id=$MP" \
+    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);console.log((Array.isArray(a)?a:[]).find(x=>x.context_kind==='research')?.context_id||'')})")
   PTY_OPEN_MP=$(curl -s -X POST "http://127.0.0.1:$MEM_WEB/v1/pty/sessions" -H 'content-type: application/json' \
     -H "Authorization: Bearer $TOKEN" \
-    -d "{\"project_id\":\"$MP\",\"workspace_id\":\"$MPWS\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\"}")
+    -d "{\"context_id\":\"$MPCTX\",\"workspace_id\":\"$MPWS\",\"label\":\"member\",\"purpose\":\"authz test\",\"preset\":\"sh\",\"cwd\":\".\"}")
   PTY_MP=$(printf '%s' "$PTY_OPEN_MP" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.pty_session_id||'')})")
   PTY_LEASE_MP=$(printf '%s' "$PTY_OPEN_MP" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.lease_token||'')})")
+  PTY_GEN_MP=$(printf '%s' "$PTY_OPEN_MP" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const j=JSON.parse(d);console.log(j.generation||'')})")
   [ -n "$PTY_FB" ] && ok "P0-2: foreign pty session opened on kernel ($PTY_FB)" || fail "P0-2: foreign pty open"
   [ -n "$PTY_MP" ] && [ -n "$PTY_LEASE_MP" ] && ok "P0-2: member pty session opened via BFF ($PTY_MP)" || fail "P0-2: member pty open ($(printf '%s' "$PTY_OPEN_MP" | head -c 160))"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$MEM_WEB/v1/pty/sessions/$PTY_FB")
   [ "$R" = "404" ] && ok "P0-2: non-member pty session read -> 404" || fail "P0-2: non-member pty read -> $R"
-  R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$MEM_WEB/v1/pty/sessions/$PTY_MP")
+  R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H "x-pty-lease: $PTY_LEASE_MP" "http://127.0.0.1:$MEM_WEB/v1/pty/sessions/$PTY_MP?expected_generation=$PTY_GEN_MP")
   [ "$R" = "200" ] && ok "P0-2: member pty session read -> 200" || fail "P0-2: member pty read -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$MEM_WEB/v1/pty/sessions/pty_does_not_exist")
   [ "$R" = "404" ] && ok "P0-2: guessed pty session id -> 404" || fail "P0-2: guessed pty -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
     -H "x-pty-lease: $PTY_LEASE_MP" \
     -X POST "http://127.0.0.1:$MEM_WEB/v1/pty/sessions/$PTY_MP/control" \
-    -d '{"client_seq":1,"type":"bytes","payload":{"text":"ls\n","byte_length":3}}')
+    -d "{\"client_seq\":1,\"expected_generation\":$PTY_GEN_MP,\"type\":\"bytes\",\"payload\":{\"text\":\"ls\\n\",\"byte_length\":3}}")
   [ "$R" = "200" ] && ok "P0-2: member pty control with lease through BFF -> 200" || fail "P0-2: member pty control -> $R"
   R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
     -X POST "http://127.0.0.1:$MEM_WEB/v1/pty/sessions/$PTY_MP/control" \
-    -d '{"client_seq":2,"type":"bytes","payload":{"text":"x","byte_length":1}}')
+    -d "{\"client_seq\":2,\"expected_generation\":$PTY_GEN_MP,\"type\":\"bytes\",\"payload\":{\"text\":\"x\",\"byte_length\":1}}")
   [ "$R" = "403" ] && ok "P0-2: pty control without lease via BFF -> 403 (kernel lease_required)" || fail "P0-2: pty control no-lease -> $R"
   # Global events: project-scoped through the BFF; no scope -> 404 fail-closed.
   R=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$MEM_WEB/v1/events?project_id=$FB")
@@ -726,7 +749,7 @@ if [ "$memready" = 1 ] && [ -n "$MP" ]; then
   [ "$R" = "200" ] && ok "P0-2: p0-2-role member added" || fail "P0-2: add member p0-2-role -> $R"
   REV_WEB=$((MEM_WEB + 6))
   node "$SERVER_BIN" --host 127.0.0.1 --port "$REV_WEB" --kernel-port "$MEM_KERNEL" \
-    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --token "$TOKEN" --principal p0-2-role > "$WORK/revoke.log" 2>&1 &
+    --kernel-data-dir "$MEM_DATA" --data-dir "$MEM_DATA" --principal p0-2-role > "$WORK/revoke.log" 2>&1 &
   REV_PID=$!
   for _ in $(seq 1 60); do
     if curl -sf -m 2 -X POST "http://127.0.0.1:$REV_WEB/api/token-check" -H 'content-type: application/json' -d "{\"token\":\"$TOKEN\"}" > /dev/null 2>&1; then break; fi
@@ -846,7 +869,7 @@ BLOCKER=$!
 sleep 0.7
 FLOG="$WORK/fail.log"
 if node "$SERVER_BIN" --host 127.0.0.1 --port "$CONFLICT_PORT" --kernel-port "$((CONFLICT_PORT + 1))" \
-  --kernel-data-dir "$WORK/faildata" --data-dir "$WORK/faildata" --token tok > "$FLOG" 2>&1; then
+  --kernel-data-dir "$WORK/faildata" --data-dir "$WORK/faildata" > "$FLOG" 2>&1; then
   fail "OPS: occupied port did NOT fail"
 else
   ok "OPS: occupied port exits non-zero"
@@ -937,24 +960,33 @@ else
   kill_test_servers
 fi
 
-# ── SEC-UI-01: script --token never reaches argv or logs ────────────────────
-# §9.1: token mode must keep the secret out of the server/Kernel argv and the
-# server log; the launcher hands it over through the 0600 token file only.
+# ── SEC-UI-01: script rejects secret argv; managed file stays authoritative ─
+# §9.1: token mode reads a pre-provisioned/server-generated 0600 file. The
+# launcher must reject secret argv rather than retaining a compatibility shim.
 SECRET="secret-token-xyz-$(date +%s)"
 SWEB=$((CONFLICT_PORT + 130))
 SKERNEL=$((CONFLICT_PORT + 131))
 SDATA="$WORK/script-tok-data"
 if DSH_SCHOLAR_KERNEL_DATA="$SDATA/kernel" DSH_SCHOLAR_STANDALONE_DATA="$SDATA" \
     bash "$REPO/scripts/start-standalone-ui.sh" --host 127.0.0.1 --port "$SWEB" --kernel-port "$SKERNEL" \
-    --data-dir "$SDATA/research-ui-standalone" --token "$SECRET" > "$WORK/script-tok.log" 2>&1; then
-  ok "SEC: script --token exits 0 after token-check readiness"
+    --data-dir "$SDATA/research-ui-standalone" --token "$SECRET" > "$WORK/script-token-reject.log" 2>&1; then
+  fail "SEC: obsolete script --token was accepted"
 else
-  fail "SEC: script --token did not become ready (log: $(tail -3 "$WORK/script-tok.log" | tr '\n' ' '))"
+  ok "SEC: obsolete script --token is rejected"
 fi
-if grep -q "$SECRET" "$WORK/script-tok.log" 2>/dev/null; then
+if grep -q "$SECRET" "$WORK/script-token-reject.log" 2>/dev/null; then
   fail "SEC: launcher echoed the token in its own output"
 else
   ok "SEC: launcher output does not contain the token"
+fi
+
+seed_standalone_token "$SDATA/research-ui-standalone" "$SECRET"
+if DSH_SCHOLAR_KERNEL_DATA="$SDATA/kernel" DSH_SCHOLAR_STANDALONE_DATA="$SDATA" \
+    bash "$REPO/scripts/start-standalone-ui.sh" --host 127.0.0.1 --port "$SWEB" --kernel-port "$SKERNEL" \
+    --data-dir "$SDATA/research-ui-standalone" > "$WORK/script-tok.log" 2>&1; then
+  ok "SEC: script starts from the pre-provisioned 0600 token file"
+else
+  fail "SEC: managed-file token startup failed (log: $(tail -3 "$WORK/script-tok.log" | tr '\n' ' '))"
 fi
 if grep -q "$SECRET" "$SDATA/standalone.log" 2>/dev/null; then
   fail "SEC: token leaked into standalone.log"
@@ -962,9 +994,9 @@ else
   ok "SEC: standalone.log does not contain the token"
 fi
 [ "$(stat -c %a "$SDATA/research-ui-standalone/standalone-token" 2>/dev/null || echo '?')" = "600" ] \
-  && ok "SEC: script-written token file 0600" || fail "SEC: script token file mode"
+  && ok "SEC: managed token file remains 0600" || fail "SEC: script token file mode"
 [ "$(tr -d '\n' < "$SDATA/research-ui-standalone/standalone-token")" = "$SECRET" ] \
-  && ok "SEC: script token file carries the exact secret" || fail "SEC: script token file mismatch"
+  && ok "SEC: launcher preserves the pre-provisioned token" || fail "SEC: script token file mismatch"
 R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$SWEB/api/token-check" -H 'content-type: application/json' -d "{\"token\":\"$SECRET\"}")
 [ "$R" = "200" ] && ok "SEC: script-started server accepts the token" || fail "SEC: script token-check -> $R"
 for PORT in "$SWEB" "$SKERNEL"; do
@@ -1002,8 +1034,9 @@ echo "== GOV-01: session-derived principal resolver =="
 SPRINC_WEB=$((WEB_PORT + 900))
 SPRINC_KERNEL=$((WEB_PORT + 901))
 SPRINC_DATA="$WORK/sprinc-data"
+seed_standalone_token "$SPRINC_DATA" "$TOKEN"
 node "$SERVER_BIN" --host 127.0.0.1 --port "$SPRINC_WEB" --kernel-port "$SPRINC_KERNEL" \
-  --kernel-data-dir "$SPRINC_DATA" --data-dir "$SPRINC_DATA" --token "$TOKEN" --principal sprinc-ops > "$WORK/sprinc.log" 2>&1 &
+  --kernel-data-dir "$SPRINC_DATA" --data-dir "$SPRINC_DATA" --principal sprinc-ops > "$WORK/sprinc.log" 2>&1 &
 SPRINC_PID=$!
 sprinc_ready=0
 for _ in $(seq 1 60); do
@@ -1094,8 +1127,9 @@ echo "== DATA-UPGRADE-01: stable server-derived principal (default token startup
 FC_WEB=$((WEB_PORT + 800))
 FC_KERNEL=$((WEB_PORT + 801))
 FC_DATA="$WORK/fc-data"
+seed_standalone_token "$FC_DATA" "$TOKEN"
 node "$SERVER_BIN" --host 127.0.0.1 --port "$FC_WEB" --kernel-port "$FC_KERNEL" \
-  --kernel-data-dir "$FC_DATA" --data-dir "$FC_DATA" --token "$TOKEN" > "$WORK/fc.log" 2>&1 &
+  --kernel-data-dir "$FC_DATA" --data-dir "$FC_DATA" > "$WORK/fc.log" 2>&1 &
 FC_PID=$!
 fcready=0
 for _ in $(seq 1 60); do

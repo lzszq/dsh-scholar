@@ -36,7 +36,9 @@ describe('v2 writing methodology and Human TeX patch HTTP seam', () => {
     const document = kernel.texEnsure(project.project_id)
     kernel.texWriteFile(document.document_id, 'paper.tex', '\\documentclass{article}\n\\begin{document}Old\\end{document}\n')
     const inputPin = kernel.currentWritingInputPin(project.project_id, document.document_id)
-    kernel.linkSession('session_http_review', project.project_id)
+    kernel.linkSession('session_http_review', project.project_id, {
+      principal_id: 'pi-http', tenant_id: '', issuer: 'kernel',
+    })
     const roles: WritingReviewerRole[] = ['claim-evidence', 'citation', 'statistics', 'reproducibility']
     for (const role of roles) {
       kernel.registerChildLink({

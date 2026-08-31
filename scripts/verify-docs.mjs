@@ -119,6 +119,26 @@ if (/\bfullscreen\b/.test(uiClientSource) || /position:fixed;right:12px;bottom:6
   errors.push('research-ui client must not retain floating/embedded mode branches')
 }
 
+// REVIEW-DOC-TRUTH-03: the hardening ledger is the current reconstruction
+// authority, not an append-only blog. Historical rows that were superseded by
+// a later implementation must say so in the row itself; otherwise a generator
+// will conservatively recreate the obsolete "missing" behavior.
+const hardeningText = readFileSync(resolve(root, 'docs/hardening-v0.2-status.md'), 'utf8')
+for (const id of ['UPLOAD-CHUNK-02', 'REPRO-02', 'CHAT-SCROLL-01', 'WORKSPACE-FACADE-READ-01']) {
+  const line = hardeningText.split(/\r?\n/).find(candidate => candidate.includes(id)) ?? ''
+  if (line === '' || /：(?:未实现|部分)(?:\s|\|)/.test(line) || !/supersed/i.test(line)) {
+    errors.push(`hardening current-truth row ${id} must be marked implemented and superseded`)
+  }
+}
+
+const readmeText = readFileSync(resolve(root, 'README.md'), 'utf8')
+if (!/still (?:under|in) (?:active )?development/i.test(readmeText)) {
+  errors.push('README.md must prominently state that DSH Scholar is still under development')
+}
+if (/\bOn 20\d\d-\d\d-\d\d\b|\b\d+\s+(?:tests?|test files?)\b|\bcommit\s+[0-9a-f]{7,40}\b/i.test(readmeText)) {
+  errors.push('README.md must not contain dated acceptance results, test counts, or commit-ledger content')
+}
+
 // SELFMOD-01: tool-cordis is a dev-only self-modification surface. It must
 // never ship in the production bundle patch or any non-dev profile config.
 const shippedPatch = readFileSync(resolve(root, 'cordis.patch.yml'), 'utf8')

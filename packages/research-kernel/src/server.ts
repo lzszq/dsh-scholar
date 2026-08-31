@@ -12,13 +12,13 @@ import { ResearchKernel, KernelError, TEX_ENGINES, validateUploadFileName } from
 import { dshOperatorPrincipal } from './dsh-principal.js'
 import { TexError } from './tex-workspace.js'
 import { PtyError } from './pty-session.js'
+import { PtyContextError, type PtyResolvedContext } from './pty-context.js'
 import { WorkspaceError } from './workspace-store.js'
-import { PtyOpenRequest, PtyControlRequest, HumanPrincipal, NoveltyAudit, ObservedPhase, WorkspaceWriteRequest, WorkspaceMoveRequest, generateJsonSchema, randomId, ReproductionReportInput, ProviderCreateInput, ProviderUpdateInput, ProjectModelBindingInput, RunnerTargetCreateInput, RunnerTargetUpdateInput, IdeaDraft, runnerTargetConfigHash, type PtySession } from '@dsh-scholar/research-schemas'
+import { PtyOpenRequest, PtyControlRequest, PtyAttachRequest, PtyDetachRequest, PtyCloseRequest, HumanPrincipal, NoveltyAudit, ObservedPhase, WorkspaceWriteRequest, WorkspaceMoveRequest, generateJsonSchema, randomId, ReproductionReportInput, OcrRequestCreateInput, IdeaDraft, runnerTargetConfigHash, ConfigWriteScopeSchema, SettingsWriteTransactionInput, type PtySession } from '@dsh-scholar/research-schemas'
 import {
   UPLOAD_MAX_BODY_BYTES, extractBoundary, parseMultipart,
   type MultipartPart,
 } from './uploads.js'
-import { validateSecretRefInput } from './provider.js'
 import { AssuranceStoreError } from './assurance-store.js'
 import { MethodologyStoreError } from './methodology-store.js'
 import { WritingReviewStoreError } from './writing-review-store.js'
@@ -27,6 +27,7 @@ import { evaluateResearchMethodology } from './research-methodology.js'
 import { buildResearchGraph } from './research-graph.js'
 import { writingClaimEvidenceSha256, writingTexSha256 } from './writing-methodology.js'
 import { FullAutoSurveyResultSchema } from './full-auto.js'
+import { errorEnvelope, kernelRequestId, withKernelRequestContext } from './server-request-context.js'
 import {
   AssuranceAuditKind,
   AssuranceSemanticReviewReceipt,
@@ -57,22 +58,6 @@ export interface KernelServerOptions {
   port?: number
   /** Optional static bearer token for local loopback auth. */
   token?: string
-  /** §12.7: require signed run manifests (also settable on the kernel itself). */
-  requireSignedManifest?: boolean
-  /**
-   * CONFIG-01: sha256 pin of the deployment's effective config (computed by
-   * the CLI through the canonical Config Registry). When omitted the kernel's
-   * own configPinHash is used; exposed via the `x-config-pin` response header
-   * and the `/v1|v2/health` `config_pin` field.
-   */
-  configPinHash?: string
-  /**
-   * CONFIG-01: redacted view of the deployment's effective config (secret
-   * values already replaced with `<redacted>` by validateConfig) served by
-   * GET /v1/config/effective. When omitted the kernel's own
-   * constructor-level redacted config is served.
-   */
-  configRedacted?: Record<string, unknown>
 }
 
 const idSchema = z.string().min(1)
@@ -261,11 +246,6 @@ const projectGrillAnswerSchema = z.object({
 const projectGrillConfirmSchema = z.object({
   expected_project_revision: z.number().int().nonnegative(),
   expected_intake_revision: z.number().int().positive(),
-}).strict()
-
-const projectRunnerTargetSchema = z.object({
-  expected_revision: z.number().int().nonnegative(),
-  runner_target_id: z.string().min(1).max(120),
 }).strict()
 
 const transitionSchema = z.object({
@@ -813,20 +793,16 @@ const intakeAnswersSchema = z.object({
     answer: z.string().min(1),
     question_revision: z.number().int().positive(),
   })).min(1).max(64),
-  principal: HumanPrincipal,
 }).strict()
 
 const intakeAdoptSchema = z.object({
-  principal: HumanPrincipal,
   expected_proposal_revision: z.number().int().positive(),
   expected_target_revision: z.number().int().nonnegative().optional(),
   idempotency_key: z.string().optional(),
   request_hash: z.string().optional(),
 }).strict()
 
-const intakeRejectSchema = z.object({
-  principal: HumanPrincipal,
-}).strict()
+const intakeRejectSchema = z.object({}).strict()
 
 /** CHUNK-01 (init-grill-upload-models.md §3): batch chunked upload begin. */
 const uploadSessionBeginSchema = z.object({
@@ -838,39 +814,47 @@ const uploadSessionBeginSchema = z.object({
   owner_scope_id: z.string().min(1).max(160).regex(/^[A-Za-z0-9._:-]+$/).optional(),
 }).strict()
 
-/** MODEL-01 (init-grill-upload-models.md §4): provider create/update/delete. */
-const providerDeleteSchema = z.object({
-  expected_revision: z.number().int().positive(),
-}).strict()
-
 const runnerTargetHeartbeatSchema = z.object({
   expected_revision: z.number().int().positive(),
   health: z.enum(['online', 'offline']),
 }).strict()
 
 /**
- * GOV-01 fail-closed pattern for intake Human actions: a request without an
- * authenticated `principal.principal_id` is 422 principal_required BEFORE
- * zod parsing — anonymous/actor-only requests never reach the kernel.
+ * GOV-01 fail-closed Human boundary for Intake actions. Identity is derived
+ * exclusively from headers injected by the trusted BFF; request-body
+ * principal objects are ordinary attacker-controlled JSON and never confer
+ * authority or provenance.
  */
-function requireIntakePrincipal(body: unknown, res: ServerResponse, action: string): boolean {
-  const bodyObj = typeof body === 'object' && body !== null ? body as Record<string, unknown> : {}
-  const p = bodyObj.principal as Record<string, unknown> | undefined
-  const principalId = typeof p === 'object' && p !== null && !Array.isArray(p)
-    && typeof p.principal_id === 'string'
-    ? p.principal_id
-    : ''
-  if (principalId === '') {
-    send(res, 422, { error: errorEnvelope('principal_required', `${action} requires an authenticated principal (principal.principal_id); anonymous or actor-only requests are rejected`) })
-    return false
+function intakePrincipalFromRequest(
+  kernel: ResearchKernel,
+  req: IncomingMessage,
+  res: ServerResponse,
+  action: string,
+): z.infer<typeof HumanPrincipal> | null {
+  const expectedServiceToken = kernel.serviceToken?.trim()
+  const serviceToken = req.headers['x-service-token']
+  if (expectedServiceToken === undefined || expectedServiceToken === ''
+    || typeof serviceToken !== 'string' || !serviceTokenEquals(serviceToken, expectedServiceToken)) {
+    send(res, 403, { error: errorEnvelope('service_token_required', `${action} requires the configured Human BFF service credential`) })
+    return null
   }
-  return true
-}
-
-function errorEnvelope(code: string, message: string): Record<string, unknown> {
-  // api-contracts.md §1: stable retryable flags for the documented codes.
-  const retryableCodes = new Set(['lease_conflict', 'lease_stale', 'upload_offset_conflict', 'document_version_conflict'])
-  return { code, message, request_id: currentRequestId, retryable: retryableCodes.has(code) }
+  if (req.headers['x-service-principal'] !== 'standalone-human-bff') {
+    send(res, 403, { error: errorEnvelope('service_identity_required', `${action} requires x-service-principal: standalone-human-bff`) })
+    return null
+  }
+  const rawPrincipal = req.headers['x-principal-id']
+  const principalId = typeof rawPrincipal === 'string' ? rawPrincipal.trim() : ''
+  const rawSession = req.headers['x-principal-session']
+  const sessionId = typeof rawSession === 'string' ? rawSession.trim() : ''
+  if (principalId === '' || sessionId === '') {
+    send(res, 422, { error: errorEnvelope('principal_required', `${action} requires BFF-derived x-principal-id and x-principal-session headers`) })
+    return null
+  }
+  return {
+    principal_id: principalId,
+    auth_method: 'dsh-session',
+    session_id: sessionId,
+  }
 }
 
 /**
@@ -890,12 +874,11 @@ const SERVICE_ROUTES: ReadonlyArray<{ method: string; re: RegExp; label: string 
   { method: 'POST', re: /^\/v1\/jobs-claim\/run$/, label: 'jobs-claim' },
   { method: 'POST', re: /^\/v1\/runner-keys$/, label: 'runner-keys' },
   { method: 'POST', re: /^\/v1\/recover\/leases$/, label: 'recover/leases' },
-  { method: 'POST', re: /^\/v1\/runner-targets$/, label: 'runner-targets/create' },
-  { method: 'PATCH', re: /^\/v1\/runner-targets\/[^/]+$/, label: 'runner-targets/update' },
   { method: 'POST', re: /^\/v1\/runner-targets\/[^/]+\/heartbeat$/, label: 'runner-targets/heartbeat' },
   { method: 'POST', re: /^\/v1\/projects\/[^/]+\/evidence\/verified$/, label: 'evidence/verified' },
   { method: 'POST', re: /^\/v1\/projects\/[^/]+\/evidence\/[^/]+\/accept$/, label: 'evidence/accept' },
   { method: 'POST', re: /^\/v1\/projects\/[^/]+\/contracts\/[^/]+\/approve$/, label: 'contracts/approve' },
+  { method: 'POST', re: /^\/v1\/projects\/[^/]+\/intake\/[^/]+\/(?:answers|adopt|reject)$/, label: 'intake/human' },
   { method: 'POST', re: /^\/internal\/reproduction-attempts\/[^/]+\/reports$/, label: 'reproduction/reports' },
   { method: 'POST', re: /^\/internal\/projects\/[^/]+\/topology\/children$/, label: 'topology/children' },
   { method: 'PATCH', re: /^\/internal\/topology\/[^/]+\/state$/, label: 'topology/state' },
@@ -987,11 +970,10 @@ export function metricsAccessAllowed(remoteAddress: string | undefined | null, b
 }
 
 /**
- * OBS-01: the /internal/metrics surface — a JSON metrics snapshot, loopback
- * only, and deliberately NOT a service-token route: like /v1/health it sits
- * at the deployment's public surface (or is exposed per deployment config;
- * the loopback check is the default guard). Returns true when the request
- * was handled (route() then returns immediately).
+ * OBS-01: the /internal/metrics surface — a JSON metrics snapshot with an
+ * additional loopback restriction. The route dispatcher enforces the same
+ * configured service token as every other /internal/* endpoint before this
+ * handler runs. Returns true when the request was handled.
  */
 export function handleInternalMetrics(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel, boundHost: string): boolean {
   let url: URL
@@ -1008,8 +990,6 @@ export function handleInternalMetrics(req: IncomingMessage, res: ServerResponse,
   ok(res, kernel.metrics.snapshot())
   return true
 }
-
-let currentRequestId = 'req_unknown'
 
 function send(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
@@ -1042,7 +1022,9 @@ function artifactContentDisposition(mediaType: string, fileName: string): string
 
 function fail(res: ServerResponse, error: unknown): void {
   if (error instanceof KernelError) {
-    send(res, error.status, { error: errorEnvelope(error.code, error.message) })
+    const envelope = errorEnvelope(error.code, error.message)
+    if (error.key !== undefined) envelope.key = error.key
+    send(res, error.status, { error: envelope })
   } else if (error instanceof TexError) {
     // CAS write conflicts and invalid TeX paths map to HTTP semantics.
     const status = error.code === 'document_version_conflict' ? 409 : 422
@@ -1051,8 +1033,16 @@ function fail(res: ServerResponse, error: unknown): void {
     // PTY-01 wire mapping: not found → 404, idempotency/state conflicts →
     // 409, open/param validation → 422, adapter absence → 501/503.
     const status = error.code === 'pty_session_not_found' ? 404
-      : error.code === 'pty_state_conflict' || error.code === 'pty_client_seq_out_of_order' || error.code === 'pty_session_closed' ? 409
-        : error.code === 'pty_adapter_failed' ? 503
+      : error.code === 'pty_principal_mismatch' || error.code === 'pty_lease_expired' ? 403
+        : error.code === 'pty_state_conflict' || error.code === 'pty_client_seq_out_of_order' || error.code === 'pty_session_closed'
+          || error.code === 'pty_generation_stale' || error.code === 'pty_context_mismatch' || error.code === 'pty_exact_parent_mismatch' ? 409
+          : error.code === 'pty_adapter_failed' ? 503
+            : 422
+    send(res, status, { error: errorEnvelope(error.code, error.message) })
+  } else if (error instanceof PtyContextError) {
+    const status = error.code === 'pty_context_not_found' ? 404
+      : error.code === 'pty_target_unavailable' ? 503
+        : error.code === 'pty_context_ambiguous' ? 409
           : 422
     send(res, status, { error: errorEnvelope(error.code, error.message) })
   } else if (error instanceof WorkspaceError) {
@@ -1072,7 +1062,7 @@ function fail(res: ServerResponse, error: unknown): void {
     const issues = error.issues.map(i => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')
     send(res, 422, { error: errorEnvelope('validation_error', issues) })
   } else {
-    send(res, 500, { error: errorEnvelope('internal', (error as Error).message ?? String(error)) })
+    send(res, 500, { error: errorEnvelope('internal_error', 'internal error') })
   }
 }
 
@@ -1115,7 +1105,6 @@ const PI_ONLY_WRITE_ROUTES: ReadonlyArray<RegExp> = [
   // INIT-GRILL-02 §2: Grill confirm 是 PI-only 显式确认事务（写入 canonical
   // Brief + 创建唯一 Scope Gate）—— researcher/viewer/auditor 一律 403。
   /(?:^|\/)grill\/confirm(?:\/|$)/,
-  /(?:^|\/)execution(?:\/|$)/,
   /(?:^|\/)idea-gate(?:\/|$)/,
   /(?:^|\/)contract-gate(?:\/|$)/,
 ]
@@ -1132,44 +1121,32 @@ function isPiOnlyWrite(pathname: string): boolean {
  * it), the kernel resolves the acting principal's role from its OWN
  * project_members table: researcher/viewer/auditor → 403 role_forbidden, an
  * unknown principal → 404 project_not_found (no enumeration, same shape as
- * memberOr404). With no header, the body `principal.principal_id` (intake
- * adopt's direct-kernel service path) keeps the existing GOV-01 contract;
- * when no identity exists at all (archive/unarchive carry no body principal)
- * → 422 principal_required (fail-closed, same pattern as requireIntakePrincipal).
+ * memberOr404). Body identity is never an authority fallback.
  */
 function requirePiOnly(
   kernel: ResearchKernel,
   req: IncomingMessage,
   res: ServerResponse,
   projectId: string,
-  body: unknown,
   action: string,
   options: { allowOperator?: boolean; includeDeleted?: boolean } = {},
 ): boolean {
-  const headerPrincipal = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'] : undefined
-  let principal = headerPrincipal !== undefined && headerPrincipal !== '' ? headerPrincipal : ''
+  const headerPrincipal = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'].trim() : ''
+  const principal = headerPrincipal
   if (principal === '') {
-    // Direct-kernel fallback: the body principal (intake adopt only).
-    const bodyObj = typeof body === 'object' && body !== null ? body as Record<string, unknown> : {}
-    const p = bodyObj.principal as Record<string, unknown> | undefined
-    if (typeof p === 'object' && p !== null && !Array.isArray(p) && typeof p.principal_id === 'string') principal = p.principal_id
-  }
-  if (principal === '') {
-    send(res, 422, { error: errorEnvelope('principal_required', `${action} requires an authenticated principal (x-principal-id or principal.principal_id); anonymous or actor-only requests are rejected`) })
+    send(res, 422, { error: errorEnvelope('principal_required', `${action} requires an authenticated principal (x-principal-id); body principal claims are not accepted`) })
     return false
   }
-  if (headerPrincipal !== undefined && headerPrincipal !== '') {
-    const role = kernel.getProjectMemberRole(projectId, principal, options.includeDeleted === true)
-    if (role === null) {
-      send(res, 404, { error: errorEnvelope('project_not_found', 'project not found or access denied') })
-      return false
-    }
-    const allowed = role === 'pi' || (options.allowOperator !== false && role === 'operator')
-    if (!allowed) {
-      const scope = options.allowOperator === false ? 'PI-only' : 'PI/operator-only'
-      send(res, 403, { error: errorEnvelope('role_forbidden', `${action} is a ${scope} decision; role '${role}' is not permitted`) })
-      return false
-    }
+  const role = kernel.getProjectMemberRole(projectId, principal, options.includeDeleted === true)
+  if (role === null) {
+    send(res, 404, { error: errorEnvelope('project_not_found', 'project not found or access denied') })
+    return false
+  }
+  const allowed = role === 'pi' || (options.allowOperator !== false && role === 'operator')
+  if (!allowed) {
+    const scope = options.allowOperator === false ? 'PI-only' : 'PI/operator-only'
+    send(res, 403, { error: errorEnvelope('role_forbidden', `${action} is a ${scope} decision; role '${role}' is not permitted`) })
+    return false
   }
   return true
 }
@@ -1186,40 +1163,55 @@ function requireGlobalConfigRole(kernel: ResearchKernel, req: IncomingMessage, r
   return false
 }
 
-/**
- * PTY-01 (hardening §5 P0-2): every pty operation (session read, control,
- * frames) is fail-closed on the authenticated principal AND the session
- * OWNER — a missing x-principal-id is 422 principal_required (GOV-01
- * pattern), a session owned by another principal is 403
- * pty_principal_mismatch (consistent with the pre-existing control check).
- * `requireLease` (control) additionally demands the session lease
- * (x-pty-lease): missing → 403 lease_required, wrong → 403 lease_invalid.
- * Frames/reads accept an OPTIONAL lease — when present it must be valid.
- * "Header missing = pass" is never accepted. Unknown session ids still
- * answer 404 pty_session_not_found via kernel.ptyGet.
- */
-function requirePtyOwner(kernel: ResearchKernel, req: IncomingMessage, res: ServerResponse, sessionId: string, opts: { requireLease: boolean }): PtySession | null {
+function requirePtyPrincipal(req: IncomingMessage, res: ServerResponse): string | null {
   const principalId = typeof req.headers['x-principal-id'] === 'string' && req.headers['x-principal-id'] !== '' ? req.headers['x-principal-id'] : ''
   if (principalId === '') {
     send(res, 422, { error: errorEnvelope('principal_required', 'pty access requires an authenticated principal (x-principal-id); the BFF injects it from the operator session') })
     return null
   }
-  const session = kernel.ptyGet(sessionId) // unknown → 404 pty_session_not_found
-  if (session.principal_id !== principalId) {
-    send(res, 403, { error: errorEnvelope('pty_principal_mismatch', 'the authenticated principal does not own this pty session') })
-    return null
+  return principalId
+}
+
+function requireExpectedGeneration(raw: string | null): number {
+  const generation = raw === null ? Number.NaN : Number(raw)
+  if (!Number.isInteger(generation) || generation <= 0) {
+    throw new KernelError(422, 'pty_generation_required', 'expected_generation must be a positive integer')
+  }
+  return generation
+}
+
+/** Resolve the owner-scoped session context through current durable
+ * Research/DSH/topology authority. Project, parent, profile and target are
+ * never accepted from the request body. */
+function requirePtyAccess(
+  kernel: ResearchKernel,
+  req: IncomingMessage,
+  res: ServerResponse,
+  sessionId: string,
+  opts: { expectedGeneration?: number; lease: 'none' | 'optional' | 'required' },
+): { context: PtyResolvedContext; session: PtySession | null } | null {
+  const principalId = requirePtyPrincipal(req, res)
+  if (principalId === null) return null
+  const owned = kernel.ptyContextForOwner(sessionId, { principal_id: principalId })
+  const context = kernel.ptyResolveContext(owned.context_id, principalId)
+  if (owned.context_kind !== context.context_kind || owned.parent_session_id !== context.parent_session_id
+    || owned.project_id !== context.project_id) {
+    throw new PtyError('pty_context_mismatch', 'PTY session authority no longer matches its durable context')
   }
   const leaseHeader = req.headers['x-pty-lease']
   const lease = typeof leaseHeader === 'string' && leaseHeader !== '' ? leaseHeader : ''
-  if (opts.requireLease && lease === '') {
-    send(res, 403, { error: errorEnvelope('lease_required', 'pty control requires the session lease (x-pty-lease); a missing header is never a pass') })
+  if (opts.lease === 'required' && lease === '') {
+    send(res, 403, { error: errorEnvelope('lease_required', 'pty access requires the session lease (x-pty-lease); a missing header is never a pass') })
     return null
   }
-  if (lease !== '' && !kernel.ptyVerifyLease(sessionId, lease)) {
+  if (opts.lease !== 'none' && lease !== '' && !kernel.ptyVerifyLease(sessionId, lease)) {
     send(res, 403, { error: errorEnvelope('lease_invalid', 'the provided pty lease does not match the session') })
     return null
   }
-  return session
+  const session = opts.expectedGeneration === undefined
+    ? null
+    : kernel.ptyGet(sessionId, context, opts.expectedGeneration)
+  return { context, session }
 }
 
 function parseSeqParam(raw: string | null): number | undefined {
@@ -1238,14 +1230,11 @@ function parseLaneParam(raw: string | null): 'research' | 'session' | undefined 
   return raw === 'research' || raw === 'session' ? raw : undefined
 }
 
-function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel, token: string | undefined, configPin: string | undefined, configRedacted: Record<string, unknown> | undefined, boundHost: string): void {
-  currentRequestId = typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id'] !== ''
-    ? req.headers['x-request-id']
-    : `req_${Math.random().toString(36).slice(2, 12)}`
+function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel, token: string | undefined, boundHost: string): void {
   // CONFIG-01: every response carries the effective-config pin so running
   // objects can be correlated with the config that produced them. The header
   // is set before any writeHead and therefore lands on every answer.
-  if (configPin !== undefined && configPin !== '') res.setHeader('x-config-pin', configPin)
+  res.setHeader('x-config-pin', kernel.configPinHash)
   let url: URL
   try {
     url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -1254,7 +1243,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
     return
   }
   // §5 P0-1 (hardening API-01/SIDE-01): when the kernel was configured with a
-  // bearer token (--token / DSH_SCHOLAR_KERNEL_TOKEN — the sidecars ALWAYS
+  // bearer token (DSH_SCHOLAR_KERNEL_TOKEN — the sidecars ALWAYS
   // inject one via the 0600 <dataDir>/kernel-token file), every non-health
   // route demands `Authorization: Bearer <token>`: missing or wrong bearer →
   // 401 unauthorized, no exception. /v1/health and /v2/health stay exempt so
@@ -1275,11 +1264,6 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
       }
     }
   }
-  // OBS-01 (reconstruction-contracts.md §18): GET /internal/metrics — JSON
-  // snapshot, loopback only, no service token required (same public surface
-  // as /v1/health, or exposed per deployment config). Routed BEFORE the
-  // v1/v2 version gate because the path carries no API version prefix.
-  if (handleInternalMetrics(req, res, kernel, boundHost)) return
   // pathname is percent-encoded; decode segments so ids like sha256:<hex>
   // survive (encodeURIComponent on the client side). A malformed escape
   // (e.g. %zz) must answer JSON 400 — never crash the server (§19.2).
@@ -1298,16 +1282,20 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
   // service token via `x-service-token` — the loopback bearer (Authorization)
   // and any self-reported x-service-principal do NOT unlock these routes.
   // A missing/wrong/misplaced credential is 403 service_token_required.
-  if (kernel.serviceToken !== undefined && (version === 'internal' || isServiceRoute(method, canonicalPath))) {
+  if (version === 'internal' || isServiceRoute(method, canonicalPath)) {
+    const expected = kernel.serviceToken?.trim()
     const provided = req.headers['x-service-token']
-    if (typeof provided !== 'string' || !serviceTokenEquals(provided, kernel.serviceToken)) {
+    if (expected === undefined || expected === '' || typeof provided !== 'string' || !serviceTokenEquals(provided, expected)) {
       send(res, 403, {
         error: errorEnvelope('service_token_required',
-          'internal route requires x-service-token (service identity); browser bearer credentials are not accepted'),
+          'internal route requires a configured x-service-token service identity; browser bearer credentials are not accepted'),
       })
       return
     }
   }
+  // Metrics remains loopback-only, and now crosses the same fail-closed
+  // service-identity boundary as every other /internal/* route.
+  if (handleInternalMetrics(req, res, kernel, boundHost)) return
   if (version === 'internal' && resource === 'methodology' && id === 'native-packs'
     && sub === 'reconcile' && method === 'POST') {
     if (!requireDshPlugin(req, res, kernel, 'native Knowledge reconciliation')) return
@@ -1441,7 +1429,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
         const report = kernel.reportReproductionAttempt({
           attempt_id: id,
           service_principal: servicePrincipal,
-          request_id: currentRequestId,
+          request_id: kernelRequestId(),
           attempt_generation: input.attempt_generation,
           lease_token: input.lease_token,
           report: input,
@@ -1657,7 +1645,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
   if (version === 'v2') {
     void readJson(req, requestBodyCap(method, version, resource, id, sub)).then(async (body) => {
       try {
-        await handleV2({ req, res, method, url, resource, id, sub, subId, subSubId, body, kernel, configPin })
+        await handleV2({ req, res, method, url, resource, id, sub, subId, subSubId, body, kernel })
       } catch (error) {
         if (error instanceof KernelError) send(res, error.status, { error: { code: error.code, message: error.message } })
         else if (error instanceof AssuranceStoreError || error instanceof MethodologyStoreError || error instanceof WritingReviewStoreError || error instanceof MethodologyRolloutStoreError) {
@@ -1667,10 +1655,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
           // INIT-GRILL-02 §1: v2 契约校验失败（如 name 去空白后 1–120）→
           // 稳定的 422 validation_error，绝不 500。
           send(res, 422, { error: { code: 'validation_error', message: error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ') } })
-        } else {
-          console.error(`[kernel] v2 handler error: ${(error as Error).message}`)
-          send(res, 500, { error: { code: 'internal_error', message: 'internal error' } })
-        }
+        } else fail(res, error)
       }
     }).catch((error: unknown) => fail(res, error))
     return
@@ -1693,7 +1678,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             protocol_version: 'v1',
             schema_version: kernel.schemaVersion(),
             database_id: kernel.databaseId(),
-            config_pin: configPin ?? kernel.configPinHash,
+            config_pin: kernel.configPinHash,
             time: new Date().toISOString(),
           })
           return
@@ -1704,63 +1689,89 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
         // the registry-generated JSON Schema (canonical UI metadata).
         case 'config': {
           if (method === 'GET' && id === 'effective') {
-            ok(res, {
-              config_pin: configPin ?? kernel.configPinHash,
-              config: configRedacted ?? kernel.configRedacted,
-              generated_at: new Date().toISOString(),
-            })
+            const projectId = url.searchParams.get('project_id')?.trim()
+            if (projectId !== undefined && projectId !== '') {
+              const principalId = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'].trim() : ''
+              if (principalId === '') {
+                send(res, 422, { error: errorEnvelope('principal_required', 'project config requires an authenticated principal') })
+                return
+              }
+              if (kernel.getProjectMemberRole(projectId, principalId) === null) {
+                send(res, 404, { error: errorEnvelope('project_not_found', 'project not found or access denied') })
+                return
+              }
+            }
+            const effective = kernel.configEffective(projectId === '' ? undefined : projectId)
+            res.setHeader('x-config-pin', effective.config_pin)
+            ok(res, effective)
             return
           }
           if (method === 'GET' && id === 'schema') {
             ok(res, generateJsonSchema())
             return
           }
+          if (method === 'GET' && (id === 'layers' || id === 'revisions') && sub !== undefined && subId !== undefined
+              && parts.length === 5) {
+            const scope = ConfigWriteScopeSchema.parse(sub)
+            const principalId = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'].trim() : ''
+            if (scope === 'project') {
+              if (principalId === '') {
+                send(res, 422, { error: errorEnvelope('principal_required', 'project config requires an authenticated principal') })
+                return
+              }
+              if (kernel.getProjectMemberRole(subId, principalId) === null) {
+                send(res, 404, { error: errorEnvelope('project_not_found', 'project not found or access denied') })
+                return
+              }
+            } else if (!requireGlobalConfigRole(kernel, req, res, 'config history read')) return
+            ok(res, id === 'layers' ? kernel.configLayer(scope, subId) : kernel.configRevisions(scope, subId))
+            return
+          }
           send(res, 404, { error: { code: 'not_found', message: 'unknown config resource' } })
+          return
+        }
+        case 'settings': {
+          if (method !== 'POST' || id !== 'transactions' || parts.length !== 3) {
+            send(res, 404, { error: errorEnvelope('not_found', 'unknown Settings resource') })
+            return
+          }
+          const input = SettingsWriteTransactionInput.parse(body)
+          const principalId = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'].trim() : ''
+          if (principalId === '') {
+            send(res, 422, { error: errorEnvelope('principal_required', 'Settings writes require an authenticated principal') })
+            return
+          }
+          const projectIds = new Set<string>()
+          let requiresGlobal = false
+          for (const operation of input.operations) {
+            if (operation.kind === 'config') {
+              if (operation.scope === 'project') projectIds.add(operation.scope_id)
+              else requiresGlobal = true
+            } else if (operation.kind === 'ocr-mineru') {
+              requiresGlobal = true
+              if (operation.binding !== undefined) projectIds.add(operation.binding.project_id)
+            } else {
+              requiresGlobal = true
+            }
+          }
+          for (const projectId of projectIds) {
+            if (!requirePiOnly(kernel, req, res, projectId, 'project Settings update')) return
+          }
+          if (requiresGlobal && !requireGlobalConfigRole(kernel, req, res, 'global Settings update')) return
+          ok(res, kernel.writeSettingsTransaction(input, principalId))
           return
         }
         case 'providers': {
           // MODEL-01 (init-grill-upload-models.md §4 / api-contracts.md §19):
           // instance/global Provider registry. Responses are redacted —
           // credential carries metadata + available only, never a secret value.
-          const headerPrincipal = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'] : undefined
           if (method === 'GET' && id === undefined) {
             ok(res, kernel.listProviders().map(p => kernel.providerView(p)))
-            return
-          }
-          if (method === 'POST' && id === undefined) {
-            if (!requireGlobalConfigRole(kernel, req, res, 'model provider creation')) return
-            const rawCredential = body !== null && typeof body === 'object' && !Array.isArray(body)
-              ? (body as Record<string, unknown>).credential
-              : undefined
-            if (rawCredential !== undefined && rawCredential !== null && typeof rawCredential === 'object' && !Array.isArray(rawCredential)) {
-              validateSecretRefInput(rawCredential as never)
-            }
-            const input = ProviderCreateInput.parse(body)
-            send(res, 201, kernel.providerView(kernel.registerProvider({ ...input, created_by: headerPrincipal ?? '' })))
             return
           }
           if (id !== undefined) {
             if (method === 'GET') {
               ok(res, kernel.providerView(kernel.getProvider(id)))
-              return
-            }
-            if (method === 'PATCH') {
-              if (!requireGlobalConfigRole(kernel, req, res, 'model provider update')) return
-              const rawCredential = body !== null && typeof body === 'object' && !Array.isArray(body)
-                ? (body as Record<string, unknown>).credential
-                : undefined
-              if (rawCredential !== undefined && rawCredential !== null && typeof rawCredential === 'object' && !Array.isArray(rawCredential)) {
-                validateSecretRefInput(rawCredential as never)
-              }
-              const input = ProviderUpdateInput.parse(body)
-              ok(res, kernel.providerView(kernel.updateProvider(id, { ...input, updated_by: headerPrincipal ?? '' })))
-              return
-            }
-            if (method === 'DELETE') {
-              if (!requireGlobalConfigRole(kernel, req, res, 'model provider deletion')) return
-              const input = providerDeleteSchema.parse(body)
-              kernel.deleteProvider(id, input.expected_revision)
-              ok(res, { ok: true })
               return
             }
           }
@@ -1770,29 +1781,16 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
         case 'runner-targets': {
           // EXEC-ENV-02: global target registry. Connection fields are
           // SecretRef metadata + availability only; values never cross HTTP.
-          const headerPrincipal = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'] : ''
           if (method === 'GET' && id === undefined) {
             ok(res, kernel.listRunnerTargets().map(target => kernel.runnerTargetView(target)))
             return
           }
-          if (method === 'POST' && id === undefined) {
-            if (!requireGlobalConfigRole(kernel, req, res, 'runner target creation')) return
-            const input = RunnerTargetCreateInput.parse(body)
-            send(res, 201, kernel.runnerTargetView(kernel.registerRunnerTarget(input, headerPrincipal)))
-            return
-          }
           if (id !== undefined) {
-            if (method === 'GET') {
+            if (method === 'GET' && sub === undefined) {
               ok(res, kernel.runnerTargetView(kernel.getRunnerTarget(id)))
               return
             }
-            if (method === 'PATCH') {
-              if (!requireGlobalConfigRole(kernel, req, res, 'runner target update')) return
-              const input = RunnerTargetUpdateInput.parse(body)
-              ok(res, kernel.runnerTargetView(kernel.updateRunnerTarget(id, input)))
-              return
-            }
-            if (method === 'POST' && sub === 'heartbeat') {
+            if (method === 'POST' && sub === 'heartbeat' && subId === undefined) {
               if (!runnerTargetTokenAccessAllowed(req.socket.remoteAddress)) {
                 send(res, 403, { error: errorEnvelope('loopback_only', 'runner target token heartbeat is accepted only from a direct loopback peer; non-loopback deployments require a trusted mTLS terminator') })
                 return
@@ -1998,15 +1996,19 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             // the kernel validates provider+model+catalog capability and
             // snapshots provider revision/config hash.
             if (sub === 'model-binding') {
-              const headerPrincipal = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'] : undefined
               if (method === 'GET') {
+                const principalId = typeof req.headers['x-principal-id'] === 'string'
+                  ? req.headers['x-principal-id'].trim()
+                  : ''
+                if (principalId === '') {
+                  send(res, 422, { error: errorEnvelope('principal_required', 'project model binding requires an authenticated principal') })
+                  return
+                }
+                if (kernel.getProjectMemberRole(id, principalId) === null) {
+                  send(res, 404, { error: errorEnvelope('project_not_found', 'project not found or access denied') })
+                  return
+                }
                 ok(res, kernel.getProjectModelBinding(id))
-                return
-              }
-              if (method === 'PUT' || method === 'POST') {
-                if (!requirePiOnly(kernel, req, res, id, body, 'model binding update')) return
-                const input = ProjectModelBindingInput.parse(body)
-                ok(res, kernel.setProjectModelBinding(id, { ...input, updated_by: headerPrincipal ?? '' }))
                 return
               }
               send(res, 404, { error: { code: 'not_found', message: 'unknown model-binding route' } })
@@ -2081,24 +2083,26 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
                   ok(res, kernel.getIntakeQuestions(subId))
                   return
                 }
-                if (method === 'POST' && action === 'answers') {
-                  if (!requireIntakePrincipal(body, res, 'intake answers')) return
+                if (method === 'POST' && action === 'answers' && segments[6] === undefined) {
+                  const principal = intakePrincipalFromRequest(kernel, req, res, 'intake answers')
+                  if (principal === null) return
                   const input = intakeAnswersSchema.parse(body)
-                  ok(res, kernel.submitIntakeAnswers(subId, input.answers, input.principal))
+                  ok(res, kernel.submitIntakeAnswers(subId, input.answers, principal))
                   return
                 }
                 if (method === 'POST' && action === 'propose') {
                   send(res, 201, kernel.proposeIntake(subId))
                   return
                 }
-                if (method === 'POST' && action === 'adopt') {
-                  if (!requireIntakePrincipal(body, res, 'intake adoption')) return
+                if (method === 'POST' && action === 'adopt' && segments[6] === undefined) {
+                  const principal = intakePrincipalFromRequest(kernel, req, res, 'intake adoption')
+                  if (principal === null) return
                   // GOV-01/ONBOARD-01 (hardening §5 P1): the kernel's OWN
                   // PI/operator gate — when the BFF-injected x-principal-id is
                   // present, the acting principal's role is resolved from the
                   // kernel's project_members table (researcher/viewer/auditor
                   // → 403, unknown → 404); never a single BFF layer.
-                  if (!requirePiOnly(kernel, req, res, id, body, 'intake adoption')) return
+                  if (!requirePiOnly(kernel, req, res, id, 'intake adoption', { allowOperator: false })) return
                   const input = intakeAdoptSchema.parse(body)
                   ok(res, kernel.adoptIntake({
                     intake_id: subId,
@@ -2106,13 +2110,14 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
                     expected_target_revision: input.expected_target_revision,
                     idempotency_key: input.idempotency_key,
                     request_hash: input.request_hash,
-                  }, input.principal))
+                  }, principal))
                   return
                 }
-                if (method === 'POST' && action === 'reject') {
-                  if (!requireIntakePrincipal(body, res, 'intake rejection')) return
-                  const input = intakeRejectSchema.parse(body)
-                  ok(res, kernel.rejectIntake(subId, input.principal))
+                if (method === 'POST' && action === 'reject' && segments[6] === undefined) {
+                  const principal = intakePrincipalFromRequest(kernel, req, res, 'intake rejection')
+                  if (principal === null) return
+                  intakeRejectSchema.parse(body)
+                  ok(res, kernel.rejectIntake(subId, principal))
                   return
                 }
                 if (method === 'DELETE' && action === 'artifacts' && segments[6] !== undefined) {
@@ -2133,7 +2138,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             }
             if (method === 'DELETE' && sub === undefined) {
               const input = deleteProjectSchema.parse(body)
-              if (!requirePiOnly(kernel, req, res, id, body, 'project deletion', { allowOperator: false, includeDeleted: true })) return
+              if (!requirePiOnly(kernel, req, res, id, 'project deletion', { allowOperator: false, includeDeleted: true })) return
               const deletedBy = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'] : ''
               const requestId = typeof req.headers['x-request-id'] === 'string' ? req.headers['x-request-id'] : ''
               if (requestId === '') throw new KernelError(422, 'request_id_required', 'project deletion requires X-Request-Id')
@@ -2144,12 +2149,12 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
               // GOV-01/ONBOARD-01 (hardening §5 P1): kernel-side PI/operator
               // gate (see requirePiOnly) — archive is a PI-only decision and
               // the kernel never relies on the BFF's single layer.
-              if (!requirePiOnly(kernel, req, res, id, body, 'project archive')) return
+              if (!requirePiOnly(kernel, req, res, id, 'project archive')) return
               ok(res, kernel.archiveProject(id))
               return
             }
             if (method === 'POST' && sub === 'unarchive') {
-              if (!requirePiOnly(kernel, req, res, id, body, 'project unarchive')) return
+              if (!requirePiOnly(kernel, req, res, id, 'project unarchive')) return
               ok(res, kernel.unarchiveProject(id))
               return
             }
@@ -2177,7 +2182,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             // Human Gate Decision (approveContract). The token-protected
             // route is used by evals/orchestrator; interactive flows use the
             // contract gate decision route instead (GOV-02 atomic freeze).
-            if (sub === 'contracts' && subId !== undefined && method === 'POST' && url.pathname.endsWith('/approve')) {
+            if (sub === 'contracts' && subId !== undefined && subSubId === 'approve' && parts[6] === undefined && method === 'POST') {
               const input = z.object({ actor: z.string().min(1) }).parse(body)
               ok(res, kernel.approveContract(subId, randomId('dec'), input.actor))
               return
@@ -2340,7 +2345,14 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             }
             if (method === 'POST' && sub === 'session') {
               const input = z.object({ session_id: z.string().min(1) }).parse(body)
-              ok(res, kernel.linkSession(input.session_id, id))
+              const principalId = requireProjectMember(kernel, req, res, id)
+              if (principalId === null) return
+              const member = kernel.listProjectMembers(id).find(candidate => candidate.principal_id === principalId)!
+              ok(res, kernel.linkSession(input.session_id, id, {
+                principal_id: principalId,
+                tenant_id: member.tenant_id,
+                issuer: 'kernel',
+              }))
               return
             }
             if (method === 'POST' && sub === 'budget') {
@@ -2360,7 +2372,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
               send(res, 201, idea)
               return
             }
-            if (method === 'POST' && sub === 'contracts') {
+            if (method === 'POST' && sub === 'contracts' && subId === undefined) {
               const input = contractSchema.parse(body)
               const contract = kernel.registerContract({ ...input, project_id: id } as never)
               send(res, 201, contract)
@@ -2432,7 +2444,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             // only reachable here with the Analysis-Worker service identity;
             // the public route rejects it (EVID-01). A missing/mismatched
             // x-service-principal is a 403 — the public cannot masquerade.
-            if (method === 'POST' && sub === 'evidence' && subId === 'verified') {
+            if (method === 'POST' && sub === 'evidence' && subId === 'verified' && subSubId === undefined) {
               const servicePrincipal = typeof req.headers['x-service-principal'] === 'string' ? req.headers['x-service-principal'] : ''
               if (servicePrincipal !== 'analysis-worker') {
                 send(res, 403, { error: errorEnvelope('service_identity_required', 'verified evidence ingestion requires x-service-principal: analysis-worker') })
@@ -2448,7 +2460,8 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             // verified → accepted (provenance state machine) after full
             // revalidation; only service principals 'verifier'/'auditor' may
             // accept. request_id defaults to the x-request-id header.
-            if (method === 'POST' && sub === 'evidence' && subId !== undefined && subId !== 'verified' && url.pathname.endsWith('/accept')) {
+            if (method === 'POST' && sub === 'evidence' && subId !== undefined && subId !== 'verified'
+              && subSubId === 'accept' && parts[6] === undefined) {
               const servicePrincipal = typeof req.headers['x-service-principal'] === 'string' ? req.headers['x-service-principal'] : ''
               if (servicePrincipal !== 'verifier' && servicePrincipal !== 'auditor') {
                 send(res, 403, { error: errorEnvelope('service_identity_required', 'evidence accept requires x-service-principal: verifier|auditor') })
@@ -2459,7 +2472,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
                 project_id: id,
                 evidence_id: subId,
                 service_principal: servicePrincipal,
-                request_id: input.request_id ?? currentRequestId,
+                request_id: input.request_id ?? kernelRequestId(),
               })
               ok(res, item)
               return
@@ -2752,7 +2765,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
             const forwardedSession = req.headers['x-principal-session']
             const sessionId = typeof forwardedSession === 'string' && forwardedSession !== '' ? forwardedSession : undefined
             ok(res, kernel.texWriteFile(id, input.path, input.content, input.expected_version, {
-              request_id: currentRequestId,
+              request_id: kernelRequestId(),
               session_id: sessionId,
             }))
             return
@@ -2894,99 +2907,89 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
           break
         }
         case 'pty': {
-          // PTY-01 (execution-runtime.md §6.1, api-contracts.md §18) —
-          // Interactive Terminal. Wire shape: the client never sends
-          // endpoint/SSH credential/Docker socket/host path — only opaque
-          // profile/target ids, a preset and a relative cwd (pty-safe-open).
-          // The REAL tty allocation is the adapter (LocalPtyAdapter in the
-          // kernel bin / LocalDockerPty / RemoteRunnerPty, all behind the
-          // same PtyAdapter contract). While no adapter is registered the
-          // HTTP open route stays 501 and no inert session row is created
-          // (an adapter-less session would mislead the UI).
-          if (id === 'sessions') {
-            if (sub === undefined && method === 'POST') {
-              // Open: schema + semantics validation first, then the adapter
-              // gate, then the authenticated principal + project membership.
-              const input = PtyOpenRequest.parse(body)
-              kernel.getProject(input.project_id) // 404 project_not_found
-              kernel.resolveWorkspace(input.workspace_id) // 404 workspace_not_found
-              if (!kernel.hasPtyAdapter()) {
-                send(res, 501, {
-                  error: errorEnvelope('pty_adapter_not_implemented',
-                    'no PTY adapter is registered (LocalPtyAdapter/RemoteRunnerPty pending) — the interface layer state machine is exercised via the kernel API'),
-                })
-                return
-              }
-              // PTY-01 (API-01): the BFF resolves the authenticated operator
-              // and injects x-principal-id (never trusted from the client);
-              // the kernel fails closed without it and pins it on the row.
-              const principalId = typeof req.headers['x-principal-id'] === 'string' && req.headers['x-principal-id'] !== ''
-                ? req.headers['x-principal-id']
-                : ''
-              if (principalId === '') {
-                send(res, 422, {
-                  error: errorEnvelope('principal_required',
-                    'pty open requires an authenticated principal (x-principal-id); the BFF injects it from the operator session'),
-                })
-                return
-              }
-              // Project membership (mirrors handleV2 memberOr404): a
-              // non-member cannot open a terminal in the project.
-              if (!kernel.listProjectMembers(input.project_id).some(m => m.principal_id === principalId)) {
-                throw new KernelError(404, 'project_not_found', 'project not found or access denied')
-              }
-              const session = kernel.ptyOpen(input, { principal: { principal_id: principalId } })
-              send(res, 201, session)
-              return
+          // PTY-SESSION-02: the browser selects only an opaque context id.
+          // Project/owner/tenant/parent/profile/target are always resolved
+          // from current server authority and revalidated on every action.
+          if (id === 'contexts' && sub === undefined && method === 'GET' && parts.length === 3) {
+            const projectId = url.searchParams.get('project_id') ?? ''
+            if (projectId === '') throw new KernelError(422, 'project_id_required', 'project_id is required')
+            const principalId = requirePtyPrincipal(req, res)
+            if (principalId === null) return
+            ok(res, kernel.ptyContexts(projectId, principalId))
+            return
+          }
+          if (id === 'contexts' && sub !== undefined && subId === 'sessions' && method === 'GET' && parts.length === 5) {
+            const principalId = requirePtyPrincipal(req, res)
+            if (principalId === null) return
+            const context = kernel.ptyResolveContext(sub, principalId)
+            ok(res, kernel.ptyListContext(context))
+            return
+          }
+          if (id === 'sessions' && sub === undefined && method === 'POST' && parts.length === 3) {
+            const input = PtyOpenRequest.parse(body)
+            const principalId = requirePtyPrincipal(req, res)
+            if (principalId === null) return
+            const context = kernel.ptyResolveContext(input.context_id, principalId)
+            send(res, 201, kernel.ptyOpen(input, { context }))
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === undefined && method === 'HEAD' && parts.length === 4) {
+            const access = requirePtyAccess(kernel, req, res, sub, { lease: 'none' })
+            if (access === null) return
+            res.writeHead(204, { 'x-project-id': access.context.project_id, 'cache-control': 'no-store' })
+            res.end()
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === undefined && method === 'GET' && parts.length === 4) {
+            const generation = requireExpectedGeneration(url.searchParams.get('expected_generation'))
+            const access = requirePtyAccess(kernel, req, res, sub, { expectedGeneration: generation, lease: 'required' })
+            if (access === null) return
+            ok(res, access.session)
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === 'attach' && method === 'POST' && parts.length === 5) {
+            const input = PtyAttachRequest.parse(body)
+            const access = requirePtyAccess(kernel, req, res, sub, { expectedGeneration: input.expected_generation, lease: 'required' })
+            if (access === null) return
+            ok(res, kernel.ptyAttach(sub, access.context, input.expected_generation))
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === 'detach' && method === 'POST' && parts.length === 5) {
+            const input = PtyDetachRequest.parse(body)
+            const access = requirePtyAccess(kernel, req, res, sub, { expectedGeneration: input.expected_generation, lease: 'required' })
+            if (access === null) return
+            ok(res, kernel.ptyDetach(sub, access.context, input.expected_generation))
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === undefined && method === 'DELETE' && parts.length === 4) {
+            const input = PtyCloseRequest.parse(body)
+            const access = requirePtyAccess(kernel, req, res, sub, { expectedGeneration: input.expected_generation, lease: 'required' })
+            if (access === null) return
+            ok(res, kernel.ptyClose(sub, access.context, input.expected_generation))
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === 'control' && method === 'POST' && parts.length === 5) {
+            const input = PtyControlRequest.parse(body)
+            const access = requirePtyAccess(kernel, req, res, sub, { expectedGeneration: input.expected_generation, lease: 'required' })
+            if (access === null) return
+            ok(res, kernel.ptyControl(sub, input, access.context))
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === 'frames' && subSubId === 'stream' && method === 'GET' && parts.length === 6) {
+            void handlePtyFramesSse(req, res, kernel, sub, url)
+            return
+          }
+          if (id === 'sessions' && sub !== undefined && subId === 'frames' && subSubId === undefined && method === 'GET' && parts.length === 5) {
+            const raw = url.searchParams.get('after_seq')
+            const afterSeq = raw === null ? 0 : Number(raw)
+            if (!Number.isInteger(afterSeq) || afterSeq < 0) {
+              throw new KernelError(422, 'pty_after_seq_invalid', 'after_seq must be a non-negative integer')
             }
-            if (sub !== undefined && subId === undefined && method === 'GET') {
-              // Session state + lease summary (api-contracts.md §18 GET).
-              // PTY-01 (hardening §5 P0-2): fail-closed principal + OWNER —
-              // knowing a session id is not enough to read it; a foreign
-              // session (even inside a member project) is 403, a missing
-              // principal 422. No lease required for the read itself.
-              if (requirePtyOwner(kernel, req, res, sub, { requireLease: false }) === null) return
-              ok(res, kernel.ptyGet(sub))
-              return
-            }
-            if (sub !== undefined && subId === 'control' && method === 'POST') {
-              // Control with client_seq idempotency: 422 on schema failure,
-              // 404 on unknown session, 409 on reorder/closed, 200 with
-              // delivered=false while no adapter is attached. PTY-01
-              // (hardening §5 P0-2): principal + OWNER + LEASE are ALL
-              // mandatory — a missing x-principal-id is 422
-              // principal_required, a non-owner 403 pty_principal_mismatch,
-              // a missing x-pty-lease 403 lease_required, a wrong lease 403
-              // lease_invalid. "Header missing = pass" is never accepted.
-              const input = PtyControlRequest.parse(body)
-              if (requirePtyOwner(kernel, req, res, sub, { requireLease: true }) === null) return
-              const result = kernel.ptyControl(sub, input)
-              ok(res, result)
-              return
-            }
-            if (sub !== undefined && subId === 'frames' && subSubId === 'stream' && method === 'GET') {
-              // PTY frame SSE stream (api-contracts.md §22): replay + live
-              // tail with the same owner+lease validation as the polling
-              // frames route below (checked INSIDE the handler before any
-              // SSE byte). Registered BEFORE the polling check so
-              // .../frames/stream never falls through to the JSON page.
-              void handlePtyFramesSse(req, res, kernel, sub, url)
-              return
-            }
-            if (sub !== undefined && subId === 'frames' && method === 'GET') {
-              // Output replay with server seq / gap / retention. PTY-01
-              // (hardening §5 P0-2): same fail-closed principal + owner as
-              // the session read; the lease is OPTIONAL here but when
-              // present it must be valid (never "wrong lease = pass").
-              const raw = url.searchParams.get('after_seq')
-              const afterSeq = raw === null ? 0 : Number(raw)
-              if (!Number.isInteger(afterSeq) || afterSeq < 0) {
-                throw new KernelError(422, 'pty_after_seq_invalid', 'after_seq must be a non-negative integer')
-              }
-              if (requirePtyOwner(kernel, req, res, sub, { requireLease: false }) === null) return
-              ok(res, kernel.ptyFrames(sub, afterSeq))
-              return
-            }
+            const generation = requireExpectedGeneration(url.searchParams.get('expected_generation'))
+            const access = requirePtyAccess(kernel, req, res, sub, { expectedGeneration: generation, lease: 'required' })
+            if (access === null) return
+            ok(res, kernel.ptyFrames(sub, afterSeq, access.context, generation))
+            return
           }
           break
         }
@@ -3006,7 +3009,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
           break
         }
         case 'jobs-claim': {
-          if (method === 'POST' && id !== undefined) {
+          if (method === 'POST' && id === 'run' && sub === undefined) {
             const input = z.object({
               owner: z.string().min(1),
               lease_ttl_seconds: z.number().int().positive().optional(),
@@ -3037,7 +3040,7 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
           break
         }
         case 'recover': {
-          if (method === 'POST' && id === 'leases') {
+          if (method === 'POST' && id === 'leases' && sub === undefined) {
             ok(res, { recovered: kernel.recoverExpiredLeases() })
             return
           }
@@ -3211,8 +3214,8 @@ export const sseStreamTiming = { pollMs: 200, heartbeatMs: 15000 }
  * PTY frame stream (api-contracts.md §22, PTY-01): text/event-stream replay
  * + live tail of a session's output frames, mirroring the terminal SSE
  * pattern (handleTerminalSse). Auth is IDENTICAL to the polling frames
- * route (requirePtyOwner: missing principal → 422, non-owner → 403,
- * unknown session → 404; an OPTIONAL lease must be valid when present).
+ * route (missing principal → 422, non-owner → 403, unknown session → 404;
+ * lease and expected generation are mandatory before the first SSE byte).
  * Events: subscribed / frame (server_seq monotonic) / gap (retention
  * eviction) / exit (ends the stream, replayable via after_seq) / heartbeat.
  * Data comes from kernel.ptyFrames — the same store the polling
@@ -3225,22 +3228,25 @@ function handlePtyFramesSse(
   sessionId: string,
   url: URL,
 ): void {
-  // Same wire validation as the polling frames route: after_seq must be a
-  // non-negative integer (422 pty_after_seq_invalid, thrown → router fail()).
+  // Same wire validation as polling frames: cursor and generation are
+  // validated before any SSE byte is written.
   const raw = url.searchParams.get('after_seq')
   const afterSeq = raw === null ? 0 : Number(raw)
   if (!Number.isInteger(afterSeq) || afterSeq < 0) {
     throw new KernelError(422, 'pty_after_seq_invalid', 'after_seq must be a non-negative integer')
   }
-  // Fail-closed owner check BEFORE any SSE byte: requirePtyOwner writes the
-  // JSON error itself (422/403/404) and returns null on rejection.
-  if (requirePtyOwner(kernel, req, res, sessionId, { requireLease: false }) === null) return
+  const generation = requireExpectedGeneration(url.searchParams.get('expected_generation'))
+  const access = requirePtyAccess(kernel, req, res, sessionId, {
+    expectedGeneration: generation,
+    lease: 'required',
+  })
+  if (access === null) return
   const writeEvent = (event: string, data: unknown): void => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
   }
   // Initial snapshot before the headers: an unknown session propagates as a
   // JSON 404 (pty_session_not_found) instead of half-open SSE.
-  const initial = kernel.ptyFrames(sessionId, 0)
+  const initial = kernel.ptyFrames(sessionId, 0, access.context, generation)
   const initialLastSeq = initial.frames.length > 0 ? initial.frames[initial.frames.length - 1]!.server_seq : 0
   res.writeHead(200, {
     'content-type': 'text/event-stream',
@@ -3271,7 +3277,7 @@ function handlePtyFramesSse(
     if (closed) return
     let data
     try {
-      data = kernel.ptyFrames(sessionId, cursor)
+      data = kernel.ptyFrames(sessionId, cursor, access.context, generation)
     } catch {
       cleanup()
       res.end()
@@ -3875,9 +3881,8 @@ async function handleV2(ctx: {
   subSubId?: string
   body: unknown
   kernel: ResearchKernel
-  configPin?: string
 }): Promise<void> {
-  const { req, res, method, url, resource, id, sub, subId, subSubId, body, kernel, configPin } = ctx
+  const { req, res, method, url, resource, id, sub, subId, subSubId, body, kernel } = ctx
   const principal = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'] : undefined
   // API-01 role capabilities: the BFF injects x-principal-role from ITS OWN
   // membership lookup (client-supplied values are never trusted). When
@@ -3974,7 +3979,7 @@ async function handleV2(ctx: {
       protocol_version: 'v2',
       schema_version: kernel.schemaVersion(),
       database_id: kernel.databaseId(),
-      config_pin: configPin ?? kernel.configPinHash,
+      config_pin: kernel.configPinHash,
       capabilities: {
         terminal_stream: true,
         interactive_terminal: true,
@@ -4039,6 +4044,60 @@ async function handleV2(ctx: {
   if (resource === 'methodology' && id === 'native-packs' && sub === 'reconcile' && subId === undefined && subSubId === undefined && method === 'POST') {
     if (methodologyOperator() === null) return
     send(res, 200, kernel.methodology.reconcileNativeKnowledgePacks())
+    return
+  }
+  // REVIEW-OCR-03: OCR is scoped by the durable Intake, not by a client
+  // supplied project id. Resolve the owning project from the Intake row and
+  // derive the caller's role from current membership on every request. The
+  // exact path shapes below deliberately reject trailing aliases.
+  if (resource === 'intakes') {
+    const collectionPath = /^\/v2\/intakes\/[^/]+\/ocr-requests$/.test(url.pathname)
+    const itemPath = /^\/v2\/intakes\/[^/]+\/ocr-requests\/[^/]+$/.test(url.pathname)
+    if (id === undefined || sub !== 'ocr-requests' || (!collectionPath && !itemPath)) {
+      send(res, 404, { error: { code: 'not_found', message: 'unknown v2 route' } })
+      return
+    }
+    if (principal === undefined || principal.trim() === '') {
+      send(res, 422, { error: errorEnvelope('principal_required', 'OCR access requires an authenticated Human Principal') })
+      return
+    }
+    const intake = kernel.getIntakeProjection(id).session
+    const projectId = intake.project_id
+    if (projectId === null) {
+      send(res, 404, { error: errorEnvelope('project_not_found', 'project not found or access denied') })
+      return
+    }
+    const durableRole = kernel.getProjectMemberRole(projectId, principal)
+    if (durableRole === null) {
+      send(res, 404, { error: errorEnvelope('project_not_found', 'project not found or access denied') })
+      return
+    }
+    const writable = durableRole === 'pi' || durableRole === 'operator' || durableRole === 'researcher'
+    if (method !== 'GET' && !writable) {
+      send(res, 403, { error: errorEnvelope('role_forbidden', 'OCR mutation requires project PI, operator or researcher authority') })
+      return
+    }
+    if (collectionPath && subId === undefined && method === 'POST') {
+      const idempotencyKey = typeof req.headers['idempotency-key'] === 'string'
+        ? req.headers['idempotency-key'].trim()
+        : ''
+      if (idempotencyKey === '') {
+        send(res, 422, { error: errorEnvelope('idempotency_key_required', 'OCR request requires an Idempotency-Key header') })
+        return
+      }
+      const input = OcrRequestCreateInput.parse(body)
+      send(res, 201, kernel.createOcrRequest(id, input, idempotencyKey))
+      return
+    }
+    if (itemPath && subId !== undefined && method === 'GET') {
+      send(res, 200, kernel.readOcrRequest(id, subId))
+      return
+    }
+    if (itemPath && subId !== undefined && method === 'DELETE') {
+      send(res, 200, kernel.cancelOcrRequest(id, subId))
+      return
+    }
+    send(res, 404, { error: { code: 'not_found', message: 'unknown v2 route' } })
     return
   }
   if (resource !== 'projects') {
@@ -4449,7 +4508,7 @@ async function handleV2(ctx: {
   }
   if (id !== undefined && sub === 'grill' && subId === 'confirm' && method === 'POST') {
     memberOr404(id)
-    if (!requirePiOnly(kernel, req, res, id, body, 'Grill confirm', { allowOperator: false })) return
+    if (!requirePiOnly(kernel, req, res, id, 'Grill confirm', { allowOperator: false })) return
     const idem = typeof req.headers['idempotency-key'] === 'string' && req.headers['idempotency-key'] !== '' ? req.headers['idempotency-key'] : undefined
     if (idem === undefined) {
       send(res, 422, { error: { code: 'idempotency_key_required', message: 'Grill confirm requires an Idempotency-Key header' } })
@@ -4465,30 +4524,23 @@ async function handleV2(ctx: {
     ok(res, kernel.getProject(id))
     return
   }
-  if (id !== undefined && sub === 'execution' && method === 'PATCH') {
-    memberOr404(id)
-    if (!requirePiOnly(kernel, req, res, id, body, 'project execution configuration')) return
-    const input = projectRunnerTargetSchema.parse(body)
-    ok(res, kernel.configureProjectRunnerTarget({ project_id: id, ...input }))
-    return
-  }
   if (id !== undefined && sub === 'idea-gate' && method === 'POST') {
     memberOr404(id)
-    if (!requirePiOnly(kernel, req, res, id, body, 'Idea selection')) return
+    if (!requirePiOnly(kernel, req, res, id, 'Idea selection')) return
     const input = ideaGatePrepareSchema.parse(body)
     send(res, 201, kernel.prepareIdeaGate({ project_id: id, ...input }))
     return
   }
   if (id !== undefined && sub === 'contract-gate' && method === 'POST') {
     memberOr404(id)
-    if (!requirePiOnly(kernel, req, res, id, body, 'Contract draft preparation')) return
+    if (!requirePiOnly(kernel, req, res, id, 'Contract draft preparation')) return
     const input = contractGatePrepareSchema.parse(body)
     send(res, 201, kernel.prepareContractGate({ project_id: id, ...input } as never))
     return
   }
   if (id !== undefined && sub === undefined && method === 'DELETE') {
     const input = deleteProjectSchema.parse(body)
-    if (!requirePiOnly(kernel, req, res, id, body, 'project deletion', { allowOperator: false, includeDeleted: true })) return
+    if (!requirePiOnly(kernel, req, res, id, 'project deletion', { allowOperator: false, includeDeleted: true })) return
     const deletedBy = typeof req.headers['x-principal-id'] === 'string' ? req.headers['x-principal-id'] : ''
     const requestId = typeof req.headers['x-request-id'] === 'string' ? req.headers['x-request-id'] : ''
     if (requestId === '') throw new KernelError(422, 'request_id_required', 'project deletion requires X-Request-Id')
@@ -4669,13 +4721,6 @@ async function handleV2(ctx: {
 }
 
 export function startKernelServer(options: KernelServerOptions): Promise<{ server: Server; url: string; port: number }> {  const { kernel, host = '127.0.0.1', port = 7412, token } = options
-  // §12.7 server-level startup parameter (see also KernelOptions.requireSignedManifest).
-  if (options.requireSignedManifest !== undefined) kernel.requireSignedManifest = options.requireSignedManifest
-  // CONFIG-01: the deployment config pin (CLI-computed) or the kernel's own.
-  const configPin = options.configPinHash ?? kernel.configPinHash
-  // CONFIG-01: the deployment's redacted effective config (CLI-computed) or
-  // the kernel's own — served by GET /v1/config/effective.
-  const configRedacted = options.configRedacted ?? kernel.configRedacted
   const server = createServer((req, res) => {
     // OBS-01 (reconstruction-contracts.md §18): HTTP request count + latency
     // histogram. Recorded once per request on response finish (or close for
@@ -4692,7 +4737,7 @@ export function startKernelServer(options: KernelServerOptions): Promise<{ serve
     }
     res.on('finish', recordRequest)
     res.on('close', recordRequest)
-    route(req, res, kernel, token, configPin, configRedacted, host)
+    withKernelRequestContext(req, () => route(req, res, kernel, token, host))
   })
   return new Promise((resolve, reject) => {
     server.once('error', reject)

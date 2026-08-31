@@ -162,15 +162,11 @@ export function resetMissingKeyWarnings(): void {
 }
 
 /**
- * Dev-mode probe: true in Vite dev servers and under test runners (vitest
- * exposes MODE='test'), false in production bundles (where import.meta.env
- * is absent and `process` is undefined in the browser). Console warnings
- * for missing keys are gated on this; the injected reporter is not.
+ * Dev-mode probe for Node/Vitest. The shipped browser client is a CJS
+ * ModuleLoader bundle, so it deliberately does not inspect import.meta.env;
+ * parity and injected-reporting remain the browser/build authorities.
  */
 export function isLocaleDevMode(): boolean {
-  const env = (import.meta as { env?: { DEV?: boolean; MODE?: string } }).env
-  if (env?.DEV === true) return true
-  if (env?.MODE === 'test') return true
   try {
     if (typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production') return true
   } catch { /* sandboxed */ }

@@ -31,9 +31,9 @@
  * - `required_by` says who must perform the action: `human` | `agent` |
  *   `runner`.
  *
- * Legacy safety: the Kernel still emits `next_actions: string[]` (labels of
- * the non-`done` actions, in projection order) so old consumers keep
- * working. A status with no mapping degrades to `code: 'unknown'` (see
+ * This structure is the only next-step authority; consumers must not infer
+ * mutations from display labels. A status with no mapping degrades to
+ * `code: 'unknown'` (see
  * `NEXT_ACTION_UNKNOWN_CODE`) — a read-only label, never a mutation CTA.
  * @module @dsh-scholar/research-schemas
  */
@@ -69,7 +69,7 @@ export const NextAction = z.object({
   id: z.string().min(1),
   /** Stable machine code (e.g. `scope_gate_submit`, `survey_run`). */
   code: z.string().min(1),
-  /** i18n key or English default label; the legacy string[] is derived from this. */
+  /** i18n key or English default label; display-only, never mutation authority. */
   label: z.string().min(1),
   /** Why this action is the next step right now. */
   reason: z.string().default(''),

@@ -1,19 +1,30 @@
 import { describe, expect, it } from 'vitest'
-import { buildExecutionPlan, type JobRecord } from '@dsh-scholar/research-schemas'
+import { buildExecutionPlan, computeProfileConfigHash, getRunnerProfile, type JobRecord } from '@dsh-scholar/research-schemas'
 import { probeDockerExecutionEnvironment } from '@dsh-scholar/runner-gateway'
 
+const profile = getRunnerProfile('profile_local_docker_cpu_v1')!
 const job = {
   job_id: 'job_probe', project_id: 'prj_probe', contract_id: null, idempotency_key: 'probe',
-  kind: 'smoke', command: ['true'], payload: {}, status: 'running', failure_class: null,
+  kind: 'smoke', command: ['true'], payload: {
+    project_config_pin: `sha256:${'1'.repeat(64)}`,
+    runner_target_id: 'local-docker',
+    runner_target_kind: 'local-docker',
+    runner_target_revision: 1,
+    runner_target_hash: `sha256:${'a'.repeat(64)}`,
+    runner_profile_id: profile.profile_id,
+    profile_config_hash: computeProfileConfigHash(profile),
+    image_digest: 'registry/research@sha256:' + 'e'.repeat(64),
+    runner_compute: { mode: 'cpu' },
+  }, status: 'running', failure_class: null,
   lease_owner: 'runner', lease_expires_at: null, heartbeat_at: null, lease_generation: 1,
   lease_token: 'token', attempts: 1, max_attempts: 1, run_manifest: null, error: '',
   created_at: '2026-08-15T00:00:00.000Z', updated_at: '2026-08-15T00:00:00.000Z',
 } satisfies JobRecord
 
 function plan(compute: { mode: 'cpu' } | { mode: 'nvidia'; devices: 'all' | string[] }) {
-  return buildExecutionPlan(job, {
+  return buildExecutionPlan({ ...job, payload: { ...job.payload, runner_compute: compute } } as JobRecord, {
     run_id: 'run_probe', lease: { owner: 'runner', generation: 1, token: 'token', expires_at: null },
-    image_digest: 'registry/research@sha256:' + 'e'.repeat(64), timeout_ms: 1000, compute,
+    timeout_ms: 1000,
   })
 }
 

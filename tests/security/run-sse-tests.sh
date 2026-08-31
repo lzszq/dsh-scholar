@@ -181,8 +181,12 @@ start_bff() {
     BFF_KPORT=$kport
     BFF_DATA="$WORK/bff$attempt"
     BTOKEN="sse-test-token-$$-$attempt"
+    mkdir -p "$BFF_DATA"
+    chmod 700 "$BFF_DATA"
+    printf '%s' "$BTOKEN" > "$BFF_DATA/standalone-token"
+    chmod 600 "$BFF_DATA/standalone-token"
     nohup node "$SERVER_BIN" --host 127.0.0.1 --port "$bport" --kernel-port "$kport" \
-      --kernel-data-dir "$BFF_DATA" --data-dir "$BFF_DATA" --token "$BTOKEN" --principal alice > "$WORK/bff.log" 2>&1 &
+      --kernel-data-dir "$BFF_DATA" --data-dir "$BFF_DATA" --principal alice > "$WORK/bff.log" 2>&1 &
     BFF_PID=$!
     for _ in $(seq 1 100); do
       if ! kill -0 "$BFF_PID" 2>/dev/null; then break; fi
@@ -337,26 +341,29 @@ fi
 # SAME stores the polling endpoints read (pty frames / workspace listSince /
 # trajectory projection).
 PTYOWNER='pty-sse'
-PTYP=$(api -X POST "$BASE/v1/projects" -d "{\"name\":\"sse-pty\",\"workspace\":\"/w/pty\",\"creator_principal_id\":\"$PTYOWNER\",\"brief\":$BRIEF}" | jfield '.project_id')
+PTYP=$(api -X POST "$BASE/v1/projects" -d "{\"name\":\"sse-pty\",\"workspace\":\"/w/pty\",\"creator_principal_id\":\"$PTYOWNER\",\"brief\":$BRIEF,\"execution\":{\"runner_profile_id\":\"profile_isolated_subprocess_v1\",\"runner_target_id\":\"target_local_process_v1\",\"network_policy\":\"none\",\"artifact_store\":\"local-cas\"}}" | jfield '.project_id')
 PTYWS=$(api -X POST "$BASE/v1/projects/$PTYP/workspaces" -d '{"kind":"scratch","name":"s"}' | jfield '.workspace_id')
 [[ -n "$PTYP" && -n "$PTYWS" ]] || { echo "failed to create pty-stream fixtures"; exit 1; }
+PTY_CONTEXT=$(curl -s "$BASE/v1/pty/contexts?project_id=$PTYP" -H "x-principal-id: $PTYOWNER" \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);console.log((Array.isArray(a)?a:[]).find(x=>x.context_kind==='research')?.context_id||'')})")
 
 say "Test 8: kernel-pty-stream-live — pty frame stream: real body, live tail, exit end"
 PTY_OPEN=$(curl -s -X POST "$BASE/v1/pty/sessions" -H 'content-type: application/json' -H "x-principal-id: $PTYOWNER" \
-  -d "{\"project_id\":\"$PTYP\",\"workspace_id\":\"$PTYWS\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\"}")
+  -d "{\"context_id\":\"$PTY_CONTEXT\",\"workspace_id\":\"$PTYWS\",\"label\":\"kernel SSE shell\",\"purpose\":\"live stream test\",\"preset\":\"sh\",\"cwd\":\".\"}")
 PTY_ID=$(printf '%s' "$PTY_OPEN" | jfield '.pty_session_id')
 PTY_LEASE=$(printf '%s' "$PTY_OPEN" | jfield '.lease_token')
-if [[ -n "$PTY_ID" && -n "$PTY_LEASE" ]]; then
+PTY_GEN=$(printf '%s' "$PTY_OPEN" | jfield '.generation')
+if [[ -n "$PTY_ID" && -n "$PTY_LEASE" && -n "$PTY_GEN" ]]; then
   ok "pty session opened via kernel ($PTY_ID)"
 else
   bad "pty session open (got: $(printf '%s' "$PTY_OPEN" | head -c 160))"
   exit 1
 fi
 (timeout 6 curl -sN --no-buffer -D "$WORK/hp1.txt" -o "$WORK/bp1.txt" \
-  "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0" -H "x-principal-id: $PTYOWNER" > /dev/null 2>&1 || true) &
+  "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0&expected_generation=$PTY_GEN" -H "x-principal-id: $PTYOWNER" -H "x-pty-lease: $PTY_LEASE" > /dev/null 2>&1 || true) &
 PTY_SSE_PID=$!
 sleep 1.2
-CTL8=$(node -e 'const text="echo SSE_LIVE_1; echo SSE_LIVE_2; echo SSE_LIVE_3; exit\n"; console.log(JSON.stringify({client_seq:1,type:"bytes",payload:{text,byte_length:text.length}}))')
+CTL8=$(node -e "const text='echo SSE_LIVE_1; echo SSE_LIVE_2; echo SSE_LIVE_3; exit\\n'; console.log(JSON.stringify({expected_generation:Number('$PTY_GEN'),client_seq:1,type:'bytes',payload:{text,byte_length:text.length}}))")
 CTL=$(curl -s -X POST "$BASE/v1/pty/sessions/$PTY_ID/control" -H 'content-type: application/json' -H "x-principal-id: $PTYOWNER" -H "x-pty-lease: $PTY_LEASE" -d "$CTL8")
 wait "$PTY_SSE_PID" 2>/dev/null || true
 CTP1=$(ctype "$WORK/hp1.txt")
@@ -389,7 +396,7 @@ fi
 
 say "Test 9: kernel-pty-stream-after-seq — resume without duplicates; gap on eviction; auth matrix"
 LAST_PTY=$(printf '%s' "$PTY_SEQS" | awk -F, '{print $NF}')
-sse_read "$WORK/bp2.txt" "$WORK/hp2.txt" 2 "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=$LAST_PTY" -H "x-principal-id: $PTYOWNER"
+sse_read "$WORK/bp2.txt" "$WORK/hp2.txt" 2 "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=$LAST_PTY&expected_generation=$PTY_GEN" -H "x-principal-id: $PTYOWNER" -H "x-pty-lease: $PTY_LEASE"
 PTY2_SEQS=$(sse_seqs "$WORK/bp2.txt" frame)
 if [[ -z "$PTY2_SEQS" ]]; then
   ok "after_seq=$LAST_PTY -> no pty frame replayed"
@@ -398,7 +405,7 @@ else
 fi
 EXIT_SEQ=$(sse_events "$WORK/bp1.txt" exit | head -1 | cut -f2 | jfield '.seq')
 if [[ -n "$EXIT_SEQ" ]]; then
-  sse_read "$WORK/bp3.txt" "$WORK/hp3.txt" 2 "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=$EXIT_SEQ" -H "x-principal-id: $PTYOWNER"
+  sse_read "$WORK/bp3.txt" "$WORK/hp3.txt" 2 "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=$EXIT_SEQ&expected_generation=$PTY_GEN" -H "x-principal-id: $PTYOWNER" -H "x-pty-lease: $PTY_LEASE"
   if grep -q 'event: frame' "$WORK/bp3.txt" || grep -q 'event: exit' "$WORK/bp3.txt"; then
     bad "after exit seq $EXIT_SEQ: expected only subscribed, got more events"
   else
@@ -409,14 +416,16 @@ else
 fi
 # Gap: a reader starting at 0 on an evicted window must see the gap event.
 PTY_GAP=$(curl -s -X POST "$BASE/v1/pty/sessions" -H 'content-type: application/json' -H "x-principal-id: $PTYOWNER" \
-  -d "{\"project_id\":\"$PTYP\",\"workspace_id\":\"$PTYWS\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\",\"retention_bytes\":16}")
+  -d "{\"context_id\":\"$PTY_CONTEXT\",\"workspace_id\":\"$PTYWS\",\"label\":\"kernel SSE retention shell\",\"purpose\":\"bounded retention test\",\"preset\":\"sh\",\"cwd\":\".\"}")
 PTY_GAP_ID=$(printf '%s' "$PTY_GAP" | jfield '.pty_session_id')
 PTY_GAP_LEASE=$(printf '%s' "$PTY_GAP" | jfield '.lease_token')
-if [[ -n "$PTY_GAP_ID" && -n "$PTY_GAP_LEASE" ]]; then
-  CTL9=$(node -e 'const text="echo GAP_AAAAAA; echo GAP_BBBBBB; echo GAP_CCCCCC; echo GAP_DDDDDD\n"; console.log(JSON.stringify({client_seq:1,type:"bytes",payload:{text,byte_length:text.length}}))')
+PTY_GAP_GEN=$(printf '%s' "$PTY_GAP" | jfield '.generation')
+if [[ -n "$PTY_GAP_ID" && -n "$PTY_GAP_LEASE" && -n "$PTY_GAP_GEN" ]]; then
+  CTL9=$(node -e "const text=\"python3 -c \\\"print('G'*1100000)\\\"\\n\"; console.log(JSON.stringify({expected_generation:Number('$PTY_GAP_GEN'),client_seq:1,type:'bytes',payload:{text,byte_length:text.length}}))")
   curl -s -X POST "$BASE/v1/pty/sessions/$PTY_GAP_ID/control" -H 'content-type: application/json' -H "x-principal-id: $PTYOWNER" -H "x-pty-lease: $PTY_GAP_LEASE" \
     -d "$CTL9" > /dev/null
-  sse_read "$WORK/bpg.txt" "$WORK/hpg.txt" 2 "$BASE/v1/pty/sessions/$PTY_GAP_ID/frames/stream?after_seq=0" -H "x-principal-id: $PTYOWNER"
+  sleep 1
+  sse_read "$WORK/bpg.txt" "$WORK/hpg.txt" 2 "$BASE/v1/pty/sessions/$PTY_GAP_ID/frames/stream?after_seq=0&expected_generation=$PTY_GAP_GEN" -H "x-principal-id: $PTYOWNER" -H "x-pty-lease: $PTY_GAP_LEASE"
   GAPLINE=$(sse_events "$WORK/bpg.txt" gap | head -1)
   if [[ -n "$GAPLINE" ]]; then
     GF=$(printf '%s' "$GAPLINE" | cut -f2)
@@ -433,16 +442,16 @@ else
   bad "retention pty session open for gap test"
 fi
 # Auth matrix mirrors the polling frames route (422/403/404, wrong lease 403).
-R=$(curl -s -o "$WORK/bpn1.json" -w '%{http_code}' "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0")
+R=$(curl -s -o "$WORK/bpn1.json" -w '%{http_code}' -H "x-pty-lease: $PTY_LEASE" "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0&expected_generation=$PTY_GEN")
 [[ "$R" == "422" && "$(jfield '.error.code' < "$WORK/bpn1.json")" == "principal_required" ]] \
   && ok "pty stream without principal -> 422 principal_required" || bad "no-principal pty stream expected 422, got HTTP $R"
-R=$(curl -s -o "$WORK/bpn2.json" -w '%{http_code}' -H 'x-principal-id: evil' "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0")
+R=$(curl -s -o "$WORK/bpn2.json" -w '%{http_code}' -H 'x-principal-id: evil' -H "x-pty-lease: $PTY_LEASE" "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0&expected_generation=$PTY_GEN")
 [[ "$R" == "403" && "$(jfield '.error.code' < "$WORK/bpn2.json")" == "pty_principal_mismatch" ]] \
   && ok "pty stream as non-owner -> 403 pty_principal_mismatch" || bad "non-owner pty stream expected 403, got HTTP $R"
-R=$(curl -s -o "$WORK/bpn3.json" -w '%{http_code}' -H "x-principal-id: $PTYOWNER" "$BASE/v1/pty/sessions/pty_nope/frames/stream?after_seq=0")
+R=$(curl -s -o "$WORK/bpn3.json" -w '%{http_code}' -H "x-principal-id: $PTYOWNER" "$BASE/v1/pty/sessions/pty_nope/frames/stream?after_seq=0&expected_generation=1")
 [[ "$R" == "404" && "$(jfield '.error.code' < "$WORK/bpn3.json")" == "pty_session_not_found" ]] \
   && ok "unknown pty session stream -> 404 pty_session_not_found" || bad "unknown pty stream expected 404, got HTTP $R"
-R=$(curl -s -o "$WORK/bpn4.json" -w '%{http_code}' -H "x-principal-id: $PTYOWNER" -H 'x-pty-lease: lease_wrong' "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0")
+R=$(curl -s -o "$WORK/bpn4.json" -w '%{http_code}' -H "x-principal-id: $PTYOWNER" -H 'x-pty-lease: lease_wrong' "$BASE/v1/pty/sessions/$PTY_ID/frames/stream?after_seq=0&expected_generation=$PTY_GEN")
 [[ "$R" == "403" && "$(jfield '.error.code' < "$WORK/bpn4.json")" == "lease_invalid" ]] \
   && ok "pty stream with wrong lease -> 403 lease_invalid" || bad "wrong-lease pty stream expected 403, got HTTP $R"
 
@@ -514,7 +523,7 @@ TJ_PID=$!
 sleep 1.2
 J2=$(api -X POST "$BASE/v1/projects/$TJP/jobs" -d '{"idempotency_key":"sse-traj-1","kind":"echo","payload":{"message":"x"}}' | jfield '.job_id')
 [[ -n "$J2" ]] || { bad "trajectory job submit"; }
-api -X POST "$BASE/v1/projects/$TJP/session" -d '{"session_id":"sess_traj_1"}' > /dev/null
+api -X POST "$BASE/v1/projects/$TJP/session" -H "x-principal-id: $TJOWNER" -d '{"session_id":"sess_traj_1"}' > /dev/null
 wait "$TJ_PID" 2>/dev/null || true
 CTT=$(ctype "$WORK/ht1.txt")
 if [[ "$CTT" == "text/event-stream" ]]; then
@@ -568,7 +577,7 @@ BAPI() { curl -sf -H "Authorization: Bearer $BTOKEN" -H 'content-type: applicati
 
 say "Test 5: bff-sse-proxy-body — terminal SSE through the standalone BFF proxy"
 BP=$(BAPI -X POST "$BFF/v1/projects" \
-  -d "{\"name\":\"sse-bff\",\"workspace\":\"/w\",\"creator_principal_id\":\"alice\",\"brief\":$BRIEF,\"execution\":{\"runner_profile_id\":\"profile_local_docker_cpu_v1\"}}" | jfield '.project_id')
+  -d "{\"name\":\"sse-bff\",\"workspace\":\"/w\",\"creator_principal_id\":\"alice\",\"brief\":$BRIEF,\"execution\":{\"runner_profile_id\":\"profile_isolated_subprocess_v1\",\"runner_target_id\":\"target_local_process_v1\"}}" | jfield '.project_id')
 if [[ -n "$BP" ]]; then
   ok "project created via proxy (creator alice) -> $BP"
 else
@@ -632,7 +641,7 @@ say "Test 7: bff-sse-cross-project — non-member job terminal -> 404 before str
 # sidecar-spawned kernel demands it).
 BFFKTOKEN=$(tr -d '\n' < "$BFF_DATA/kernel-token" 2>/dev/null || true)
 FP=$(curl -sf -H 'content-type: application/json' -H "Authorization: Bearer $BFFKTOKEN" -X POST "http://127.0.0.1:$BFF_KPORT/v1/projects" \
-  -d "{\"name\":\"sse-foreign-b\",\"workspace\":\"/w\",\"creator_principal_id\":\"bob\",\"brief\":$BRIEF,\"execution\":{\"runner_profile_id\":\"profile_local_docker_cpu_v1\"}}" | jfield '.project_id')
+  -d "{\"name\":\"sse-foreign-b\",\"workspace\":\"/w\",\"creator_principal_id\":\"bob\",\"brief\":$BRIEF,\"execution\":{\"runner_profile_id\":\"profile_isolated_subprocess_v1\",\"runner_target_id\":\"target_local_process_v1\"}}" | jfield '.project_id')
 FJ=$(curl -sf -H 'content-type: application/json' -H "Authorization: Bearer $BFFKTOKEN" -X POST "http://127.0.0.1:$BFF_KPORT/v1/projects/$FP/jobs" \
   -d '{"idempotency_key":"sse-bff-foreign","kind":"echo","payload":{"message":"x"}}' | jfield '.job_id')
 if [[ -n "$FP" && -n "$FJ" ]]; then
@@ -733,20 +742,23 @@ else
 fi
 
 say "Test 14: bff-pty-stream — pty frame stream through the BFF proxy"
+BP_CONTEXT=$(BAPI "$BFF/v1/pty/contexts?project_id=$BP" \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);console.log((Array.isArray(a)?a:[]).find(x=>x.context_kind==='research')?.context_id||'')})")
 BP_OPEN=$(BAPI -X POST "$BFF/v1/pty/sessions" \
-  -d "{\"project_id\":\"$BP\",\"workspace_id\":\"$BWID\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\"}")
+  -d "{\"context_id\":\"$BP_CONTEXT\",\"workspace_id\":\"$BWID\",\"label\":\"BFF SSE shell\",\"purpose\":\"proxy stream test\",\"preset\":\"sh\",\"cwd\":\".\"}")
 BP_ID=$(printf '%s' "$BP_OPEN" | jfield '.pty_session_id')
 BP_LEASE=$(printf '%s' "$BP_OPEN" | jfield '.lease_token')
-if [[ -n "$BP_ID" && -n "$BP_LEASE" ]]; then
+BP_GEN=$(printf '%s' "$BP_OPEN" | jfield '.generation')
+if [[ -n "$BP_ID" && -n "$BP_LEASE" && -n "$BP_GEN" ]]; then
   ok "pty session opened via BFF proxy ($BP_ID)"
 else
   bad "pty session open via BFF (got: $(printf '%s' "$BP_OPEN" | head -c 160))"
 fi
 (timeout 6 curl -sN --no-buffer -D "$WORK/hp1b.txt" -o "$WORK/bp1b.txt" \
-  "$BFF/v1/pty/sessions/$BP_ID/frames/stream?after_seq=0" -H "Authorization: Bearer $BTOKEN" > /dev/null 2>&1 || true) &
+  "$BFF/v1/pty/sessions/$BP_ID/frames/stream?after_seq=0&expected_generation=$BP_GEN" -H "Authorization: Bearer $BTOKEN" -H "x-pty-lease: $BP_LEASE" > /dev/null 2>&1 || true) &
 BPTY_PID=$!
 sleep 1.2
-CTL14=$(node -e 'const text="echo BFF_LIVE_1; echo BFF_LIVE_2; exit\n"; console.log(JSON.stringify({client_seq:1,type:"bytes",payload:{text,byte_length:text.length}}))')
+CTL14=$(node -e "const text='echo BFF_LIVE_1; echo BFF_LIVE_2; exit\\n'; console.log(JSON.stringify({expected_generation:Number('$BP_GEN'),client_seq:1,type:'bytes',payload:{text,byte_length:text.length}}))")
 curl -s -X POST "$BFF/v1/pty/sessions/$BP_ID/control" -H 'content-type: application/json' -H "Authorization: Bearer $BTOKEN" -H "x-pty-lease: $BP_LEASE" \
   -d "$CTL14" > /dev/null
 wait "$BPTY_PID" 2>/dev/null || true
@@ -766,18 +778,22 @@ if grep -qF 'event: exit' "$WORK/bp1b.txt"; then
 else
   bad "proxied pty stream missing exit event"
 fi
-CODE=$(curl -s -o "$WORK/bp1c.json" -w '%{http_code}' "$BFF/v1/pty/sessions/$BP_ID/frames/stream?after_seq=0" || true)
+CODE=$(curl -s -o "$WORK/bp1c.json" -w '%{http_code}' -H "x-pty-lease: $BP_LEASE" "$BFF/v1/pty/sessions/$BP_ID/frames/stream?after_seq=0&expected_generation=$BP_GEN" || true)
 if [[ "$CODE" == "401" ]]; then
   ok "proxied pty stream without token -> HTTP 401"
 else
   bad "no-token pty stream: expected 401, got HTTP $CODE"
 fi
 # Non-member: bob's pty session on the BFF kernel -> 404 before any SSE bytes.
+FPTY_CONTEXT=$(curl -s -H "Authorization: Bearer $BFFKTOKEN" -H 'x-principal-id: bob' "http://127.0.0.1:$BFF_KPORT/v1/pty/contexts?project_id=$FP" \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);console.log((Array.isArray(a)?a:[]).find(x=>x.context_kind==='research')?.context_id||'')})")
 FPTY_OPEN=$(curl -s -H 'content-type: application/json' -H "Authorization: Bearer $BFFKTOKEN" -H 'x-principal-id: bob' -X POST "http://127.0.0.1:$BFF_KPORT/v1/pty/sessions" \
-  -d "{\"project_id\":\"$FP\",\"workspace_id\":\"$FWS\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\"}")
+  -d "{\"context_id\":\"$FPTY_CONTEXT\",\"workspace_id\":\"$FWS\",\"label\":\"foreign SSE shell\",\"purpose\":\"cross-project test\",\"preset\":\"sh\",\"cwd\":\".\"}")
 FPTY_ID=$(printf '%s' "$FPTY_OPEN" | jfield '.pty_session_id')
+FPTY_LEASE=$(printf '%s' "$FPTY_OPEN" | jfield '.lease_token')
+FPTY_GEN=$(printf '%s' "$FPTY_OPEN" | jfield '.generation')
 if [[ -n "$FPTY_ID" ]]; then
-  CODE=$(curl -s -o "$WORK/bp1d.json" -w '%{http_code}' -H "Authorization: Bearer $BTOKEN" "$BFF/v1/pty/sessions/$FPTY_ID/frames/stream?after_seq=0")
+  CODE=$(curl -s -o "$WORK/bp1d.json" -w '%{http_code}' -H "Authorization: Bearer $BTOKEN" -H "x-pty-lease: $FPTY_LEASE" "$BFF/v1/pty/sessions/$FPTY_ID/frames/stream?after_seq=0&expected_generation=$FPTY_GEN")
   ERR=$(jfield '.error.code' < "$WORK/bp1d.json")
   if [[ "$CODE" == "404" && "$ERR" == "project_not_found" ]] && ! grep -q 'event: ' "$WORK/bp1d.json" 2>/dev/null; then
     ok "non-member pty stream via BFF -> HTTP 404 before any SSE bytes"

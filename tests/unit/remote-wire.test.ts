@@ -33,6 +33,8 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   buildExecutionPlan,
+  computeProfileConfigHash,
+  getRunnerProfile,
   verifyExecutionPlanSignature,
   type AgentClaimRequest,
   type AgentClaimResponse,
@@ -76,6 +78,8 @@ import {
 
 const DIGEST = 'node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32'
 const OTHER_DIGEST = 'other@sha256:0000000000000000000000000000000000000000000000000000000000000000'
+const TARGET_CONFIG_HASH = `sha256:${'5'.repeat(64)}`
+const REMOTE_PROFILE = getRunnerProfile('profile_local_docker_cpu_v1')!
 /** secure kinds 的 output contract（metrics 路径；fake executor 据此写 MetricsFileV1）。 */
 const OUT = { metrics: 'metrics.json' }
 
@@ -138,7 +142,7 @@ class FakeFleetKernel implements FleetKernelClient {
   enforceSecureFacts = true
   runnerTarget = {
     target_id: 'remote-gpu-1', kind: 'remote-ssh' as const, enabled: true,
-    draining: false, revision: 1, config_hash: 'sha256:remote-target-v1',
+    draining: false, revision: 1, config_hash: TARGET_CONFIG_HASH,
   }
 
   async getRunnerTarget(targetId: string) {
@@ -167,6 +171,18 @@ class FakeFleetKernel implements FleetKernelClient {
       created_at: '2026-08-11T00:00:00.000Z',
       updated_at: '2026-08-11T00:00:00.000Z',
       ...overrides,
+    }
+    record.payload = {
+      project_config_pin: `sha256:${'3'.repeat(64)}`,
+      runner_target_id: 'remote-gpu-1',
+      runner_target_kind: 'remote-ssh',
+      runner_target_revision: 1,
+      runner_target_hash: TARGET_CONFIG_HASH,
+      runner_profile_id: REMOTE_PROFILE.profile_id,
+      profile_config_hash: computeProfileConfigHash(REMOTE_PROFILE),
+      image_digest: DIGEST,
+      runner_compute: { mode: 'cpu' },
+      ...(record.payload ?? {}),
     }
     this.jobs.set(record.job_id, record)
     return record
@@ -617,7 +633,7 @@ describe('wire claim 匹配（POST /v1/agents/{id}/claims）', () => {
   it('target_id 精确 + capability 匹配才分发；无匹配 target → pending 保留（retryable，不静默改派）', async () => {
     const fixture = makeFleet()
     const kernel = fixture.kernel
-    kernel.seedJob({ job_id: 'job_gpu_1', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST } })
+    kernel.seedJob({ job_id: 'job_gpu_1', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST } })
 
     // CPU agent（不同 target）轮询 → 空；任务留在 pending（不降级到 CPU/local）。
     const cpuAgent = createRemoteRunnerAgent(
@@ -671,13 +687,13 @@ describe('wire claim 匹配（POST /v1/agents/{id}/claims）', () => {
       job_id: 'job_stale_remote_target', project_id: 'prj_1',
       payload: {
         runner_target_id: 'remote-gpu-1', runner_target_kind: 'remote-ssh',
-        runner_target_revision: 1, runner_target_hash: 'sha256:remote-target-v1',
+        runner_target_revision: 1, runner_target_hash: TARGET_CONFIG_HASH,
         image_digest: DIGEST,
       },
     })
     const { agent } = makeAgent(fixture)
     await agent.register()
-    fixture.kernel.runnerTarget = { ...fixture.kernel.runnerTarget, revision: 2, config_hash: 'sha256:remote-target-v2' }
+    fixture.kernel.runnerTarget = { ...fixture.kernel.runnerTarget, revision: 2, config_hash: `sha256:${'6'.repeat(64)}` }
     await expect(agent.claimOnce(1)).resolves.toEqual([])
     expect(fixture.kernel.jobs.get('job_stale_remote_target')).toMatchObject({ status: 'failed' })
     expect(fixture.kernel.completes.at(-1)).toMatchObject({
@@ -690,7 +706,7 @@ describe('wire claim 匹配（POST /v1/agents/{id}/claims）', () => {
     fixture.kernel.seedJob({
       job_id: 'job_bad_remote_profile', project_id: 'prj_1',
       payload: {
-        target_id: 'remote-gpu-1', runner_profile_id: 'profile_missing',
+        runner_target_id: 'remote-gpu-1', runner_profile_id: 'profile_missing',
         profile_config_hash: 'sha256:not-a-profile', image_digest: DIGEST,
       },
     })
@@ -705,7 +721,7 @@ describe('wire claim 匹配（POST /v1/agents/{id}/claims）', () => {
 
   it('agent 断连期间服务端保留 outstanding；恢复后 resume 返回同一 claim（同一 run_id/lease）', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_resume', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST } })
+    fixture.kernel.seedJob({ job_id: 'job_resume', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST } })
     const { agent } = makeAgent(fixture)
     await agent.register()
     const first = await agent.claimOnce(1)
@@ -737,7 +753,7 @@ describe('wire CAS（GET /v1/agents/{id}/cas/{sha}）与 hash 复算', () => {
       job_id: 'job_cas_bad',
       project_id: 'prj_1',
       code_snapshot_id: `sha256:${codeSha}`,
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
     })
 
     // 篡改传输：响应声明的 sha256 与内容不符（模拟链路损坏/服务端撒谎）。
@@ -768,7 +784,7 @@ describe('wire CAS（GET /v1/agents/{id}/cas/{sha}）与 hash 复算', () => {
       job_id: 'job_cas_addr',
       project_id: 'prj_1',
       code_snapshot_id: `sha256:${fakeAddress}`,
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
     })
     const claims2 = await agent.claimOnce(2)
     const addrClaim = claims2.find(c => c.plan.job_id === 'job_cas_addr')
@@ -790,7 +806,7 @@ describe('wire CAS（GET /v1/agents/{id}/cas/{sha}）与 hash 复算', () => {
       job_id: 'job_cas_ok',
       project_id: 'prj_1',
       code_snapshot_id: `sha256:${codeSha}`,
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
     })
     const { agent } = makeAgent(fixture)
     await claimAndRun(agent)
@@ -807,7 +823,7 @@ describe('wire 执行全链路（frames/artifacts/complete，mock 传输）', ()
       job_id: 'job_happy',
       project_id: 'prj_1',
       contract_id: 'expc_1',
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, seed: 11, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, seed: 11, output_contract: OUT },
     })
     const { agent } = makeAgent(fixture, {
       executor: fakeExecutor([
@@ -851,7 +867,8 @@ describe('wire 执行全链路（frames/artifacts/complete，mock 传输）', ()
     expect(typeof runManifest.signature).toBe('string')
     expect(typeof runManifest.payload_sha256).toBe('string')
     expect(runManifest.signed_by).toBe('fleet-owner')
-    expect(runManifest.lease).toEqual({ generation: 1, token: kernelJob.lease_token })
+    expect(runManifest.lease).toEqual({ generation: 1 })
+    expect(JSON.stringify(runManifest)).not.toContain(kernelJob.lease_token)
     expect(runManifest.run_id).toBe(runId)
     expect(runManifest.job_id).toBe('job_happy')
     expect(fixture.kernel.jobs.get('job_happy')?.status).toBe('succeeded')
@@ -859,7 +876,7 @@ describe('wire 执行全链路（frames/artifacts/complete，mock 传输）', ()
 
   it('artifact finalize 篡改（内容与 stage 声明 hash 不一致）→ 409 cas_hash_mismatch 不落库', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_stage', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST } })
+    fixture.kernel.seedJob({ job_id: 'job_stage', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST } })
     const { agent, transport } = makeAgent(fixture)
     await agent.register()
     const claims = await agent.claimOnce(1)
@@ -904,7 +921,7 @@ describe('wire 执行全链路（frames/artifacts/complete，mock 传输）', ()
 describe('wire 离线 spool（有界保存、恢复重放、gap 不静默丢弃）', () => {
   it('断网期间 frames/stage/finalize/complete 全部 spool；恢复后按序重放并完成 Job', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_spool', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
+    fixture.kernel.seedJob({ job_id: 'job_spool', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
     const inner = new InMemoryFleetTransport(fixture.fleet)
     const failing = new FailingFleetTransport(inner)
     const agentKey = makeKeypair('agent-spool')
@@ -947,8 +964,8 @@ describe('wire 离线 spool（有界保存、恢复重放、gap 不静默丢弃�
   it('spool 有界：frames 条目可被淘汰并合成 gap（不静默丢弃）；exit_frame/complete 不可淘汰；恢复后 gap 先于幸存帧送达', async () => {
     const fixture = makeFleet()
     const kernel = fixture.kernel
-    kernel.seedJob({ job_id: 'job_gap_r1', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
-    kernel.seedJob({ job_id: 'job_gap_r2', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
+    kernel.seedJob({ job_id: 'job_gap_r1', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
+    kernel.seedJob({ job_id: 'job_gap_r2', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
     const inner = new InMemoryFleetTransport(fixture.fleet)
     const failing = new FailingFleetTransport(inner)
     const agentKey = makeKeypair('agent-gap')
@@ -964,7 +981,7 @@ describe('wire 离线 spool（有界保存、恢复重放、gap 不静默丢弃�
         // manifest 已含完整 facts（code_commit/code_snapshot_id/container_
         // digest/data_hash/seed/metrics_artifact）——complete 条目比早期更大，
         // 字节预算相应上调（仍保证 R2 complete 入队时淘汰两个 run 的 chunks）。
-        spool: { maxBytes: 2_900, maxEntries: 16 },
+        spool: { maxBytes: 3_200, maxEntries: 16 },
       },
     ) as RemoteRunnerAgentImpl
     await agent.register()
@@ -1021,7 +1038,7 @@ describe('wire 离线 spool（有界保存、恢复重放、gap 不静默丢弃�
 
   it('spool 极小（不可淘汰条目挡住）→ push 被拒 → run 本地失败（fail closed，无合成成功）', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_overflow', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
+    fixture.kernel.seedJob({ job_id: 'job_overflow', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
     const failing2 = new FailingFleetTransport(new InMemoryFleetTransport(fixture.fleet))
     const agentKey2 = makeKeypair('agent-overflow')
     fixture.kernel.manifestPublicKeyPem = agentKey2.publicKeyPem
@@ -1050,7 +1067,7 @@ describe('wire lease 过期 fencing（旧 agent 不能完成 Job）', () => {
   it('lease 过期并被新 claim 抢占后，旧 agent 的 complete → 409 lease_stale；claim 置 settled，后续写入全拒', async () => {
     const fixture = makeFleet()
     const kernel = fixture.kernel
-    kernel.seedJob({ job_id: 'job_fence', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
+    kernel.seedJob({ job_id: 'job_fence', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
     const { agent, transport } = makeAgent(fixture)
     await agent.register()
     const claims = await agent.claimOnce(1)
@@ -1091,7 +1108,7 @@ describe('wire lease 过期 fencing（旧 agent 不能完成 Job）', () => {
 
   it('agent last_seen 超时 → claims 被拒（409 agent_offline，retryable）；心跳恢复后可用', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_offline', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST } })
+    fixture.kernel.seedJob({ job_id: 'job_offline', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST } })
     const { agent } = makeAgent(fixture)
     await agent.register()
     fixture.clock.value = NOW + 60_000 // 超过 offline_after_ms（30s）
@@ -1107,7 +1124,7 @@ describe('wire lease 过期 fencing（旧 agent 不能完成 Job）', () => {
 describe('wire HTTP 面（attachRemoteFleetRoutes + HttpRemoteFleetTransport）', () => {
   it('service token 保护：缺失/错误 token → 403 service_token_required；正确 token 全链路可用', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_http', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
+    fixture.kernel.seedJob({ job_id: 'job_http', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
     const { server, baseUrl } = await startFleetHttpServer(fixture.fleet, { serviceToken: 'svc-tok-1' })
     try {
       // 错误 token / 无 token → 403。
@@ -1163,7 +1180,7 @@ describe('wire §5 修复（secure kinds 容器化 / manifest facts / run_id 绑
     const fixture = makeFleet()
     fixture.kernel.seedJob({
       job_id: 'job_env', project_id: 'prj_1',
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
     })
     const agentKey = makeKeypair('agent-env')
     fixture.kernel.manifestPublicKeyPem = agentKey.publicKeyPem
@@ -1194,7 +1211,7 @@ describe('wire §5 修复（secure kinds 容器化 / manifest facts / run_id 绑
     const fixture = makeFleet()
     fixture.kernel.seedJob({
       job_id: 'job_dkr', project_id: 'prj_1',
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT, seed: 7 },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT, seed: 7 },
     })
     const agentKey = makeKeypair('agent-dkr')
     fixture.kernel.manifestPublicKeyPem = agentKey.publicKeyPem
@@ -1258,14 +1275,25 @@ describe('wire §5 修复（secure kinds 容器化 / manifest facts / run_id 绑
   it('defaultSubprocessExecutor：secure kind / 未标记 trusted_fixture 的 smoke → environment 失败（不 spawn）', async () => {
     const base: JobRecord = {
       job_id: 'job_sec', project_id: 'prj_1', contract_id: null, idempotency_key: 'ik',
-      kind: 'formal', command: ['echo', 'host-marker'], payload: {},
+      kind: 'formal', command: ['echo', 'host-marker'],
+      payload: {
+        project_config_pin: `sha256:${'3'.repeat(64)}`,
+        runner_target_id: 'remote-gpu-1',
+        runner_target_kind: 'remote-ssh',
+        runner_target_revision: 1,
+        runner_target_hash: TARGET_CONFIG_HASH,
+        runner_profile_id: REMOTE_PROFILE.profile_id,
+        profile_config_hash: computeProfileConfigHash(REMOTE_PROFILE),
+        image_digest: DIGEST,
+        runner_compute: { mode: 'cpu' },
+      },
       status: 'queued', failure_class: null, lease_owner: null, lease_expires_at: null,
       heartbeat_at: null, lease_generation: 0, lease_token: null, attempts: 0, max_attempts: 3,
       run_manifest: null, error: '', created_at: '2026-08-11T00:00:00.000Z', updated_at: '2026-08-11T00:00:00.000Z',
     }
     const opts = {
-      run_id: 'run_sec', lease: { owner: 'o', generation: 0, token: null, expires_at: null },
-      image_digest: DIGEST, timeout_ms: 60000, created_at: '2026-08-11T00:00:00.000Z',
+      run_id: 'run_sec', lease: { owner: 'o', generation: 1, token: 'tok-sec', expires_at: null },
+      timeout_ms: 60000, created_at: '2026-08-11T00:00:00.000Z',
     }
     const secure = await defaultSubprocessExecutor(buildExecutionPlan(base, opts), {})
     expect(secure.exit_code).toBe(-1)
@@ -1281,7 +1309,12 @@ describe('wire §5 修复（secure kinds 容器化 / manifest facts / run_id 绑
     // 显式 trusted smoke fixture → subprocess 执行成功（唯一豁免）。
     const trusted = await defaultSubprocessExecutor(
       buildExecutionPlan(
-        { ...base, kind: 'smoke', command: ['echo', 'trusted-ok'], payload: { trusted_fixture: true } },
+        {
+          ...base,
+          kind: 'smoke',
+          command: ['echo', 'trusted-ok'],
+          payload: { ...base.payload, trusted_fixture: true },
+        },
         opts,
       ),
       {},
@@ -1294,7 +1327,7 @@ describe('wire §5 修复（secure kinds 容器化 / manifest facts / run_id 绑
     const fixture = makeFleet()
     fixture.kernel.seedJob({
       job_id: 'job_stale', project_id: 'prj_1',
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
     })
     const { transport } = makeAgent(fixture)
     await transport.register(makeRegistration())
@@ -1323,7 +1356,7 @@ describe('wire §5 修复（secure kinds 容器化 / manifest facts / run_id 绑
     const fixture = makeFleet()
     fixture.kernel.seedJob({
       job_id: 'job_facts', project_id: 'prj_1',
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
     })
     const { transport } = makeAgent(fixture)
     await transport.register(makeRegistration())
@@ -1357,7 +1390,7 @@ describe('wire §5 修复（secure kinds 容器化 / manifest facts / run_id 绑
     fixture.kernel.seedCas(`sha256:${dataSha}`, bytes)
     fixture.kernel.seedJob({
       job_id: 'job_bin', project_id: 'prj_1',
-      payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+      payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
       data_artifact_ids: [`sha256:${dataSha}`],
     })
     const { agent, transport } = makeAgent(fixture)

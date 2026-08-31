@@ -35,6 +35,18 @@ function fenceArgs(kernel: ResearchKernel, jobId: string): { lease_generation: n
   return { lease_generation: j.lease_generation, lease_token: j.lease_token }
 }
 
+function manifestIdentity(kernel: ResearchKernel, jobId: string): Record<string, unknown> {
+  const job = kernel.getJob(jobId)
+  return {
+    run_id: job.run_id,
+    job_id: job.job_id,
+    project_id: job.project_id,
+    contract_id: job.contract_id,
+    config_pin: job.payload.project_config_pin,
+    lease: { generation: job.lease_generation },
+  }
+}
+
 /** Realistic pdflatex log: classic `!` errors, -file-line-error prefix,
  * undefined citation/reference warnings, Overfull noise. */
 const SAMPLE_LOG = [
@@ -123,8 +135,8 @@ describe('tex diagnostics: file/line + structured kinds (§7)', () => {
       status: 'succeeded',
       run_manifest: {
         // §5 RUN-REMOTE-01: secure kinds 必须携带 claim 的 run_id + metrics_artifact。
-        run_id: kernel.getJob(job.job_id).run_id!,
-        job_id: job.job_id, project_id: project.project_id, exit_code: 0,
+        ...manifestIdentity(kernel, job.job_id),
+        exit_code: 0,
         metrics_artifact: log.artifact_id,
         container_digest: `docker:${kernel.getJob(job.job_id).image_digest}`,
         tex_pdf_artifact: pdf.artifact_id,
@@ -161,7 +173,7 @@ describe('tex diagnostics: file/line + structured kinds (§7)', () => {
       ...fenceArgs(kernel, job2.job_id),
       status: 'failed',
       failure_class: 'code_error',
-      run_manifest: { run_id: kernel.getJob(job2.job_id).run_id!, job_id: job2.job_id, project_id: project.project_id, exit_code: 1, tex_diagnostics: [{ level: 'error', message: 'halted' }] },
+      run_manifest: { ...manifestIdentity(kernel, job2.job_id), exit_code: 1, tex_diagnostics: [{ level: 'error', message: 'halted' }] },
     })
     const stored2 = JSON.parse(kernel.texGetBuild(build2.build_id).diagnostics) as LatexDiagnostic[]
     expect(stored2).toEqual([{ level: 'error', message: 'halted' }])
@@ -323,7 +335,7 @@ describe('tex compile freeze & replay (§7)', () => {
       ...fenceArgs(kernel, job.job_id),
       status: 'succeeded',
       run_manifest: {
-        run_id: kernel.getJob(job.job_id).run_id!, job_id: job.job_id, project_id: project.project_id, exit_code: 0, metrics_artifact: log.artifact_id,
+        ...manifestIdentity(kernel, job.job_id), exit_code: 0, metrics_artifact: log.artifact_id,
         container_digest: `docker:${kernel.getJob(job.job_id).image_digest}`,
         tex_pdf_artifact: pdf.artifact_id,
         tex_log_artifact: log.artifact_id,
@@ -366,7 +378,7 @@ describe('tex compile freeze & replay (§7)', () => {
       owner: 'test-runner',
       ...fenceArgs(kernel, job.job_id),
       status: 'succeeded',
-      run_manifest: { run_id: kernel.getJob(job.job_id).run_id!, job_id: job.job_id, project_id: project.project_id, exit_code: 0, metrics_artifact: metrics.artifact_id, container_digest: `docker:${kernel.getJob(job.job_id).image_digest}`, tex_diagnostics: [] },
+      run_manifest: { ...manifestIdentity(kernel, job.job_id), exit_code: 0, metrics_artifact: metrics.artifact_id, container_digest: `docker:${kernel.getJob(job.job_id).image_digest}`, tex_diagnostics: [] },
     })
     // The build froze the then-current revision; after a source edit the
     // document revision moves ahead — the kernel exposes both so a UI can

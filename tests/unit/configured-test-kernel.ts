@@ -12,6 +12,9 @@ export class ConfiguredTestKernel extends ResearchKernel {
   override createProject(input: Parameters<ResearchKernel['createProject']>[0]) {
     return super.createProject({
       ...input,
+      ...(input.session_id !== undefined && input.session_id !== null && input.creator_principal_id === undefined
+        ? { creator_principal_id: 'test-session-owner', creator_tenant_id: 'test-tenant', session_issuer: 'kernel' as const }
+        : {}),
       ...(input.brief_status === 'collecting'
         ? {}
         : {

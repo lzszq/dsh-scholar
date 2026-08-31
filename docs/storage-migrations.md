@@ -569,7 +569,7 @@ pre-accept 表不能使用 FK 创建 Project/Gate/Job/Run/Evidence 旁路；只�
 
 **SUBAGENT-STAGE-02 追加迁移 0024（引入时 SCHEMA_VERSION 21）**：`child_links.state` 追加 durable terminal `cancelled`。迁移必须同时重建并复制 `child_links`、`child_history`、`child_followups`，先移除旧 dependent tables 再替换 parent，恢复唯一索引并执行 `PRAGMA foreign_key_check`；已有 child/history/followup 的 schema 20 数据库必须零丢失升级，不能只靠 `defer_foreign_keys` 后直接 drop 被引用 parent。迁移只追加，不修改 0013 的已发布形状/checksum。
 
-**STORE-06 已落地（migration 0014_lease_token_hash，SCHEMA_VERSION 13，幂等）**：lease token 不再明文落盘——`jobs` 新增 `lease_token_hash TEXT`（sha256(token)，NULL 仅存在于 0014 之前的旧行）；claim 时 token 只写 hash 列，明文仅存于 kernel 进程内存并在 claim 响应返回给 runner（传输面明文、存储面哈希，重启后重取的 job 记录不再携带明文 token；fencing 校验用 sha256(提供值) 对照 hash 列，重启后依然可验）。0014 对旧行回填：`payload.__lease_token` 存在的 running 行按行计算 hash 写入列（已有数据不动，payload 原样保留）；hash 为空的行走旧路径兼容比较（对照 legacy payload token，fail-closed）。`pty_sessions` 同轮重建（复制→校验→原子 rename，与 0009 的 runs 同模式）：旧形状 `lease_token TEXT NOT NULL`（明文落盘）改为 `lease_token TEXT`（可空，旧行值保留审计）+ `lease_token_hash TEXT NOT NULL DEFAULT ''`（open 时写入 sha256；新会话明文只存在于内存与 open 响应，`PtySession.lease_token` wire 形状改为 nullable）。新形状与 pty-session.ts 的 `PTY_SESSIONS_TABLE_DDL` 共享同一 DDL 常量，杜绝两处漂移。验证：tests/unit/migrations.test.ts（0014 列存在/回填/pty 重建）、tests/unit/kernel.test.ts（claim 后 hash 匹配、payload 无明文、hash 比较 fencing、空 hash 旧行兼容）、tests/unit/pty-session.test.ts（hash 存储、读回 null）。
+**STORE-06 历史步骤（migration 0014_lease_token_hash，SCHEMA_VERSION 13，checksum 冻结）**：0014 首次新增 `jobs.lease_token_hash`，并把当时的 Job/PTY 明文租约转换为 hash；为保证已发布数据库可继续升级，其 migration body 和中间表形状不得改写。该中间形状不是当前运行时契约：完整迁移链随后由 0036 清除 context-less transient PTY，再由 0038 删除 `jobs.payload.__lease_token` 和 `pty_sessions.lease_token`。当前 claim 仅把明文保存在 Kernel 进程内并在 claim/open 响应返回一次；所有持久化和 fencing 都只使用 SHA-256，hash 缺失立即 fail closed。
 
 ## 6. Artifact CAS
 
@@ -666,7 +666,7 @@ workspace 的每次 mutation 是**两种介质上的两个提交**：磁盘字�
 
 ## 11. Init、Intake upload、Provider 与 OCR 增量
 
-已发布 migration 0021 包含 `model_providers`、模型目录与 projects 上的 model binding 列；`credential_json` 使用 JSON `null` 表达 no-auth，SecretRef metadata 表达有凭据，坏 JSON/坏 schema 必须 fail closed。MinerU 不另建旁路配置表：固定 descriptor 与当前项目 binding 均复用这些表。后续 migration 只追加、不改已发布 checksum，并至少补齐独立的 `ocr_requests`（source/provider/model/config pin/status/result/safe error/idempotency）；Provider 配置完成不得伪造 OCR request/result 行。
+已发布 migration 0021 包含 `model_providers`、模型目录与 projects 上的 model binding 列；`credential_json` 使用 JSON `null` 表达 no-auth，SecretRef metadata 表达有凭据，坏 JSON/坏 schema 必须 fail closed。MinerU 不另建旁路配置表：固定 descriptor 与当前项目 binding 均复用这些表。migration 0035 追加独立的 `ocr_requests`、`ocr_result_artifacts` 与 `ocr_observations`，固定 source/provider/model/config pin/status/result/safe error/idempotency 及逐页 provenance；Provider 配置完成不得伪造 OCR request/result 行。
 
 stage 创建按 expected_size 事务预留 Intake 配额；finalize 与 intake_artifacts 写入原子，失败不泄漏权威 Artifact。Provider/OCR 记录不得保存 secret value。备份/恢复与 integrity scan 必须覆盖开放 stage offset/temp 文件、binding foreign key、OCR config pin 和终态 result ref；GC 只删除 expired/aborted 临时文件，不触碰已采用或共享 Blob。
 
@@ -675,6 +675,8 @@ stage 创建按 expected_size 事务预留 Intake 配额；finalize 与 intake_a
 追加 `reproduction_specs`、`reproduction_attempts`、`reproduction_reports`、material/source link、`runner_targets`/`runner_profiles`/Config revision，并为 `pty_sessions` 增加 context_kind/context_id/parent_session_id 与 `(project_id,context_kind,context_id)` 索引。Spec/Attempt/Report 各自保存 canonical hash、revision/idempotency、Principal、Artifact refs；Report 不可变。Target/PTY 只保存 SecretRef metadata/token hash，不保存 SSH key/token 明文。
 
 恢复检查开放 attempt/lease/report ref、target/environment pin、PTY context/generation/lease expiry；同一 context 多 PTY 不互相覆盖。删除/retention 不得破坏 Report、signed RunManifest、released Bundle 或共享 Blob。
+
+**REVIEW-PTY-CONTEXT-03 / migration 0036（SCHEMA_VERSION 33）**：PTY 是可丢弃的交互运行时，不是 Run、Evidence、Artifact、Claim、Gate 或正式研究证据。升级发现 `pty_sessions` 缺少当前必填的 `context_kind`、`context_id`、`parent_session_id`、`label`、`purpose` 任一列，或存在无法满足当前 context/label 契约的旧行时，必须在 0036 的单个 SQLite migration transaction 内先丢弃 `pty_frames`、再丢弃 `pty_sessions`，随后用当前 DDL 重建两表和索引。禁止从 project、workspace、owner、旧 target/profile 猜测 Research/Chat/Subagent context，禁止 compatibility read、dual-read 或 fallback；升级后的旧终端会话及其帧不可恢复。该破坏性 reset 只能作用于这两张 transient PTY 表，Project、Workspace/node/op、Artifact/CAS、TeX、Run、Evidence 与其他正式数据必须逐行保持不变。已符合当前结构且 context/label 完整的数据库只执行幂等 DDL，不清空当前 PTY。
 
 **EXEC-ENV-02 追加迁移 0023（本轮）**：新增 `runner_targets`，保存 opaque `target_id`、`kind(local-process|local-docker|remote-ssh)`、display name、enabled/draining、capabilities JSON、`connection_json`（仅三项 SecretRef metadata：endpoint/credential/known_hosts）、health/last_seen、revision、created_by/created_at/updated_at；内置本机进程与本机 Docker 目标用 `INSERT OR IGNORE` 建立。表内严禁 hostname/private key/token/ProxyCommand 明文。迁移只追加，不修改 0022 以前 checksum；SCHEMA_VERSION 随迁移集合增加。完整性检查至少覆盖 remote-ssh 三个 SecretRef、kind/connection 一致性、revision 正数和内置目标存在。
 
@@ -688,13 +690,17 @@ stage 创建按 expected_size 事务预留 Intake 配额；finalize 与 intake_a
 
 接管顺序固定为：目标 `VACUUM INTO` backup + CAS inventory → 源 `VACUUM INTO` 只读一致快照 → 仅在 disposable snapshot 上执行当前 migrations → 校验源/目标持久表 inventory 与列集合 → 按主键在一个 SQLite transaction 内合并全部领域表、补当前稳定本地 operator 的 canonical 项目 membership 并执行 `foreign_key_check` → transaction 成功后才校验并复制 CAS/Workspace/PTY workspace 普通文件 → 全部文件成功后才原子落 0600 receipt。数据库合并冲突必须 rollback，且不能产生任何源文件复制副作用；文件冲突发生时数据库合并可能已经幂等提交，但不得写 receipt，修正冲突后重试必须复用相同行并继续文件校验，不得重复业务对象。相同主键内容相同视为幂等重放；不同内容、unique/FK 冲突、CAS 同名异内容、symlink/特殊文件一律失败。源 snapshot 或 canonical Kernel 中任一已应用 migration 的 checksum mismatch 都必须 loud fail；离线接管不得重写 `schema_migrations` 或把漂移版本“修复”为当前 checksum。Operator 必须回到产生该数据库的已知版本导出，或使用单独审计的恢复流程。
 
-receipt 以源 `database_id` 命名并带格式版本、源 snapshot hash、源/目标目录、插入/已存在行数、文件计数、stable operator 与目标备份。当前格式为 v4；低于 v4 的 receipt 不足以证明当前完整 inventory、DB-first 文件顺序和 strict checksum 边界，必须在再次备份后执行完整的幂等 DB merge + 文件校验，成功后原子替换 receipt，不能用“只升级 receipt”掩盖漏表。采用完成后只读 canonical Kernel，不保留旧库 dual-read、schema parser fallback 或 endpoint fallback。源目录和备份只有在 acceptance-tests.md §24 的 Archived、Workspace、Artifact/CAS、TeX/PDF 与双入口人工验收完成后才能由用户显式清理。
+receipt 以源 `database_id` 命名并带格式版本、源 snapshot hash、源/目标目录、插入/已存在行数、文件计数、stable operator 与目标备份。当前格式为 v5；低于 v5 的 receipt 不足以证明当前完整 inventory、DB-first 文件顺序、strict checksum 与最新持久表边界，必须在再次备份后执行完整的幂等 DB merge + 文件校验，成功后原子替换 receipt，不能用“只升级 receipt”掩盖漏表。采用完成后只读 canonical Kernel，不保留旧库 dual-read、schema parser fallback 或 endpoint fallback。源目录和备份只有在 acceptance-tests.md §24 的 Archived、Workspace、Artifact/CAS、TeX/PDF 与双入口人工验收完成后才能由用户显式清理。
 
 `MERGE_TABLES` 当前必须覆盖 schema 0028–0033 的全部新增持久对象：`assurance_events`、`methodology_run_outcomes`、`methodology_project_events`、`methodology_registry_events`、`writing_methodology_events`、`methodology_rollout_policies`、`methodology_project_rollout_events`、`methodology_rollout_consumptions`、`budget_block_provenance`、`writing_patch_intents` 与 `full_auto_gate_idempotency`。接管事务会把代码清单与 `main`/`legacy` 的当前 SQLite product-table inventory 双向比较；任何新 migration 增表但未定义 parent-first merge 顺序时必须 loud fail，禁止静默遗漏。
 
+OCR migration 0035 同样属于数据接管的强制 inventory：在 `intake_sessions`/`intake_artifacts` 之后，必须严格按 `ocr_requests` → `ocr_result_artifacts` → `ocr_observations` 的外键父子顺序合并，再处理其他 Intake 子表。升级验收必须用真实 OCR sentinel 证明三表逐条保留；少登记任一表都要在 receipt 前 loud fail。
+
+PTY context migration 0036 后，数据接管 inventory 仍必须校验 `pty_sessions`/`pty_frames` 的当前列集合、逐表 source row count 与 merge 后 inserted/existing 对账，并拒绝 orphan frame。旧形状会在 disposable source snapshot 的 0036 中原子清空，因此不会被合并或从其他业务字段重建；当前形状的行按 exact context 原样合并。PTY runtime 进程不能跨 Kernel 接管存活，接管后的开放会话按既有 lease 失效语义关闭；这不改变 PTY 非正式证据的边界。
+
 事务合并 raw ledger 时必须临时停用并在同一事务恢复三个会派生新行的当前 trigger：Project create 的 rollout pin、Knowledge Activation consumption、Assurance execution consumption。接管的是源库已经持久化的 exact pin/consumption，不能让目标当前 policy 重新推导并篡改历史；任一失败 rollback 会连同 trigger DDL 一起恢复。其余 revision、identity、policy match、append-only 与 FK trigger 保持启用并继续 fail closed。
 
-普通 Scholar schema 升级由 sidecar 比较 `meta.schema_version` 与代码 `SCHEMA_VERSION`；落后时只有在 Kernel 停止后重启，并自动向 Kernel 添加 `--backup-on-start`。migration 0027 把历史 `projects.execution.runner_profile`/缺字段一次性规范为当前结构；旧 label 不映射成可执行 profile，`runner_profile_id` 保持 `null`，直到用户显式选择环境。
+普通 Scholar schema 升级由 sidecar 比较 `meta.schema_version` 与代码 `SCHEMA_VERSION`；落后时只有在 Kernel 停止后重启，并自动向 Kernel 添加 `--backup-on-start`。任何共享 canonical Kernel 的入口都属于同一重启边界：升级前先停止 DSH Host 与 standalone，完成一致性 DB/CAS 备份和业务 inventory，再由 DSH Host 先启动并持有 canonical Kernel；Kernel health、schema 与 inventory 通过后才启动 standalone，standalone 必须验证 identity 并复用该 Kernel。旧 standalone 仍持有 Kernel 时，新 Host 必须 loud fail，操作者不得用反复重启、换端口或新 dataDir 绕过。升级验收至少比较 Project、Artifact、Workspace、TeX 与 Session 行数/关键标识，确认 3080/7412/18610 各至多一个预期 listener。migration 0027 把历史 `projects.execution.runner_profile`/缺字段一次性规范为当前结构；旧 label 不映射成可执行 profile，`runner_profile_id` 保持 `null`，直到用户显式选择环境。
 
 ## 14. Methodology / Knowledge 持久化
 
@@ -741,3 +747,16 @@ Kernel 在 full-auto approval 事务开始时先按全局 key 查询：同 diges
 新 finalize 只有在本次上传实际创建隔离区内、仍为 `staged` 的 IntakeArtifact 时才写 `owns_artifact=1`；内容去重命中既有 artifact 时写 0。显式关闭 Chat session 时，Kernel 在同一事务持久化 scope tombstone、删除 chunk ledger、把该 scope 的 open/finalized upload 全部转为 `aborted` cleanup ledger，并仅在提交后消费文件清理；因此提交后崩溃仍可由启动/sweep 收敛。迟到的 Intake begin、upload begin、append 与 finalize 都在写入前检查 tombstone并以 `409 chat_scope_closed` 失败；scoped Intake 的 admission、幂等重放/active reuse 与 insert 同处一个写事务，owner scope 作为 provenance 持久化。upload begin 的 Project/Intake/scope/quota 也同处 `BEGIN IMMEDIATE`，并发 begin 不能同时使用旧配额。
 
 客户端取消信号覆盖 Intake 请求、hash、chunk 与 finalize；若成功响应和取消交错，补偿 abort 可以撤销刚完成的 late finalize，同时不会删除预先存在、已去重或已经扫描的材料。重复 abort 必须保留尚未 unlink 的 `owns_artifact=1`，不能把失败账本降为 0。direct/multipart same-SHA stage 在写锁内解除旧 upload ownership；cleanup 也在该写锁内先检查当前 artifact row，旧 ledger 因而不能删除后来重建的新一代同路径文件。若同一 staged artifact 有其他 finalized upload 引用，所有权会在事务内转移；文件 unlink 失败则保留 `aborted` row 由 sweep 重试。finalize 在文件 hash 后、artifact promote 前必须在写事务内重新检查 upload 为 open、Project 未删除、scope 未关闭且 Intake 仍可写，保证 abort/delete/close 已先提交时不会产生新 artifact。
+
+0034 是 canonical 数据模型的单向、append-only schema evolution，不是保留旧 API、旧解析器、dual-read 或 fallback 的兼容层。已经发布并可能写入用户数据库的 migration body/checksum 不得删除、改写或折叠回 0012/0021；否则会违反 DATA-UPGRADE-01 的升级后数据可访问与 checksum fail-closed 要求。代码侧仍只存在当前 `owner_scope_id`/`owns_artifact`/tombstone 语义，不保留旧业务写路径。后续 review 若以“禁止兼容层”为由要求修改已发布 migration，应判为与数据不丢失硬约束冲突并拒绝，除非同时提供经审计、可恢复且不改写历史 checksum 的数据升级方案。
+
+## 18. 租约凭据当前存储形状（migration 0038）
+
+`0038_remove_plaintext_lease_storage` 把 `SCHEMA_VERSION` 提升到 `35`。它是清除已退役存储形状的单向数据升级，不修改 0014 或 0036 的已发布 migration body/checksum，也不保留运行时 compatibility read：
+
+- `jobs.payload.__lease_token` 必须逐行删除；迁移先校验现有 `lease_token_hash` 与明文一致，或在 hash 缺失时按 `sha256(token)` 回填，再提交净化后的 payload。空值、非字符串或 hash 冲突必须使整个 migration transaction loud fail，禁止静默丢失有效租约或接受两份互相矛盾的凭据。
+- `jobs.run_manifest` 中退役的 `lease.token` 也必须逐行删除；迁移先用该 Job 的 `lease_token_hash` 校验明文，hash 缺失时允许按同一明文回填，冲突时整笔失败。净化后的 Manifest 只允许保留 `lease.generation`。因为 token 位于旧签名 payload 内，删除它会使旧签名失效：迁移必须同时删除 `signature`/`runner_key_id`/`payload_sha256` envelope，并把 Job 的历史 `signature_status` 标成 `credential_redacted`，不得继续伪称 signed。对应 `runs.manifest_json` 副本必须做同样净化并把 Run 状态标成 `credential_redacted`；不得只清一份或保留无效签名。
+- 当前 context-bound `pty_sessions` 必须先逐行验证 lease hash；旧明文存在且 hash 缺失时回填 SHA-256，二者冲突或两者都无法形成有效 hash 时整笔失败。随后重建为只含 `lease_token_hash` 的表，彻底移除 obsolete `lease_token` 列；所有当前 PTY session 行与 `pty_frames` 必须逐条保留，重建前后 session/frame 计数及 `foreign_key_check` 必须一致。
+- migration 完成后，Job heartbeat/complete/frame fencing 与 PTY control 都只能比较调用方 token 的 SHA-256 和持久 hash。代码不得读取 `payload.__lease_token`、`run_manifest.lease.token` 或 PTY 明文列，不得在 hash 缺失时回退到明文比较；新生成的 RunManifest schema 只接受 `lease.generation`。
+
+升级仍必须遵守 DATA-UPGRADE-01：先备份 canonical DB/CAS，再在一个 SQLite migration transaction 内清理和重建；失败回滚后原数据库继续可访问。迁移报告至少记录净化 Job payload/Manifest/Run Manifest 数、Job/PTY 回填 hash 数、保留 PTY session 数与保留 frame 数。自动化验收必须覆盖 fresh schema 无明文列/键、34→35 数据保留、hash 冲突回滚、重启后的 hash-only fencing，以及已发布 0036 checksum 不漂移。

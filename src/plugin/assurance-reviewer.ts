@@ -26,6 +26,7 @@ export interface WritingSemanticReviewInput {
   sessionId: string
   parent: { id: string }
   signal: AbortSignal
+  hostConfirmation: { callId: string; rootCallId: string }
 }
 
 export interface WritingSemanticReviewDependencies {
@@ -129,6 +130,7 @@ export async function runWritingSemanticReview(
       task: reviewTask,
       completion,
       idempotencyKey: `assurance:${action.id}:${String(action.revision)}`,
+      hostConfirmation: input.hostConfirmation,
     }, deps.panel)
     const panel = result.panel
     const reviewers = panel.stale ? [] : panel.members.map(member => ({

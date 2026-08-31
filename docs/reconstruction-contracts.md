@@ -12,14 +12,14 @@ DSH 兼容基线：
 |---|---|
 | repository | DeepSeek Harness / @deepseek-ai/dsh-root |
 | local reference commit | 895a2f84133204c92ad3d62297fbb63af182b94f（仅开发参考，不构成安装兼容性 PASS） |
-| root version | 0.0.1 |
+| npm compatibility baseline | @deepseek-ai/dsh 0.1.1-rc.2（`config/dsh-baseline.json` 是唯一可编辑版本源） |
 | cordis peer | >=4.0.0-rc.7 |
 | schemastery peer | >=3.18.0 |
 | required host modules | @deepseek-ai/dsh-tools、@deepseek-ai/dsh-commands、@deepseek-ai/dsh-skill-filesystem |
 | optional host module | @deepseek-ai/dsh-llm（Agent/tool 内容块类型；缺失时不影响 standalone 与紧凑 session workspace） |
 | optional dev module | @deepseek-ai/dsh-tool-cordis |
 
-构建仓库必须生成 packages/dsh-host-compat：只暴露本项目使用的 Context、Tool、Command 和 Session 类型。该模块不暴露 HttpServer、Slot、LocaleFace 或 ThemeFace。contract test 可对本地固定 commit 和最小 fake host 运行以加速反馈，但它们不是发布兼容性证据。插件集成兼容性必须从配置的私有 registry 在全新目录安装固定版本的真实 `@deepseek-ai/*` 包，使用全新 `DSH_HOME` 通过公开 DSH CLI/Profile/Cordis 生命周期完成加载、启动和 dispose。源码 checkout、symlink、伪造 host、`file:` override 或仅安装 Scholar tarball 均不得替代该证据。升级 DSH 版本时先更新本文件、锁定 spec 和兼容测试。
+Scholar 直接从精确基线的公开 `@deepseek-ai/*` 类型面编译，不生成或保留 `dsh-host-compat` shim。contract test 可对最小 fake host 运行以加速反馈，但它们不是发布兼容性证据。插件集成兼容性必须从配置的 registry 在全新目录安装固定版本的真实 `@deepseek-ai/*` 包，使用全新 `DSH_HOME` 通过公开 DSH CLI/Profile/Cordis 生命周期完成加载、启动和 dispose；`DSH_PRIVATE_DSH_SPEC` 必须显式等于 `config/dsh-baseline.json` 的精确版本，不得使用隐式默认值或浮动 tag。源码 checkout、symlink、伪造 host、`file:` override 或仅安装 Scholar tarball 均不得替代 published-registry 证据；Scholar 尚未发布时，本地绝对路径 Profile smoke 只能单独标记为 local compatibility PASS。升级 DSH 版本时先更新唯一基线、锁文件、本文与兼容测试。
 
 ## 2. 固定 ID 与 canonical JSON
 
@@ -374,7 +374,7 @@ Canonical Tool registry（共 40 个实际可调用名称；表中以 `/` 并列
 | research_synthesis_record | 对当前 session-bound project 追加 strict agent-generated ResearchSynthesis |
 | research_writing_review_record | 对当前 session-bound project 追加 revision/hash-bound ReverseOutline 或 ReviewFinding |
 | research_knowledge_activate | 当前 session-bound project 的显式 Knowledge Pack activation；要求 Host confirmation 与 Kernel resolver 全通过 |
-| research_intake_begin / research_intake_stage / research_intake_scan / research_intake_answers / research_intake_propose | 五个独立 prepare-only Intake 工具；只输出 observation/question/proposal，不提供 accept/adopt/Decision |
+| research_intake_begin / research_intake_stage / research_intake_scan / research_intake_propose | 四个独立 prepare-only Intake 工具；只输出 observation/question/proposal，不提供 Human Grill answer、accept/adopt/Decision。answer 必须来自可信原生提问 UI 的 Human session。 |
 | literature_search | Connector search，不写 Kernel |
 | paper_resolve | Connector resolve |
 | corpus_snapshot | Connector search + create corpus snapshot |
@@ -495,4 +495,4 @@ interface SubagentAddress { parent_session_id:string; child_session_id:string; m
 interface TrajectoryNodeSummary { node_id:string; parent_node_id:string|null; relation:'root'|'child'|'fork'; source:'kernel-outbox'|'dsh-session'|'external'; kind:'session'|'subagent'|'task'|'research-event'; label:string|null; mode:'one-shot'|'continuable'|'read-only'|null; status:string; has_children:boolean; children_count:number|null; duration_ms:number|null; tokens:{uncached_input:number;cache_read:number;cache_write:number;output:number}|null; permissions:{can_read_summary:boolean;can_read_detail:boolean;can_continue:boolean} }
 ~~~
 
-Project projection 同时返回 legacy `next_actions: string[]`（由非 done 动作的 label 稳定派生）与权威 `next_actions_v2: NextAction[]`（GUIDE-01；字段语义见 domain-model.md §14，Zod schema 见 research-schemas `NextAction`）。动作由 Kernel 从 status/pending gates/jobs/budget/contracts/ideas/evidence 确定性生成；未知/未来状态退化 `code:'unknown'` 的只读动作，UI 不得为 unknown 构造 mutation。Trajectory event envelope、分页、SSE、retention、redaction、token/duration 聚合与 exact-parent follow-up 见 trajectory-subagents.md。
+Project projection 只返回权威 `next_actions_v2: NextAction[]`（GUIDE-01；字段语义见 domain-model.md §14，Zod schema 见 research-schemas `NextAction`）。已删除旧 `next_actions: string[]` 投影和 UI fallback；缺失或畸形的结构化动作必须显示安全空态/协议错误，不得从 label 文本恢复 mutation。动作由 Kernel 从 status/pending gates/jobs/budget/contracts/ideas/evidence 确定性生成；未知/未来状态退化 `code:'unknown'` 的只读动作，UI 不得为 unknown 构造 mutation。Trajectory event envelope、分页、SSE、retention、redaction、token/duration 聚合与 exact-parent follow-up 见 trajectory-subagents.md。

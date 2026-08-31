@@ -185,7 +185,7 @@ export function registerResearchCommands(ctx: Context, commandCtx: CommandContex
             const pending = projection.pending_gates.map(g => `  - ${g.type} gate ${g.gate_id}: ${g.title} (${g.status})`).join('\n') || '  none'
             const jobs = projection.jobs.map(j => `  - ${j.job_id} [${j.kind}] ${j.status}`).join('\n') || '  none'
             const text = `**${linked.name}** (${linked.project_id}) — phase \`${projection.project.status}\` rev ${projection.project.revision}\n\n`
-              + `Next actions:\n${projection.next_actions.map(a => `  - ${a}`).join('\n')}\n\n`
+              + `Next actions:\n${projection.next_actions_v2.map(action => `  - [${action.state}] ${action.label} (${action.code})`).join('\n') || '  none'}\n\n`
               + `Pending gates:\n${pending}\n\n`
               + `Jobs:\n${jobs}\n\n`
               + `Budget: $${projection.budget.model_cost_usd ?? 0} / ${projection.project.constraints.max_model_cost_usd} max, `

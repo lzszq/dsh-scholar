@@ -31,6 +31,25 @@
 
 import { z } from 'zod'
 
+/** Canonical defaults and writable bounds for server-owned PTY policy. */
+export const PTY_DEFAULT_IDLE_TTL_S = 900
+export const PTY_MIN_IDLE_TTL_S = 1
+export const PTY_MAX_IDLE_TTL_S = 86_400
+export const PTY_DEFAULT_RETENTION_BYTES = 1024 * 1024
+export const PTY_MIN_RETENTION_BYTES = 4 * 1024
+export const PTY_MAX_RETENTION_BYTES = 64 * 1024 * 1024
+export const PTY_DEFAULT_LEASE_TTL_S = 3600
+export const PTY_MIN_LEASE_TTL_S = 1
+export const PTY_MAX_LEASE_TTL_S = 86_400
+
+/** Authoritative session context. These values are resolved by the server
+ * from its own Research/DSH session and topology stores; the browser only
+ * carries the opaque context_id selected from a server projection. */
+export const PtyContextKind = z.enum(['research', 'chat', 'subagent'])
+export type PtyContextKind = z.infer<typeof PtyContextKind>
+
+const PtyContextId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$/)
+
 /** Session lifecycle: open (created, no wire yet) → attached (wire up) →
  * detached (wire down, process alive) → closed (terminal). Permission
  * revocation detaches immediately; idle TTL expiry closes. */
@@ -66,6 +85,13 @@ export const PtySession = z.object({
   tenant_id: z.string().default(''),
   project_id: z.string().min(1),
   workspace_id: z.string().min(1),
+  /** Trusted context binding, fixed when the PTY is opened. */
+  context_kind: PtyContextKind,
+  context_id: PtyContextId,
+  parent_session_id: PtyContextId.nullable(),
+  /** Human-readable tab metadata; neither field grants authority. */
+  label: z.string().trim().min(1).max(96),
+  purpose: z.string().trim().max(512).default(''),
   /** Opaque Runner profile/target ids — resolved server-side only. */
   profile: z.string().min(1),
   target: z.string().min(1),
@@ -87,10 +113,10 @@ export const PtySession = z.object({
    * restart surfaces null. */
   lease_token: z.string().min(1).nullable(),
   lease_expires_at: z.string().nullable().default(null),
-  /** Idle TTL (seconds) — from the Config Schema when not provided. */
-  idle_ttl_s: z.number().int().positive().default(900),
-  /** Bounded output retention in bytes (Config Schema default). */
-  retention_bytes: z.number().int().positive().default(1024 * 1024),
+  /** Server-owned idle TTL pinned from the effective Config Registry at open. */
+  idle_ttl_s: z.number().int().min(PTY_MIN_IDLE_TTL_S).max(PTY_MAX_IDLE_TTL_S).default(PTY_DEFAULT_IDLE_TTL_S),
+  /** Server-owned bounded output retention pinned at open. */
+  retention_bytes: z.number().int().min(PTY_MIN_RETENTION_BYTES).max(PTY_MAX_RETENTION_BYTES).default(PTY_DEFAULT_RETENTION_BYTES),
   /** Output frames below this seq were evicted (retention); readers get a
    * gap. 0 = nothing evicted yet (reading from seq 0 is a clean replay). */
   retained_from_seq: z.number().int().nonnegative().default(0),
@@ -102,8 +128,7 @@ export const PtySession = z.object({
   total_bytes: z.number().int().nonnegative().default(0),
   /** Output bytes dropped by retention eviction. */
   dropped_bytes: z.number().int().nonnegative().default(0),
-  /** Adapter identity: 'none' until a LocalDockerPty/RemoteRunnerPty
-   * adapter is registered (interface layer ships with no real tty). */
+  /** Adapter identity selected by the Kernel from the current runner target. */
   adapter_id: z.string().default('none'),
   open_at: z.string(),
   last_activity_at: z.string(),
@@ -113,24 +138,56 @@ export const PtySession = z.object({
 export type PtySession = z.infer<typeof PtySession>
 
 /** POST /v1/pty/sessions body (PTY-01 open contract). `cwd` is relative;
- * `config_hash`/`idle_ttl_s`/`retention_bytes` default from the Config
- * Schema when omitted (registry keys land with the adapter round). */
+ * config hash, idle/retention policy and lease policy are server-owned and
+ * therefore deliberately absent from this strict browser request. */
 export const PtyOpenRequest = z.object({
-  project_id: z.string().min(1),
+  /** The only authority-bearing reference accepted from the browser. The
+   * server resolves project/owner/parent/profile/target from this id. */
+  context_id: PtyContextId,
   workspace_id: z.string().min(1),
-  profile: z.string().min(1),
-  target: z.string().min(1),
+  label: z.string().trim().min(1).max(96),
+  purpose: z.string().trim().max(512).default(''),
   preset: PtyShellPreset,
   cwd: z.string().min(1),
-  /** sha256 pin of the effective Config Schema (may carry the canonical
-   * `sha256:` prefix). */
-  config_hash: z.string().regex(/^(sha256:)?[0-9a-f]{64}$/).optional(),
-  idle_ttl_s: z.number().int().positive().optional(),
-  retention_bytes: z.number().int().positive().optional(),
   cols: z.number().int().positive().max(500).default(80),
   rows: z.number().int().positive().max(300).default(24),
 }).strict()
 export type PtyOpenRequest = z.infer<typeof PtyOpenRequest>
+
+/** Safe context projection returned to the browser. Principal identity and
+ * credentials are intentionally absent. */
+export const PtyContext = z.object({
+  context_kind: PtyContextKind,
+  context_id: PtyContextId,
+  project_id: z.string().min(1),
+  parent_session_id: PtyContextId.nullable(),
+  runner_profile_id: z.string().min(1),
+  runner_target_id: z.string().min(1),
+  target_kind: z.enum(['local-process', 'local-docker', 'remote-ssh']),
+}).strict()
+export type PtyContext = z.infer<typeof PtyContext>
+
+/** One context's recoverable PTY tabs. active_hint is a non-authoritative UI
+ * hint (the newest usable session), never an implicit control target. */
+export const PtyContextSessions = z.object({
+  context: PtyContext,
+  sessions: z.array(PtySession),
+  active_hint: z.string().nullable(),
+}).strict()
+export type PtyContextSessions = z.infer<typeof PtyContextSessions>
+
+/** Attach/detach/close fencing body. A generation is mandatory; omitting it
+ * can never mean "use latest". */
+export const PtyAttachRequest = z.object({
+  expected_generation: z.number().int().positive(),
+}).strict()
+export type PtyAttachRequest = z.infer<typeof PtyAttachRequest>
+
+export const PtyDetachRequest = PtyAttachRequest
+export type PtyDetachRequest = z.infer<typeof PtyDetachRequest>
+
+export const PtyCloseRequest = PtyAttachRequest
+export type PtyCloseRequest = z.infer<typeof PtyCloseRequest>
 
 /** One control frame sent by the client (full wire record). */
 export const PtyControlFrame = z.discriminatedUnion('type', [
@@ -170,27 +227,39 @@ export type PtyControlFrame = z.infer<typeof PtyControlFrame>
  * the server fills them). */
 export const PtyControlRequest = z.discriminatedUnion('type', [
   z.object({
+    expected_generation: z.number().int().positive(),
     client_seq: z.number().int().nonnegative(),
     type: z.literal('bytes'),
     payload: z.object({ text: z.string(), byte_length: z.number().int().nonnegative() }).strict(),
   }).strict(),
   z.object({
+    expected_generation: z.number().int().positive(),
     client_seq: z.number().int().nonnegative(),
     type: z.literal('resize'),
     payload: z.object({ cols: z.number().int().positive().max(500), rows: z.number().int().positive().max(300) }).strict(),
   }).strict(),
   z.object({
+    expected_generation: z.number().int().positive(),
     client_seq: z.number().int().nonnegative(),
     type: z.literal('signal'),
     payload: z.object({ signal: PtySignal }).strict(),
   }).strict(),
   z.object({
+    expected_generation: z.number().int().positive(),
     client_seq: z.number().int().nonnegative(),
     type: z.literal('close'),
     payload: z.object({}).strict(),
   }).strict(),
 ])
 export type PtyControlRequest = z.infer<typeof PtyControlRequest>
+
+/** Poll/SSE replay cursor plus the exact session generation the caller has
+ * attached. Generation changes are explicit reconnect boundaries. */
+export const PtyFramesRequest = z.object({
+  after_seq: z.number().int().nonnegative(),
+  expected_generation: z.number().int().positive(),
+}).strict()
+export type PtyFramesRequest = z.infer<typeof PtyFramesRequest>
 
 /** One output frame produced by the server (append-only, server_seq
  * monotonic per session). */

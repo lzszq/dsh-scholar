@@ -7,17 +7,16 @@
 #   1. check:dsh-baseline — one source of truth for the tested DSH version
 #   2. pnpm build       — schemas, kernel, UI browser bundle and DSH plugin
 #   3. pnpm test        — root unit tests (vitest run) + research-ui typecheck
-#   4. verify-docs      — node scripts/verify-docs.mjs (structure/links/contract
-#                         fragments + forbidden embedded surface + SELFMOD-01)
-#   5. security aggregator — CI=true bash tests/security/run-all-v2-blocking-tests.sh
+#   4. verify-docs      — static verification + origin/main diff contract
+#   5. whitespace diff — working tree and origin/main commit-range checks
+#   6. security aggregator — CI=true bash tests/security/run-all-v2-blocking-tests.sh
 #                         (fail-closed §19.2 suite; several scripts run real docker)
-#   6. root plugin typecheck — pnpm --filter @dsh-scholar/research-plugin typecheck
-#                         (only when the root package.json declares a typecheck script)
+#   7. root plugin typecheck — pnpm --filter @dsh-scholar/research-plugin typecheck
 #
 # Options:
-#   --skip-security   skip step 5 (docker-dependent aggregator). NOTE: this
+#   --skip-security   skip step 6 (docker-dependent aggregator). NOTE: this
 #                     lowers blocking evidence — skipped steps are reported as
-#                     SKIP and never counted as PASS.
+#                     SKIP and the command exits non-zero; forbidden with CI=true.
 #   --help | -h       print this usage and exit.
 #
 # Design:
@@ -43,7 +42,12 @@ for a in "$@"; do
   esac
 done
 
-TOTAL=6
+if [ "${CI:-}" = "true" ] && [ "$SKIP_SECURITY" -eq 1 ]; then
+  echo "ci-gate: --skip-security is forbidden when CI=true" >&2
+  exit 2
+fi
+
+TOTAL=7
 PASSED=()
 FAILED=()
 SKIPPED=()
@@ -78,36 +82,35 @@ skip_step() {
   SKIPPED+=("$name")
 }
 
-# --- step 1/6: tested DSH version single source of truth --------------------
+# --- step 1/7: tested DSH version single source of truth --------------------
 run_step 1 "check DSH compatibility baseline" pnpm run check:dsh-baseline
 
-# --- step 2/6: production bundles -------------------------------------------
+# --- step 2/7: production bundles -------------------------------------------
 run_step 2 "pnpm build (schemas + kernel + UI + plugin)" pnpm run build
 
-# --- step 3/6: root tests (vitest) + research-ui typecheck ------------------
+# --- step 3/7: root tests (vitest) + research-ui typecheck ------------------
 run_step 3 "pnpm test (root: vitest + research-ui typecheck)" pnpm test
 
-# --- step 4/6: docs static verification -------------------------------------
-run_step 4 "verify-docs (node scripts/verify-docs.mjs)" node scripts/verify-docs.mjs
+# --- step 4/7: docs static + change contract --------------------------------
+run_step 4 "verify-docs (--diff-check origin/main)" node scripts/verify-docs.mjs --diff-check origin/main
 
-# --- step 5/6: §19.2 security aggregator (fail-closed under CI=true) --------
+# --- step 5/7: whitespace/conflict-marker checks -----------------------------
+run_step 5 "git diff --check (working tree + origin/main range)" \
+  bash -c 'git diff --check && git diff --check origin/main...HEAD'
+
+# --- step 6/7: §19.2 security aggregator (fail-closed under CI=true) --------
 if [ "$SKIP_SECURITY" -eq 1 ]; then
-  skip_step 5 "security aggregator (CI=true)" "--skip-security given (docker-dependent)"
+  skip_step 6 "security aggregator (CI=true)" "--skip-security given (docker-dependent)"
 else
   echo
-  echo "NOTE: step 5 runs the full §19.2 aggregator (~20 per-concern scripts,"
+  echo "NOTE: step 6 runs the full §19.2 aggregator (~20 per-concern scripts,"
   echo "several with real docker runs) — it can take several minutes."
-  run_step 5 "security aggregator (CI=true)" env CI=true bash tests/security/run-all-v2-blocking-tests.sh
+  run_step 6 "security aggregator (CI=true)" env CI=true bash tests/security/run-all-v2-blocking-tests.sh
 fi
 
-# --- step 6/6: root plugin typecheck (only if the script exists) -------------
-if node -e "const p = require('./package.json'); process.exit(p.scripts && p.scripts.typecheck ? 0 : 1)"; then
-  run_step 6 "root plugin typecheck (--filter @dsh-scholar/research-plugin)" \
-    pnpm --filter @dsh-scholar/research-plugin typecheck
-else
-  skip_step 6 "root plugin typecheck (--filter @dsh-scholar/research-plugin)" \
-    "root package.json declares no typecheck script"
-fi
+# --- step 7/7: root plugin typecheck -----------------------------------------
+run_step 7 "root plugin typecheck (--filter @dsh-scholar/research-plugin)" \
+  pnpm --filter @dsh-scholar/research-plugin typecheck
 
 # --- summary -----------------------------------------------------------------
 echo
@@ -119,8 +122,8 @@ for s in "${SKIPPED[@]}"; do printf '%-46s %s\n' "$s" "SKIP"; done
 echo "total: ${#PASSED[@]} passed, ${#FAILED[@]} failed, ${#SKIPPED[@]} skipped"
 ELAPSED=$(( $(date +%s) - START ))
 printf 'elapsed: %s (%dm %02ds)\n' "${ELAPSED}s" "$(( ELAPSED / 60 ))" "$(( ELAPSED % 60 ))"
-if [ "${#FAILED[@]}" -gt 0 ]; then
-  echo "ci-gate: GATE BLOCKED — exit 1 (fix the FAIL steps above)"
+if [ "${#FAILED[@]}" -gt 0 ] || [ "${#SKIPPED[@]}" -gt 0 ]; then
+  echo "ci-gate: GATE BLOCKED — exit 1 (FAIL or SKIP is not release evidence)"
   exit 1
 fi
 echo "ci-gate: GATE PASSED — exit 0"

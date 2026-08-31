@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { executeChatTurn } from '../../packages/dsh-research-ui/src/client/chat'
+import {
+  cachedGrillGuide,
+  clearCachedGrillGuide,
+  executeChatCommand,
+  executeChatTurn,
+} from '../../packages/dsh-research-ui/src/client/chat'
 import { state } from '../../packages/dsh-research-ui/src/client/state'
 
 function json(value: unknown): Response {
@@ -10,10 +15,13 @@ function json(value: unknown): Response {
 }
 
 afterEach(() => {
+  clearCachedGrillGuide()
   vi.unstubAllGlobals()
   state.chatMessages = []
   state.chatSessions = []
   state.chatActiveId = null
+  state.projectId = undefined
+  state.rerender = () => {}
 })
 
 describe('project-scoped free conversation', () => {
@@ -404,6 +412,115 @@ describe('project-scoped free conversation', () => {
     expect(result.consumedVisualInputs).toBeUndefined()
   })
 
+  it('treats a plain browser image-encoding failure as a visual failure', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const path = String(input)
+      if (path.endsWith('/grill')) {
+        return json({
+          project_revision: 2, intake_revision: 2, question: null,
+          brief_preview: { problem: '', scope: '', primary_metrics: [], target_outputs: [] },
+          ready_to_confirm: false,
+        })
+      }
+      return json({
+        project: { project_id: 'prj_1', status: 'SURVEYING', brief_status: 'confirmed' },
+        next_actions_v2: [],
+      })
+    }))
+
+    const result = await executeChatTurn('分析图片', 'prj_1', undefined, async () => {
+      throw new Error('File.arrayBuffer failed')
+    })
+
+    expect(result.text).toMatch(/视觉模型.*不可用|vision model.*unavailable/i)
+    expect(result.text).not.toMatch(/自由对话|discuss this freely/i)
+    expect(result.consumedVisualInputs).toBeUndefined()
+  })
+
+  it('does not let a delayed /new response replace a newer project focus', async () => {
+    let releaseCreate!: (response: Response) => void
+    const create = new Promise<Response>(resolve => { releaseCreate = resolve })
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith('/v2/projects')) return create
+      throw new Error(`unexpected request: ${String(input)}`)
+    }))
+    state.projectId = 'prj_a'
+
+    const pending = executeChatCommand('/new delayed-project', 'prj_a')
+    state.projectId = 'prj_b'
+    releaseCreate(json({ project: { project_id: 'prj_c', name: 'delayed-project', status: 'DRAFT' } }))
+    await pending
+
+    expect(state.projectId).toBe('prj_b')
+  })
+
+  it('does not let a delayed /new Grill read rerender over a newer project focus', async () => {
+    let signalGrillStarted!: () => void
+    const grillStarted = new Promise<void>(resolve => { signalGrillStarted = resolve })
+    let releaseGrill!: (response: Response) => void
+    const grill = new Promise<Response>(resolve => { releaseGrill = resolve })
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
+      const path = String(input)
+      if (path.endsWith('/v2/projects')) {
+        return json({ project: { project_id: 'prj_c', name: 'delayed-grill', status: 'DRAFT' } })
+      }
+      if (path.endsWith('/v2/projects/prj_c/grill')) {
+        signalGrillStarted()
+        return grill
+      }
+      throw new Error(`unexpected request: ${path}`)
+    }))
+    const rerender = vi.fn()
+    state.rerender = rerender
+    state.projectId = 'prj_a'
+
+    const pending = executeChatCommand('/new delayed-grill', 'prj_a')
+    await grillStarted
+    state.projectId = 'prj_b'
+    releaseGrill(json({
+      project_revision: 1, intake_revision: 1, question: null,
+      brief_preview: { problem: '', scope: '', primary_metrics: [], target_outputs: [] },
+      ready_to_confirm: false,
+    }))
+    await pending
+
+    expect(state.projectId).toBe('prj_b')
+    expect(rerender).not.toHaveBeenCalled()
+    expect(cachedGrillGuide('prj_c')).toBeNull()
+  })
+
+  it('enters the new project Grill normally when focus has not changed', async () => {
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const path = String(input)
+      if (path.endsWith('/v2/projects')) {
+        return json({ project: { project_id: 'prj_c', name: 'normal-grill', status: 'DRAFT' } })
+      }
+      if (path.endsWith('/v2/projects/prj_c/grill')) {
+        return json({
+          project_revision: 1, intake_revision: 1,
+          question: { question_code: 'brief.problem', question_revision: 1, prompt_key: 'grill.question.problem', required: true },
+          brief_preview: { problem: '', scope: '', primary_metrics: [], target_outputs: [] },
+          ready_to_confirm: false,
+        })
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    vi.stubGlobal('fetch', fetch)
+    const rerender = vi.fn()
+    state.rerender = rerender
+    state.projectId = 'prj_a'
+
+    const result = await executeChatCommand('/new normal-grill', 'prj_a')
+
+    expect(result).toMatch(/normal-grill/)
+    expect(state.projectId).toBe('prj_c')
+    expect(fetch.mock.calls.some(([input]) => String(input).endsWith('/v2/projects/prj_c/grill'))).toBe(true)
+    expect(rerender).toHaveBeenCalledTimes(1)
+    expect(cachedGrillGuide('prj_c')?.projection.question).toMatchObject({
+      question_code: 'brief.problem', prompt_key: 'grill.question.problem',
+    })
+  })
+
   it('freezes the originating session history before asynchronous project reads', async () => {
     let releaseGrill!: (response: Response) => void
     const grill = new Promise<Response>(resolve => { releaseGrill = resolve })
@@ -444,7 +561,7 @@ describe('project-scoped free conversation', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const path = String(input)
       if (path.includes('/v1/projects/prj_b/projection')) {
-        return json({ project: { project_id: 'prj_b', name: 'B', status: 'SURVEYING', revision: 3 }, next_actions: [] })
+        return json({ project: { project_id: 'prj_b', name: 'B', status: 'SURVEYING', revision: 3 }, next_actions_v2: [] })
       }
       if (path.includes('/v2/projects/prj_b/projection')) {
         return json({

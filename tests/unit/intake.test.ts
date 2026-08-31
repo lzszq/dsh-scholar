@@ -22,9 +22,9 @@ import type { AdoptionReceipt, GrillAnswerView, IntakeProjection, IntakeSession,
 
 const REAL_LIMIT = ResearchKernel.UPLOAD_MAX_FILE_BYTES
 
-function freshKernel(): ResearchKernel {
+function freshKernel(options: { serviceToken?: string } = {}): ResearchKernel {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-intake-test-'))
-  return new ResearchKernel({ dbPath: join(dir, 'kernel.db'), casRoot: join(dir, 'cas'), requireSignedManifest: false })
+  return new ResearchKernel({ dbPath: join(dir, 'kernel.db'), casRoot: join(dir, 'cas'), requireSignedManifest: false, ...options })
 }
 
 function makeBrief() {
@@ -74,6 +74,13 @@ async function withServer(kernel: ResearchKernel, fn: (base: string) => Promise<
 }
 
 const PRINCIPAL = { principal_id: 'pi-1', tenant_id: 'acme', auth_method: 'dsh-session', session_id: 'sess-1' }
+const INTAKE_SERVICE_TOKEN = 'intake-human-bff-service-token'
+const INTAKE_HUMAN_HEADERS = {
+  'x-service-token': INTAKE_SERVICE_TOKEN,
+  'x-service-principal': 'standalone-human-bff',
+  'x-principal-id': PRINCIPAL.principal_id,
+  'x-principal-session': PRINCIPAL.session_id,
+}
 
 describe('ONBOARD-01 begin', () => {
   it('creates a draft intake session with owner, project linkage and 7-day expiry', () => {
@@ -709,8 +716,10 @@ describe('ONBOARD-01 pre-accept ZERO authority', () => {
 
 describe('ONBOARD-01 HTTP surface (/v1/projects/{id}/intake*)', () => {
   it('runs begin → stage → scan → questions → answers → propose → adopt → reject end to end', async () => {
-    const kernel = freshKernel()
-    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })
+    const kernel = freshKernel({ serviceToken: INTAKE_SERVICE_TOKEN })
+    const project = kernel.createProject({
+      name: 't', workspace: '/w', brief: makeBrief(), creator_principal_id: PRINCIPAL.principal_id,
+    } as never)
     await withServer(kernel, async (base) => {
       const url = (suffix: string): string => `${base}/v1/projects/${project.project_id}/intake${suffix}`
       const json = async (path: string, method: string, body?: unknown): Promise<Response> => {
@@ -740,23 +749,87 @@ describe('ONBOARD-01 HTTP surface (/v1/projects/{id}/intake*)', () => {
       const r4 = await json(`/${session.intake_id}/questions`, 'GET')
       expect(r4.status).toBe(200)
       const questions = (await r4.json()) as { questions: GrillAnswerView[] }
-      // answers without a principal → 422 principal_required (fail-closed)
-      const r5 = await json(`/${session.intake_id}/answers`, 'POST', { answers: [{ question_code: 'owner_scope_license', answer: 'x', question_revision: 1 }] })
-      expect(r5.status).toBe(422)
-      expect(((await r5.json()) as { error: { code: string } }).error.code).toBe('principal_required')
-      // answers with principal
-      const r6 = await json(`/${session.intake_id}/answers`, 'POST', {
-        answers: allRequiredAnswers(questions.questions, 'brief'),
+      // A self-reported body principal is attacker-controlled and must never
+      // establish Human authority without the trusted BFF header seam.
+      const r5 = await json(`/${session.intake_id}/answers`, 'POST', {
+        answers: [{ question_code: 'owner_scope_license', answer: 'x', question_revision: 1 }],
         principal: PRINCIPAL,
       })
+      expect(r5.status).toBe(403)
+      expect(((await r5.json()) as { error: { code: string } }).error.code).toBe('service_token_required')
+      const headerOnly = await fetch(url(`/${session.intake_id}/answers`), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-principal-id': PRINCIPAL.principal_id, 'x-principal-session': PRINCIPAL.session_id },
+        body: JSON.stringify({ answers: allRequiredAnswers(questions.questions, 'brief'), principal: PRINCIPAL }),
+      })
+      expect(headerOnly.status).toBe(403)
+      expect(((await headerOnly.json()) as { error: { code: string } }).error.code).toBe('service_token_required')
+      const wrongAudience = await fetch(url(`/${session.intake_id}/answers`), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-service-token': INTAKE_SERVICE_TOKEN,
+          'x-service-principal': 'agent-tool',
+          'x-principal-id': PRINCIPAL.principal_id,
+          'x-principal-session': PRINCIPAL.session_id,
+        },
+        body: JSON.stringify({ answers: allRequiredAnswers(questions.questions, 'brief') }),
+      })
+      expect(wrongAudience.status).toBe(403)
+      expect(((await wrongAudience.json()) as { error: { code: string } }).error.code).toBe('service_identity_required')
+      const missingSession = await fetch(url(`/${session.intake_id}/answers`), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-service-token': INTAKE_SERVICE_TOKEN,
+          'x-service-principal': 'standalone-human-bff',
+          'x-principal-id': PRINCIPAL.principal_id,
+        },
+        body: JSON.stringify({ answers: allRequiredAnswers(questions.questions, 'brief') }),
+      })
+      expect(missingSession.status).toBe(422)
+      expect(((await missingSession.json()) as { error: { code: string } }).error.code).toBe('principal_required')
+      // Even with a valid service audience, the strict body no longer admits
+      // a principal field; authority metadata exists only in trusted headers.
+      const trustedForged = await fetch(url(`/${session.intake_id}/answers`), {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...INTAKE_HUMAN_HEADERS,
+        },
+        body: JSON.stringify({
+          answers: allRequiredAnswers(questions.questions, 'brief'),
+          principal: { principal_id: 'forged-body-pi' },
+        }),
+      })
+      expect(trustedForged.status).toBe(422)
+      expect(((await trustedForged.json()) as { error: { code: string } }).error.code).toBe('validation_error')
+      // With the trusted header seam, durable provenance records that exact
+      // principal/session and the body carries domain input only.
+      const r6 = await fetch(url(`/${session.intake_id}/answers`), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...INTAKE_HUMAN_HEADERS },
+        body: JSON.stringify({ answers: allRequiredAnswers(questions.questions, 'brief') }),
+      })
       expect(r6.status).toBe(200)
+      expect(((await r6.clone().json()) as IntakeProjection).questions.find(q => q.answer !== null)?.answered_by).toBe(PRINCIPAL.principal_id)
       // propose
       const r7 = await json(`/${session.intake_id}/propose`, 'POST')
       expect(r7.status).toBe(201)
       const proposal = (await r7.json()) as PhaseProposal
       expect(proposal.safe_project_status).toBe('DRAFT')
-      // adopt
-      const r8 = await json(`/${session.intake_id}/adopt`, 'POST', { principal: PRINCIPAL, expected_proposal_revision: proposal.revision })
+      // A forged PI in the body cannot adopt without the trusted header.
+      const forgedAdopt = await json(`/${session.intake_id}/adopt`, 'POST', {
+        principal: PRINCIPAL, expected_proposal_revision: proposal.revision,
+      })
+      expect(forgedAdopt.status).toBe(403)
+      expect(((await forgedAdopt.json()) as { error: { code: string } }).error.code).toBe('service_token_required')
+      // The trusted header principal is rechecked against durable PI membership.
+      const r8 = await fetch(url(`/${session.intake_id}/adopt`), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...INTAKE_HUMAN_HEADERS },
+        body: JSON.stringify({ expected_proposal_revision: proposal.revision }),
+      })
       expect(r8.status).toBe(200)
       const receipt = (await r8.json()) as AdoptionReceipt
       expect(receipt.intake_id).toBe(session.intake_id)
@@ -778,7 +851,7 @@ describe('ONBOARD-01 HTTP surface (/v1/projects/{id}/intake*)', () => {
   })
 
   it('reject flow over HTTP + DELETE artifact + unknown intake 404', async () => {
-    const kernel = freshKernel()
+    const kernel = freshKernel({ serviceToken: INTAKE_SERVICE_TOKEN })
     const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })
     await withServer(kernel, async (base) => {
       const url = (suffix: string): string => `${base}/v1/projects/${project.project_id}/intake${suffix}`
@@ -787,7 +860,13 @@ describe('ONBOARD-01 HTTP surface (/v1/projects/{id}/intake*)', () => {
       const fd = new FormData()
       fd.append('file', new Blob([Buffer.from('x')]), 'x.txt')
       await fetch(url(`/${session.intake_id}/artifacts`), { method: 'POST', body: fd })
-      const r2 = await fetch(url(`/${session.intake_id}/reject`), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ principal: PRINCIPAL }) })
+      const forged = await fetch(url(`/${session.intake_id}/reject`), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ principal: PRINCIPAL }),
+      })
+      expect(forged.status).toBe(403)
+      const r2 = await fetch(url(`/${session.intake_id}/reject`), {
+        method: 'POST', headers: { 'content-type': 'application/json', ...INTAKE_HUMAN_HEADERS }, body: '{}',
+      })
       expect(r2.status).toBe(200)
       const projection = (await r2.json()) as IntakeProjection
       expect(projection.session.status).toBe('rejected')
@@ -803,14 +882,16 @@ describe('ONBOARD-01 HTTP surface (/v1/projects/{id}/intake*)', () => {
   })
 
   it('adopt without awaiting_human over HTTP → 409 intake_state_conflict', async () => {
-    const kernel = freshKernel()
-    const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })
+    const kernel = freshKernel({ serviceToken: INTAKE_SERVICE_TOKEN })
+    const project = kernel.createProject({
+      name: 't', workspace: '/w', brief: makeBrief(), creator_principal_id: PRINCIPAL.principal_id,
+    } as never)
     await withServer(kernel, async (base) => {
       const r1 = await fetch(`${base}/v1/projects/${project.project_id}/intake`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ source_label: 's' }) })
       const session = (await r1.json()) as IntakeSession
       const r2 = await fetch(`${base}/v1/projects/${project.project_id}/intake/${session.intake_id}/adopt`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ principal: PRINCIPAL, expected_proposal_revision: 1 }),
+        method: 'POST', headers: { 'content-type': 'application/json', ...INTAKE_HUMAN_HEADERS },
+        body: JSON.stringify({ expected_proposal_revision: 1 }),
       })
       expect(r2.status).toBe(409)
       expect(((await r2.json()) as { error: { code: string } }).error.code).toBe('intake_state_conflict')

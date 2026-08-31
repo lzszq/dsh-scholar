@@ -74,7 +74,7 @@ port=0 必须通过 sidecar handshake 回填，不能把 0 当作客户端 endpo
 | DSH 会话公共受控入口 | dsh_scholar |
 | DSH 会话方法论入口 | research_methodology_status、research_protocol_record、research_synthesis_record、research_writing_review_record、research_knowledge_activate |
 | director | research_project、research_phase、research_gate_request、research_budget、research_status |
-| intake | research_intake_begin、research_intake_stage、research_intake_scan、research_intake_answers、research_intake_propose（prepare-only，不提供 adopt） |
+| intake | research_intake_begin、research_intake_stage、research_intake_scan、research_intake_propose（prepare-only，不提供 Human answer/adopt；Grill answer 只能来自可信 DSH/standalone 原生提问 UI） |
 | scholar/curator | literature_search、paper_resolve、corpus_snapshot、passage_lookup |
 | panel | research_panel、idea_create、idea_compare、novelty_audit |
 | engineer | workspace_snapshot、patch_apply、baseline_prepare、test_run、baseline_verify |
@@ -82,7 +82,7 @@ port=0 必须通过 sidecar handshake 回填，不能把 0 当作客户端 endpo
 | statistician | evidence_note_create、claim_create、claim_verify_request、analysis_request |
 | writer/reviewer | manuscript_build、manuscript_review、release_bundle_request |
 
-Canonical catalog 固定为 42 个可调用工具名。Unknown/root role 不是空集合：只允许 `dsh_scholar` 与上述七个 exact-session methodology tools；其余普通 Research tools 继续 deny。tools/pre-execute waterfall 对未授权工具返回 deny；允许时必须调用 next()。`dsh_scholar` 只接受有界 `text`、可选 `project_name`、可选 `project_id` 与 `locale`，默认从 `exec.agent.id` 解析当前 DSH session link；session id 只允许安全 opaque-id 字符并在 ResearchClient 中编码成一个 URL segment。`project_name` 只在 session 尚未关联、用户原文是整句肯定创建指令、且字段等于确定性语法从命令后缀解析出的完整名称时启用 name-only Init；只取名称子串、疑问、否定/取消/避免、主题讨论、模型补写/改写名称、名称不一致或已有 link 均不得创建。否定/疑问词只作用于命令结构，合法名称中的“风险”“方法”“类别”或英文 `What` 不应被误拒。它返回精确、封闭的脱敏阶段投影和受控动作结果，不授予任何低层 Research role capability。七个 methodology tools 必须从调用 DSH session 精确解析持久 project link，不接受任意 `project_id`；`research_knowledge_activate` 只接收 package identity 与 CAS，Host confirmation 后由 Kernel 派生 session/project/PI/phase/NextAction/policy/capability；`research_assurance_run` 的 semantic reviewer identity 只从 durable child topology 派生。DSH 当前 Tool schema DSL 不表达 string min/max，故 `text` 的 1–4000 和 `project_name` 的 1–120 长度由运行时再次强制；其余 input/output 字段、enum、对象开放性必须在 schema 中精确声明。Human Gate Decision、accepted Evidence 写入和任意宿主 shell 不注册为 Agent Tool。
+Canonical catalog 只由 `src/plugin/tools.ts` 的当前注册结果派生，规范不硬编码会随删除过时工具而漂移的数量。Unknown/root role 不是空集合：只允许 `dsh_scholar` 与上述七个 exact-session methodology tools；其余普通 Research tools 继续 deny。tools/pre-execute waterfall 对未授权工具返回 deny；允许时必须调用 next()。`dsh_scholar` 只接受有界 `text`、可选 `project_name`、可选 `project_id` 与 `locale`，默认从 `exec.agent.id` 解析当前 DSH session link；session id 只允许安全 opaque-id 字符并在 ResearchClient 中编码成一个 URL segment。`project_name` 只在 session 尚未关联、用户原文是整句肯定创建指令、且字段等于确定性语法从命令后缀解析出的完整名称时启用 name-only Init；只取名称子串、疑问、否定/取消/避免、主题讨论、模型补写/改写名称、名称不一致或已有 link 均不得创建。否定/疑问词只作用于命令结构，合法名称中的“风险”“方法”“类别”或英文 `What` 不应被误拒。它返回精确、封闭的脱敏阶段投影和受控动作结果，不授予任何低层 Research role capability。七个 methodology tools 必须从调用 DSH session 精确解析持久 project link，不接受任意 `project_id`；`research_knowledge_activate` 只接收 package identity 与 CAS，Host confirmation 后由 Kernel 派生 session/project/PI/phase/NextAction/policy/capability；`research_assurance_run` 的 semantic reviewer identity 只从 durable child topology 派生。DSH 当前 Tool schema DSL 不表达 string min/max，故 `text` 的 1–4000 和 `project_name` 的 1–120 长度由运行时再次强制；其余 input/output 字段、enum、对象开放性必须在 schema 中精确声明。Human Gate Decision、accepted Evidence 写入和任意宿主 shell 不注册为 Agent Tool。
 
 ## 5. 命令
 

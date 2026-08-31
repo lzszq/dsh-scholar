@@ -111,7 +111,7 @@ export {
   adoptLegacyKernelData, kernelDatabaseNeedsMigration,
   type AdoptLegacyKernelDataOptions, type KernelDataAdoptionReceipt,
 } from './data-upgrade.js'
-export { nextActionProjection, legacyNextActionStrings, INTAKE_ACTIVE_STATUSES, type NextActionContext, type NextActionJob, type NextActionIntake, type NextActionReproduction, type NextActionMethodology, type NextActionRunObservation, type NextActionSynthesisRequest, type NextActionRoute } from './next-action.js'
+export { nextActionProjection, INTAKE_ACTIVE_STATUSES, type NextActionContext, type NextActionJob, type NextActionIntake, type NextActionReproduction, type NextActionMethodology, type NextActionRunObservation, type NextActionSynthesisRequest, type NextActionRoute } from './next-action.js'
 export {
   buildRunOutcomeObservation,
   buildSynthesisRecordRequest,
@@ -165,13 +165,32 @@ export {
   type MethodologyFailure,
 } from './methodology-coordinator.js'
 export { openDatabase, SCHEMA_VERSION } from './store.js'
+export {
+  CONFIG_WRITE_DDL, ConfigWriteStore, ConfigWriteStoreError,
+  type ConfigWriteProjectAuthority, type ConfigWriteStoreOptions,
+} from './config-write-store.js'
+export {
+  SettingsWriteCoordinator,
+  type SettingsWritePorts,
+} from './settings-write-coordinator.js'
 export { runMigrations, MIGRATIONS, checksumOf } from './migrations.js'
+export { OCR_DDL, OcrStore, OcrStoreError, type PinnedOcrRequest } from './ocr-store.js'
+export { deterministicAnalysisPort, type AnalysisPort } from './analysis-port.js'
+export {
+  MinerUOcrWorker, MinerUTransportError,
+  type MinerUOcrTransport, type MinerUExtractInput, type MinerUExtractResult,
+  type MinerUTransportBinding, type OcrSourceBytes, type OcrWorkerKernelPort,
+} from './ocr-worker.js'
 export {
   openPtySessionStore, PtySessionStore, PtyError, NullPtyAdapter,
-  PTY_DDL, PTY_SESSIONS_TABLE_DDL,
+  PTY_CURRENT_DDL, PTY_DDL, PTY_SESSIONS_TABLE_DDL,
   PTY_DEFAULT_IDLE_TTL_S, PTY_DEFAULT_RETENTION_BYTES, PTY_DEFAULT_LEASE_TTL_S,
   type PtyAdapter, type PtySpawnPlan, type PtyControlResult, type PtyAppendResult, type PtySessionRow,
 } from './pty-session.js'
+export {
+  PtyContextError, resolvePtyContext, projectPtyContext,
+  type PtyContextAuthoritySource, type PtyResolvedContext, type PtyTargetKind,
+} from './pty-context.js'
 export {
   LocalPtyAdapter, PTY_SHELL_PRESETS,
   type LocalPtyAdapterOptions, type PtyOutputInput,

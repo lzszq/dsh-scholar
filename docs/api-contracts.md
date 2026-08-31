@@ -81,7 +81,7 @@ capabilities 至少包含 terminal_stream、interactive_terminal、workspace_fil
 
 Projection 是 UI 摘要，不承载完整日志、Artifact 字节、TeX 内容或大型 Evidence。
 
-Standalone 当前使用两个同源、Bearer + CSRF 保护的本地 BFF route。`POST /api/chat/turn` 接收 `{project_id,session_id,text,locale,history,images}`；`images` 是最多 20 个 strict `{mediaType: image/png|image/jpeg|image/webp|image/gif,data: canonical-base64,name?}` 的当前轮瞬态视觉输入，整个 BFF/bridge JSON envelope 最大 16 MiB，且只允许出现在 `conversation` operation。一次选择/拖放/粘贴形成原子批次：浏览器先把新增项与当前 exact-session 队列合并，在任何 `arrayBuffer()` 前按媒体类型、数量与 encoded 上界整批预检，失败零项进入视觉队列；通过后才顺序编码。private bridge 对最终 `JSON.stringify` 字节数再次精确检查，超限保持 HTTP 413 / `payload_too_large`。发送端在首个 await 前冻结 exact project/session/history/quote/image ids，以独立于 DOM 重绘的 exact-session single-flight 提交，并将延迟文本/错误只写回原会话；显式关闭原会话后零写。BFF 先做 membership 并重读 project projection，再把 allowlist 后的 project context、最多 12 条有界 history 和图片 wire 发给 DSH 插件的 private loopback model bridge。插件解析 exact route 后必须确认模型接受 text；视觉 turn 还必须确认显式 image capability，再经 `ctx.attachments` 的 `admitEncodedImages` 得到 durable refs，LLM 消息只携 `ImageBlock`；image-only、unknown/text-only 视觉模型均在附件写与网络 I/O 前拒绝。开放对话的模型输出是纯文本流，插件负责封装为 strict `{operation:"conversation",assistant_text}` reply；不得要求模型把自然语言包装成 JSON，也不从模型文本解析或自动执行 mutation/suggested command。该 route 零 Kernel mutation；bridge metadata/credential 必须作为同一个 `0600 agent-bridge.json` 原子替换，包含同版本 loopback origin/pid/started_at/token，禁止 endpoint/token 分文件与兼容读取，浏览器永远拿不到描述文件或 token。Bridge 业务错误使用闭合 typed code，BFF 只 allowlist code，不依赖英文 message。无图片的普通桥接或模型不可用可返回稳定 `503 model_unavailable` 并允许客户端使用确定性阶段引导；任何携图请求的 `vision_model_required`、`vision_image_rejected`、`vision_attachment_service_unavailable`、`payload_too_large` 或通用模型失败都必须显示视觉错误并保留原会话图片，不能静默当成普通文本成功。
+Standalone 当前使用两个同源、Bearer + CSRF 保护的本地 BFF route。`POST /api/chat/turn` 接收 `{project_id,session_id,text,locale,history,images}`；`images` 是最多 20 个 strict `{mediaType: image/png|image/jpeg|image/webp|image/gif,data: canonical-base64,name?}` 的当前轮瞬态视觉输入，整个 BFF/bridge JSON envelope 最大 16 MiB，且只允许出现在 `conversation` operation。一次选择/拖放/粘贴形成原子批次：浏览器先把新增项与当前 exact-session 队列合并，在任何 `arrayBuffer()` 前按媒体类型、数量与 encoded 上界整批预检，失败零项进入视觉队列；通过后才顺序编码。private bridge 对最终 `JSON.stringify` 字节数再次精确检查，超限保持 HTTP 413 / `payload_too_large`。发送端在首个 await 前冻结 exact project/session/history/quote/image ids，以独立于 DOM 重绘的 exact-session single-flight 提交，并将延迟文本/错误只写回原会话；显式关闭原会话后零写。浏览器图片编码阶段本身属于视觉请求边界：只要 `loadImages`/`File.arrayBuffer()` 抛错，即使尚未形成任何 `images[]` wire，也必须返回可操作的视觉错误并保留队列，禁止误判为无图片后进入确定性文本回答。BFF 先做 membership 并重读 project projection，再把 allowlist 后的 project context、最多 12 条有界 history 和图片 wire 发给 DSH 插件的 private loopback model bridge。插件解析 exact route 后必须确认模型接受 text；视觉 turn 还必须确认显式 image capability，再经 `ctx.attachments` 的 `admitEncodedImages` 得到 durable refs，LLM 消息只携 `ImageBlock`；image-only、unknown/text-only 视觉模型均在附件写与网络 I/O 前拒绝。开放对话的模型输出是纯文本流，插件负责封装为 strict `{operation:"conversation",assistant_text}` reply；不得要求模型把自然语言包装成 JSON，也不从模型文本解析或自动执行 mutation/suggested command。该 route 零 Kernel mutation；bridge metadata/credential 必须作为同一个 `0600 agent-bridge.json` 原子替换，包含同版本 loopback origin/pid/started_at/token，禁止 endpoint/token 分文件与兼容读取，浏览器永远拿不到描述文件或 token。Bridge 业务错误使用闭合 typed code，BFF 只 allowlist code，不依赖英文 message。无图片的普通桥接或模型不可用可返回稳定 `503 model_unavailable` 并允许客户端使用确定性阶段引导；任何携图请求的 `vision_model_required`、`vision_image_rejected`、`vision_attachment_service_unavailable`、`payload_too_large` 或通用模型失败都必须显示视觉错误并保留原会话图片，不能静默当成普通文本成功。
 
 `GET /api/model` 投影 private bridge 的 live DSH discovery catalog，模型项包含 exact `id=provider/model`、provider、opaque model、name、可选 `input_modalities` 与可选 `available`；`inputModalities` 缺失保持字段缺失（unknown），显式空数组保持空数组（不接受 Scholar text），两者都不能使其他目录项消失。不得保留静态模型 fallback，也不得把 advisory catalog 当请求白名单。qualified route 只在第一个 `/` 分隔 provider，后续字符全部属于 opaque model id。已保存值不在目录时，BFF 必须通过 private `resolve_model` 调用所属 adapter 的 `ctx.llm.resolveModelInfo(provider, model)`：成功追加精确项并维持选择；失败保留同 id 的 `available=false` 禁用项，Plugin 也 fail closed，绝不显示/执行 Auto 或目录首项。即使 route 存在于 catalog，PUT 和每个实际 turn 也必须重新使用 exact resolver，而不能把 discovery capability 当 correctness metadata。旧的未限定模型名仍视为未选择且不得猜 Provider。`PUT /api/model` 继续要求 Bearer、same-origin 与 CSRF；`auto` 可在 bridge 不可用时清除用户偏好，并先回退显式插件 PI 默认；没有配置默认时才逐项 exact-resolve catalog，跳过离线或明确不含 text 的项。具体模型只能由 exact `resolve_model` 确认，未知/不可解析项 422、bridge 不可用 503。浏览器只有在模型未明确排除 text 时才允许用于 Scholar Chat；显式空/image-only 项禁用，只有显式 text+image 项以 `👁` 标记。选择 PUT 必须作为 Chat send 的 acknowledgment barrier；迟到初始化 GET 不得覆盖已开始的 PUT，保存失败恢复上一已确认值并阻止该 turn；用户显式选择优先于插件默认。Auto exact-resolution 收到取消后必须立即停止。
 
@@ -359,13 +359,16 @@ zh/en 字典随 dsh-research-ui client bundle 发布，不由 Kernel 动态返�
 | POST | `/v2/intakes/{id}/grill-answers` | 每次一个 Human assertion + question revision；返回 next question |
 | POST | `/v2/intakes/{id}/ocr-requests` | 显式 provider/model ID 的异步 OCR；Idempotency-Key |
 | GET | `/v2/intakes/{id}/ocr-requests/{request}` | OCR 状态、安全错误、结果 refs 与来源/confidence |
+| DELETE | `/v2/intakes/{id}/ocr-requests/{request}` | 在执行前取消；终态请求幂等返回或明确冲突 |
 | POST | `/v2/intakes/{id}/proposals` | 生成确定性阶段/映射 proposal |
 | POST | `/bff/research/intakes/{id}/accept` | PI Human adoption；expected proposal/target revision |
 | POST | `/bff/research/intakes/{id}/reject` | Human reject/cleanup request |
 
 `accept` 只存在于 BFF Human 面；Agent tool schema 不生成该方法。scan/parser/LLM 永远不能直接 mutation Project。单文件 Artifact 上传与 research package intake 是两个明确入口，UI 不得把 internal Runner stage 暴露给用户。状态、映射、错误和幂等见 research-onboarding.md。
 
-兼容基线仍包括 v1 项目域 begin/list/resume、≤32 MiB multipart、scan/questions/answers/propose/adopt/reject。v2 name-only Grill 与批量分块 stage 已实现；Provider Registry、MinerU 配置与项目 binding 使用当前 v1 adapter。上表 OCR request 是目标契约，当前未注册 route/worker/provenance，状态必须是“未实现”，不能仅记为真实服务 `NOT_RUN_MANUAL_PENDING`。
+兼容基线仍包括 v1 项目域 begin/list/resume、≤32 MiB multipart、scan/questions/answers/propose/adopt/reject。v2 name-only Grill 与批量分块 stage 已实现；Provider Registry、MinerU 配置与项目 binding 使用当前 v1 adapter。上表 OCR request 已注册 exact route，并按 Intake 所属项目的 durable membership 授权；create/read/cancel、重启恢复、幂等、固定配置与 `observed_unverified` provenance 有自动测试。真实 MinerU transport 仍为 `NOT_RUN_MANUAL_PENDING`，不得用 mock worker 结果冒充外部服务验收。
+
+当前 v1 chunk begin 的 2xx body 必须逐字段回显并绑定 project/intake/file identity；append 的 2xx body 必须包含与请求一致的 `upload_id`、`committed_offset` 与 `replayed`。顺序 append 返回 `end+1`；old-range 同字节/hash重放可返回已经进一步推进、但不超过 total 的当前权威 offset。浏览器对 identity mismatch、非法 JSON、无界/停滞 offset 一律 typed fail-closed，不能把合法 replay 误判为协议错误。
 
 ## 17. 通用 Workspace 与 Upload
 
@@ -396,16 +399,25 @@ zh/en 字典随 dsh-research-ui client bundle 发布，不由 Kernel 动态返�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET/POST | `/bff/research/projects/{id}/pty-sessions` | 按 context 列出/open；workspace/profile/target/preset/cwd/size/config revision；server-derived session binding |
-| GET | `/bff/research/pty-sessions/{id}` | state 和权限摘要 |
-| GET | `/bff/research/pty-sessions/{id}/events?after_seq=N` | SSE fallback：data/gap/state/exit |
-| GET | `/bff/research/pty-sessions/{id}/socket` | authenticated WebSocket 双向 attach |
-| POST | `/bff/research/pty-sessions/{id}/input` | SSE fallback input bytes + client_seq |
-| POST | `/bff/research/pty-sessions/{id}/resize` | cols/rows + client_seq |
-| POST | `/bff/research/pty-sessions/{id}/signals` | allowlisted INT/TERM/KILL |
-| DELETE | `/bff/research/pty-sessions/{id}` | close，幂等 |
+| GET | `/v1/pty/contexts?project_id={project}` | 当前 Human 在项目内可用的 Research、DSH Chat 与其 exact-parent Subagent context；只返回安全投影，不返回 owner/tenant/凭据 |
+| GET | `/v1/pty/contexts/{context}/sessions` | 列出该 exact context 的多个 PTY、标签与 `active_hint`；服务端重新解析当前 context authority |
+| POST | `/v1/pty/sessions` | body 仅含 `context_id/workspace_id/label/purpose/preset/cwd/cols/rows`；project/owner/tenant/parent/profile/target 全由服务端解析 |
+| HEAD | `/v1/pty/sessions/{id}` | 仅供可信 BFF 解析 owning project；仍要求 server-derived principal，不返回会话体 |
+| GET | `/v1/pty/sessions/{id}?expected_generation=N` | state 与权限摘要；owner、lease、exact context、current generation 全部校验 |
+| POST | `/v1/pty/sessions/{id}/attach` | `{expected_generation}`；成功后 generation 递增并返回新会话 |
+| POST | `/v1/pty/sessions/{id}/detach` | `{expected_generation}`；断开 wire、保留进程，generation 递增 |
+| POST | `/v1/pty/sessions/{id}/control` | `{expected_generation,client_seq,type,payload}`；bytes/resize/INT/TERM/KILL/close |
+| GET | `/v1/pty/sessions/{id}/frames?after_seq=N&expected_generation=G` | 有界回放；gap/retention 明示 |
+| GET | `/v1/pty/sessions/{id}/frames/stream?after_seq=N&expected_generation=G` | authenticated SSE；frame/gap/exit/heartbeat |
+| DELETE | `/v1/pty/sessions/{id}` | body `{expected_generation}`；显式 close，幂等但不接受省略 generation |
 
-open/list 接受 context_kind 与可验证 context ref，但 BFF/Kernel 必须从当前 Operator/Research/Chat/Subagent 地址解析 project/owner/parent，不能信任任意客户端 child/session ID。attach/detach/input/resize/signal/control 与 SSE subscribed/frame/state 均携带 generation；stale generation、lease expired 或 context 越权 fail closed。一个 context 可有多个 PTY，list 返回可恢复标签集合与 active_hint。
+浏览器唯一可提交的 authority reference 是由 contexts 列表取得的 opaque `context_id`。Kernel 必须实时从当前项目 membership、`session_links` 的 durable principal、`child_links` exact-parent 链和项目当前 Runner binding 重新解析 project/owner/tenant/parent/profile/target；旧的无 durable principal session link 不构成 PTY authority，也不得由当前登录者、项目 owner 或本机默认值推断。canonical context 仅有 Research、Chat、Subagent：Research context 使用 server-derived、principal-scoped opaque id；Chat 只属于其 durable link owner；Subagent 必须沿 parent 链收敛到同项目的有身份 Chat root。不存在 Operator context、project context 或旧枚举兼容 fallback。
+
+`idle_ttl_s`、`retention_bytes` 与 lease TTL 是 Kernel runtime policy，不属于 open body。Kernel 每次 open 从 canonical Config Registry 的 `kernel.pty_idle_ttl_s`、`kernel.pty_retention_bytes`、`kernel.pty_lease_ttl_s` 读取当前 effective 值，并与 exact `config_hash` 一起钉定到新会话；Settings hot write 只影响此后的 open，已有会话不得被后台配置变化重解释。
+
+attach/detach/input/resize/signal/control、轮询与 SSE 全部携带 `expected_generation`；stale generation、lease expired、membership 撤销、exact-parent 变化、project runner binding 变化、target disabled/draining/offline、adapter 与 target kind 不匹配或 context 越权均 fail closed。一个 context 可有多个带 label/purpose 的 PTY；切 context 时客户端必须先清空 active input target，服务端 `active_hint` 只是恢复提示，不能授权控制。
+
+Standalone BFF 对所有 `/v1/pty/*` 请求只注入其可信会话解析出的 `x-principal-id`；不得再从 open body 读取或要求 `project_id`。Kernel 从 `context_id` 重新解析 Project 与当前 membership，并对 open/attach/detach/control/close 执行 `terminal_write`（仅 PI、Operator、Researcher）；Viewer/Auditor 不能产生 PTY 写入。BFF 解析已有 PTY 的 Project 时使用无 body 的 `HEAD /v1/pty/sessions/{id}`，不能调用需要 lease/generation 的 session GET。
 
 Run Terminal `/jobs/{id}/terminal` 保持只读且永远不接受 input。PTY 每个 control 操作执行 Project AuthZ、terminal_write、generation/client_seq 和 target policy；revoke 关闭连接。浏览器不能提交 SSH endpoint/credential、Docker socket、host path 或任意 argv。
 
@@ -414,23 +426,20 @@ Run Terminal `/jobs/{id}/terminal` 保持只读且永远不接受 input。PTY �
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/v1/runner-targets`、`/bff/research/runner-targets` | 可见 target kind/health/capability/config hash 与 SecretRef availability，不返回 endpoint/credential 值 |
-| POST `/v1/runner-targets`；PATCH `/v1/runner-targets/{id}` | PI/Operator 登记、drain、disable；BFF 与 Kernel 都从权威项目成员表实时求得 PI/Operator，忽略调用方自报 role，不能把任意登录 principal 升格；生产 Kernel 同时要求 service token；revision CAS；所有新 target 必须提供独立 `service_identity` SecretRef，`remote-ssh` 另须提供 endpoint/credential/known_hosts 三个 SecretRef |
-| PATCH | `/v2/projects/{id}/execution` | PI/Operator 以 `{expected_revision, runner_target_id}` CAS 保存项目默认 Target；服务端按 Target kind 同步兼容的内置 RunnerProfile，未知/禁用/排空目标拒绝 |
 | GET/POST/PATCH | `/bff/research/runner-profiles` | profile、资源/网络/image policy；revision CAS |
 | GET | `/bff/research/config/schema` | canonical schema/UI metadata |
-| GET | `/bff/research/config/effective` | scope filters + value/source/revision/hash |
-| PATCH | `/bff/research/config/{scope}/{scope_id}` | expected revision；secret 只接受 SecretRef |
-| POST | `/bff/research/config/{scope}/{scope_id}/reset` | reset field/section to inherited default |
-| GET | `/bff/research/config/revisions/{id}` | redacted provenance/audit |
-| GET/POST | `/bff/research/model-providers` | global Provider 列表/创建；PI/Operator；SecretRef metadata only |
-| PATCH | `/bff/research/model-providers/{id}` | revision CAS；编辑、启停、能力/模型目录；不接受 secret value |
-| GET/PATCH | `/bff/research/projects/{id}/model-bindings` | 项目只选择 purpose/provider_id/model_id；revision CAS |
+| GET | `/v1/config/effective?project_id={id}` | scope filters + value/source/revision/hash；Project 读取要求 membership |
+| GET | `/v1/config/layers/{scope}/{scope_id}` | redacted layer 与 revision CAS 当前值 |
+| GET | `/v1/config/revisions/{scope}/{scope_id}` | redacted provenance/audit |
+| POST | `/v1/settings/transactions` | 唯一 Settings mutation；最多 64 个 Config/OCR/Runner operations，统一 CAS、权限和 SQLite transaction，任一失败全部回滚 |
+| GET | `/v1/providers`、`/v1/providers/{id}` | Provider safe view；SecretRef metadata only |
+| GET | `/v1/projects/{id}/model-binding` | 项目 OCR binding safe view；要求 membership |
 
-当前兼容面使用 `/v1/providers*` 与 `/v1/projects/{id}/model-binding`。OCR-CONFIG-01 的首个内置 descriptor 为 `provider_id=mineru`、`kind=mineru`、默认 `base_url=https://mineru.net/api/v4`，模型目录固定为 `flash/pipeline/vlm`；credential 可省略（MinerU Flash）或为严格 SecretRef（精准模式），任何明文 token/value/password 继续拒绝。此处只定义 Provider/Binding 配置面；`/v2/intakes/{id}/ocr-requests` 在 worker 与 provenance 未落地前仍是目标路由，不得从配置成功推断 OCR 已执行。
+OCR-CONFIG-01 的首个内置 descriptor 为 `provider_id=mineru`、`kind=mineru`、默认 `base_url=https://mineru.net/api/v4`，模型目录固定为 `flash/pipeline/vlm`；credential 可省略（MinerU Flash）或为严格 SecretRef（精准模式），任何明文 token/value/password 继续拒绝。Provider create/update 与可选 Project binding 必须放在同一个 `ocr-mineru` Settings operation 中。`/v2/intakes/{id}/ocr-requests` 只接受与当前 binding 完全一致的 provider/model，并把 provider revision/config hash、source hash、页和语言固定进持久请求；配置成功或请求入队都不能被解释为 OCR 已执行，只有带结果 provenance 的 `succeeded` 状态表示 worker 已完成。
 
 Remote Agent internal 面提供 enroll/heartbeat/capability/claim/CAS fetch/stage/complete；全部使用 mTLS service identity 与 ExecutionPlan signature。任何 target/profile/config 修改只影响新动作，不能改变运行中 Job/PTY/Build 的 pinned hash。
 
-Experiment/Job/Reproduction public body 只接受 `runner_profile_id` 与 `runner_target_id`。Settings 当前项目选择器写 `/v2/projects/{id}/execution` 作为默认值；Chat `/run` 与 `/reproduce` JSON 中的 `runner_target_id` 作为 Job 顶层字段发送，优先级为 Job > Project。Target Registry 的 local-docker/remote-ssh endpoint、known-hosts、SSH/mTLS credential 由 Settings + SecretRef 管理；提交时固定 profile/target/environment revision/hash。claim 可由服务端 `runner_target_kinds` 过滤，runner/adapter 仍须执行前二次校验；offline/draining/capability mismatch 返回 blocked/retryable，不做 implicit local fallback。
+Experiment/Job/Reproduction public body 只接受 `runner_profile_id` 与 `runner_target_id`。Settings 当前项目选择器通过统一 transaction 写 project-scope `execution.runner_target_id`；Kernel 在同一事务中校验 Target 并派生匹配的 RunnerProfile。Chat `/run` 与 `/reproduce` JSON 中的 `runner_target_id` 作为 Job 顶层字段发送，优先级为 Job > Project。Target Registry 的 local-docker/remote-ssh endpoint、known-hosts、SSH/mTLS credential 由 Settings + SecretRef 管理；提交时固定 profile/target/environment revision/hash。claim 可由服务端 `runner_target_kinds` 过滤，runner/adapter 仍须执行前二次校验；offline/draining/capability mismatch 返回 blocked/retryable，不做 implicit local fallback。
 
 ## 19.1 论文复现
 
@@ -461,7 +470,7 @@ Standalone v1 adapter 兼容面（当前 Scholar UI 使用）包括 `/v1/project
 
 ## 21. NextAction 兼容
 
-`GET /v1/projects/{id}/projection`（v2 同路由）返回双字段（GUIDE-01）：`next_actions: string[]`（legacy，由 `next_actions_v2` 中非 done 动作的 label 稳定派生，终态为空数组——旧 UI/API 消费端不受破坏）与 `next_actions_v2: NextAction[]`（权威结构化投影，wire 字段见 reconstruction-contracts.md §24 / domain-model.md §14）。
+`GET /v1/projects/{id}/projection`（v2 同路由）只返回 `next_actions_v2: NextAction[]`（GUIDE-01 权威结构化投影，wire 字段见 reconstruction-contracts.md §24 / domain-model.md §14）。旧 `next_actions: string[]` 已删除；缺失或畸形结构化字段不得由 display label 推导可执行操作。
 
 NextAction 由 Kernel 从 project status、pending gates、jobs、budget、contracts、ideas、evidence、claims 确定性生成（`nextActionProjection` 纯函数，无 DB、无副作用、不抛错）。状态、reason、required 缺口、revision、capability 和 target route 都由 Kernel 产生；UI 只负责翻译 label、解析白名单交互与路由，不能直接执行未声明 mutation。未知/未来状态退化 `code='unknown'` 的只读动作（state=blocked、required=['state_mapping']），UI 不得为 unknown 构造 mutation。`required` 是前置条件，`required_by` 才是执行者。Intake/Grill 阶段动作在 ONBOARD-01 落地后由同一投影扩展。
 
@@ -483,9 +492,9 @@ Remote Runner 通过双重身份保护的 `POST /v1/runner-targets/{target_id}/h
 
 三个 v1 stream 端点与 §9 Terminal SSE 同模式（Content-Type `text/event-stream`、`Cache-Control: no-store`、`x-accel-buffering: no`、连接前完成鉴权——错误以 JSON 返回、绝不半开 SSE；`after_seq`/`after_revision` 重放、live 尾随、命名 `heartbeat` 事件（服务端周期发送，`data: {"time": …}`，客户端不得伪造/依赖其语义）。服务端以 ~200ms 轮询**既有轮询数据源**（pty frames store / workspace op-ledger listSince / trajectory outbox 投影）并推送增量——stream 与 poll 读同一份数据，永不漂移。轮询端点全部保留（向后兼容），客户端自行选择流或轮询。
 
-### GET /v1/pty/sessions/{id}/frames/stream?after_seq=N
+### GET /v1/pty/sessions/{id}/frames/stream?after_seq=N&expected_generation=G
 
-PTY-01 帧流（对应轮询 `GET /v1/pty/sessions/{id}/frames?after_seq=`）。鉴权与轮询 frames 完全一致（fail-closed）：缺 `x-principal-id` → 422 `principal_required`、非 owner → 403 `pty_principal_mismatch`、未知会话 → 404 `pty_session_not_found`、`after_seq` 非法 → 422 `pty_after_seq_invalid`；可选 `x-pty-lease` 出现即必须有效（错误 → 403 `lease_invalid`）。事件：
+PTY-01 帧流（对应轮询 `GET /v1/pty/sessions/{id}/frames?after_seq=&expected_generation=`）。鉴权与轮询 frames 完全一致（fail-closed）：缺 `x-principal-id` → 422 `principal_required`、非 owner → 403 `pty_principal_mismatch`、未知会话 → 404 `pty_session_not_found`、`after_seq` 非法 → 422 `pty_after_seq_invalid`；`expected_generation` 与当前 generation 必须精确相等，缺失或过期均拒绝；`x-pty-lease` 必填，缺失 → 403 `lease_required`，错误或过期 → 403 `lease_invalid`。事件：
 
 ~~~text
 event: subscribed
@@ -657,4 +666,5 @@ Knowledge Activation 与 Assurance execution 的成功 response 对应一条数�
 - Intake `Idempotency-Key` 是全局 key，但 exact replay authority 同时包含 path `project_id`、持久化 `owner_scope_id` 与 request hash；三者任一不同都返回 `409 idempotency_conflict`。服务端不得从另一 project/scope 返回已有 Intake，也不得仅依赖 caller hash 表达 path authority。
 - append 在文件写入与 committed offset 更新所在的同一写事务内重读 upload、Project、scope 与 offset；finalize 在 hash 完成后、artifact promote 前的写事务内再次重读这些状态。这样 tombstone、abort 或 project delete 已先提交时，迟到 continuation 必须零权威写。
 - 只有本 upload 新建仍为 `staged` 的隔离 artifact 时，session 才持有 `owns_artifact=1`。关闭后的补偿 abort 可删除该 artifact；去重命中、已扫描 artifact 不归本 session 所有。共享 staged artifact 的所有权在 abort 时转移；重复 abort 不得清零未完成的 ownership ledger。direct/multipart same-SHA stage 与 cleanup 使用同一写锁，stage 先接管新 generation，cleanup 只有在当前 artifact row 不存在时才 unlink，从而禁止旧账本删除后来重建的材料。
-- 浏览器关闭 session 前先写独立于 transcript 的 durable local outbox，再删除本地 session；若 storage 写失败，则保留可见 session 直到 Kernel ACK。outbox 在项目激活和成功 project-list refresh 时自动重放，只有 2xx 或权威 project 404 才移除。网络/4xx/5xx 不得丢 outbox，且本地 page-lifetime tombstone仍立即取消所有 continuation。
+- 浏览器关闭 session 时由单一 lifecycle coordinator 先发布独立于 transcript 的 page-lifetime exact-scope tombstone，同步封死 turn、attachment、vision 与 upload continuation，再写 durable local outbox；若 storage 写失败，则保留可见 session 直到 Kernel ACK，但该可见项也不能重新提交或接受迟到 transcript/attachment 写。outbox 在项目激活和成功 project-list refresh 时自动重放，只有 tombstone route 的 2xx 才确认该条 close；route 404 同时可能表示防枚举 membership denial，不得当作物理删除 ACK。真正的项目删除由成功 project-list + projection authority reconciliation 调用 project discard，并在那里清理项目全部 outbox。网络/4xx/5xx 均不得丢单条 close outbox。
+- page lifetime 只有一个 session/project tombstone authority；turn、attachment、upload、vision 与 transcript 都读取它，但每类资源独立持有自己的 controller/driver map。hydrated outbox 在远端请求前必须重建 tombstone。上传 queue failure wire 为 `{code,status?}`，2xx begin/append 也需 strict shape 与单调 offset 校验；malformed 或 offset regression 立即 fail-stop。

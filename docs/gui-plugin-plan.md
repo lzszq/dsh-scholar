@@ -96,7 +96,7 @@ Composer 的输入分派顺序固定为：显式 `/...` → direct command；act
 
 成功读取 project list 后还要对账后台 Chat scopes：枚举 transcript、upload、vision、turn 与 attachment-flight 五类 page-lifetime store 的项目并集，不能依赖 localStorage 写入成功；列表缺失者逐一请求 projection，只有明确 404 才执行 `chatDiscardProject`。因此在 B 工作时由另一 tab/API 删除 A，也会取消 A 的 Intake/hash/upload/model turn、释放 File/queue/vision 并删 snapshot；暂时断网或 5xx 不清任何后台 scope。
 
-显式关闭 session 必须先封死本地 exact scope，再把 Kernel Chat-scope tombstone 写入 transcript 之外的 durable outbox。outbox 落盘后可立即移除 session；storage 失败时保持 session 可见直到服务端 ACK，项目激活与成功列表刷新重放失败项。Chat 附件取得 Intake 时必须始终 `POST` scoped begin 并携带 session id，由 Kernel 原子选择 unscoped/same-scope Intake 或创建新 Intake；禁止客户端先 GET 后无 scope 复用任意 active Intake。upload 若未显式给 owner，必须继承 Intake 的持久化 owner。AbortSignal 贯穿请求和 hash；客户端即使在取消边界收到 finalize 成功也必须补偿 abort。页面重绘、切换、关闭按钮和项目删除不得通过创建新 controller 重新开放已关闭 scope。
+显式关闭 session 必须由单一 Chat scope lifecycle coordinator 先封死本地 exact scope，再把 Kernel Chat-scope tombstone 写入 transcript 之外的 durable outbox。turn 与 attachment continuation 共用 typed scope key/abort registry，二者关闭语义必须一致；关闭后 `begin`、迟到 transcript 与 attachment upsert 全部拒绝。outbox 落盘后可立即移除 session；storage 失败时保持 session 可见直到服务端 ACK，但可见不代表可写。项目激活与成功列表刷新重放失败项；tombstone route 的普通 404 不是 ACK，只有 2xx 或随后独立完成的权威 project discard 才移除 outbox。Chat 附件取得 Intake 时必须始终 `POST` scoped begin 并携带 session id，由 Kernel 原子选择 unscoped/same-scope Intake 或创建新 Intake；禁止客户端先 GET 后无 scope 复用任意 active Intake。upload 若未显式给 owner，必须继承 Intake 的持久化 owner。AbortSignal 贯穿请求和 hash；客户端即使在取消边界收到 finalize 成功也必须补偿 abort。页面重绘、切换、关闭按钮和项目删除不得通过创建新 controller 重新开放已关闭 scope。
 
 同样的自然语言体验必须覆盖 DSH 本体 Chat，而不是只存在于 standalone composer。`research-core` Skill 指示 Harness Agent 在用户表达研究意图时调用单一 `dsh_scholar` façade，并原样传递文本；工具按当前 DSH session 绑定项目、执行受控 intent、返回本地化回答与最新阶段。项目处于 Brief collecting 时，工具通过正式注入的 Host `ctx.userQuestions.ask()` 一次展示一个问题，把 exact live root Agent 和调用 AbortSignal 原样交还 DSH 原生 composer takeover UI；free text 记为 answered，原生 Skip 记为 skipped，“暂时未知”选项记为 unknown。每次回答前重新读取 link 与 question code/revision，全部收集后只引导到 Scholar 由 PI confirm，不自动决策 Gate。缺少 userQuestions service/provider 时插件启动或提问 fail closed，禁止恢复旧内嵌表单。Agent 不应要求用户先手写 slash；当动作不能安全自动执行时，回答要帮助生成可编辑的一级 slash command，并解释所需 Human/Agent/Runner 与阻断项。
 
@@ -270,7 +270,7 @@ OCR-UI-01：MinerU 配置使用独立纵向表单，内部按服务商、项目�
 
 Execution advanced 内含可编辑 Runner Target/Profile Registry：目标类型明确显示“本机进程（仅 trusted dev/smoke）”“本机 Docker”“远程 SSH”，配置 label、capabilities、resource/network policy、enabled/draining 与 revision/hash；remote-ssh 表单只提交服务端连接配置和 SecretRef 元数据，私钥/token 不回显。项目和实验只用 opaque target/profile picker，显示健康/能力与 pin；offline、host-key mismatch 或 capability mismatch 给出可操作阻断信息，不提供隐式本机回退按钮。所有 label、validation、secret availability、health、aria 具备 zh/en parity。
 
-Start 的 New Project modal 只含 project name；创建成功立即进入 Chat Grill。Upload 是多文件队列，默认请求 8 MiB 但每次实际 PUT 使用服务端 begin/list 协商的 chunk cap，并支持暂停/恢复/取消、offset/hash 冲突、失效 stage 重建、扫描和 OCR 状态；begin/append 在途 pause 与 owner close 都必须 race-safe。配置项收缩在 Settings 折叠组，不在创建流程铺开。切换语言不得清空项目名、当前 Grill answer 或队列。
+Start 的 New Project modal 只含 project name；创建成功立即进入 Chat Grill。项目创建与 Grill 获取都绑定 `/new` 发起时的焦点，用户已切到另一项目时迟到结果不得抢焦点、写 cache 或 rerender。Upload 是多文件队列，默认请求 8 MiB 但每次实际 PUT 使用服务端 begin/list 协商的 chunk cap，并支持暂停/恢复/取消、offset/hash 冲突、失效 stage 重建、扫描和 OCR 状态；begin/append 在途 pause 与 owner close 都必须 race-safe，malformed 2xx/offset regression 必须 typed fail-stop。配置项收缩在 Settings 折叠组，不在创建流程铺开。切换语言不得清空项目名、当前 Grill answer 或队列。
 
 业务页只显示当前策略摘要和“调整”链接，不常驻展开高级项。运行中 Job/PTY/Build 标注 pinned config hash，修改配置只影响新动作。Patch 使用 revision CAS，409 展示 base/current/local；不支持的 target/capability 不隐藏成默认值。
 

@@ -97,10 +97,8 @@ export interface RunnerOptions {
   signal?: AbortSignal
   /** Ed25519 signing key for the RunManifest (design §12.7). */
   signingKey?: RunnerSigningKey
-  /** §12.6 lease generation of the claim; carried on terminal frames. */
-  leaseGeneration?: number | null
   /** Exact local RunnerTarget identity configured for this runner process. */
-  targetId?: string
+  targetId: string
 }
 
 /**
@@ -651,7 +649,7 @@ export async function runnerTargetPinFailure(
     ? payload.runner_target_id
     : null
   const kind = typeof payload.runner_target_kind === 'string' ? payload.runner_target_kind : null
-  if (targetId === null) return kind === null ? null : 'runner target pin has a kind without an id'
+  if (targetId === null) return 'runner target pin is missing; id/kind/revision/hash are required together'
   if ((kind !== 'local-process' && kind !== 'local-docker' && kind !== 'remote-ssh')
     || typeof payload.runner_target_revision !== 'number'
     || typeof payload.runner_target_hash !== 'string'
@@ -659,7 +657,7 @@ export async function runnerTargetPinFailure(
     return `target ${targetId} has an incomplete pin; id/kind/revision/hash are required together`
   }
   if (kind !== expectedKind || configuredTargetId !== targetId) {
-    return `local ${expectedKind} runner target ${configuredTargetId ?? '(legacy)'} refuses ${kind} target ${targetId}; no local fallback is permitted`
+    return `local ${expectedKind} runner target ${configuredTargetId ?? '(unconfigured)'} refuses ${kind} target ${targetId}; no local fallback is permitted`
   }
   try {
     const current = await client.getRunnerTarget(targetId)
@@ -688,9 +686,17 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
   // the run identity is the KERNEL'S durable runs row — claimJobs returns
   // `run_id` (run_<12 hex>, one per attempt) and the manifest, metrics
   // provenance and terminal frames must ALL use it; the runner never mints a
-  // parallel run id. (Fallback keeps legacy callers working.)
-  const runId = (job as ClaimedJobRecord).run_id ?? `run_${randomUUID().slice(0, 12)}`
-  const leaseGeneration = options.leaseGeneration ?? undefined
+  // parallel run id. Missing claim identity is a protocol violation.
+  const claimed = job as ClaimedJobRecord
+  if (typeof claimed.run_id !== 'string' || claimed.run_id === '') {
+    throw new Error(`job ${job.job_id} is missing the Kernel claim run_id`)
+  }
+  if (typeof claimed.lease_generation !== 'number' || claimed.lease_generation < 1 || claimed.lease_token === null) {
+    throw new Error(`job ${job.job_id} is missing the Kernel claim lease fencing fields`)
+  }
+  const runId = claimed.run_id
+  const leaseGeneration = claimed.lease_generation
+  const leaseToken = claimed.lease_token
   const pendingFrames: Array<{
     seq: number; stream_seq?: number | null; channel?: 'stdout' | 'stderr' | null
     text?: string | null; byte_offset?: number | null; byte_length?: number | null
@@ -712,7 +718,7 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
     pendingFrames.push({
       seq: frameSeq, stream_seq: streamSeq, channel, text,
       byte_offset: byteOffset, byte_length: byteLength, frame_kind: 'chunk',
-      ...(leaseGeneration !== undefined ? { lease_generation: leaseGeneration } : {}),
+      lease_generation: leaseGeneration,
     })
     if (pendingFrames.length >= 64) {
       if (frameFlushTimer !== undefined) { clearTimeout(frameFlushTimer); frameFlushTimer = undefined }
@@ -726,7 +732,7 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
     ? targetPayload.runner_target_id
     : null
   const expectedLocalKind = mode === 'docker' ? 'local-docker' : 'local-process'
-  const configuredTargetId = options.targetId ?? pinnedTargetId
+  const configuredTargetId = options.targetId
   const targetPinFailure = await runnerTargetPinFailure(client, targetPayload, expectedLocalKind, configuredTargetId)
   if (targetPinFailure !== null) {
     const reason = `job ${job.job_id}: ${targetPinFailure}`
@@ -745,6 +751,10 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
       stdout: '', stderr: '', error: `rejected: ${reason}`,
     } }
     throw new Error(`job ${job.job_id} rejected before execution (${reason})`)
+  }
+  const projectConfigPin = job.payload.project_config_pin
+  if (typeof projectConfigPin !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(projectConfigPin)) {
+    throw new Error(`job ${job.job_id} rejected before execution (missing current project config pin)`)
   }
   // §3.2 / ADR-004: formal-class jobs must run in a container runtime.
   // Subprocess is only for trusted smoke fixtures and echoes — never for
@@ -779,9 +789,8 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
   // domain-model.md §9.1（审计 §4 #8）: secure jobs 由 kernel submitJob 固定
   // opaque runner profile id + profile config hash（payload.runner_profile_id
   // + payload.profile_config_hash）。Runner 按注册表复算校验：未知 id 或
-  // hash 不一致 → environment 失败（fail closed，绝不执行——target 不得
-  // 放宽 Job 固定的 profile/config pin）。legacy jobs（无 pin）跳过校验，
-  // 执行路径与现状字节级一致。
+  // hash 不一致或缺失 → environment 失败（fail closed，绝不执行——target
+  // 不得放宽 Job 固定的 profile/config pin）。
   const payloadProfileId = typeof job.payload.runner_profile_id === 'string' && job.payload.runner_profile_id !== ''
     ? job.payload.runner_profile_id
     : null
@@ -820,6 +829,8 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
       throw new Error(`job ${job.job_id} rejected before execution (runner profile validation)`)
     }
     resolvedProfile = candidate
+  } else {
+    throw new Error(`job ${job.job_id} rejected before execution (missing current runner profile pin)`)
   }
   if (resolvedProfile !== null) {
     const expectedMode = resolvedProfile.runner_mode === 'local-docker' ? 'docker' : 'subprocess'
@@ -971,30 +982,24 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
     // RUN-REMOTE-01（接口层）：ExecutionPlan 由 Kernel 固定字段派生并签名
     // （有 signingKey 时），target 不得改写（adapter 冻结 + fingerprint 断言）。
     // domain-model.md §9.1：docker 参数来源 = 注册表 profile 记录（limits/
-    // network/opaque profile_id + config hash pin）；legacy jobs 缺省值
-    // 与现状字节级一致。
+    // network/opaque profile_id + config hash pin）。
     const plan = buildExecutionPlan(job, {
       run_id: runId,
       command,
       lease: {
         owner,
-        generation: job.lease_generation ?? 0,
-        token: job.lease_token,
+        generation: leaseGeneration,
+        token: leaseToken,
         expires_at: job.lease_expires_at,
       },
-      image_digest: image,
       timeout_ms: timeoutMs,
-      config_pin: null,
-      target_id: configuredTargetId ?? (mode === 'docker' ? 'target_local_docker_v1' : 'target_local_process_v1'),
-      profile_id: resolvedProfile?.profile_id ?? 'local-docker',
-      profile: resolvedProfile ?? undefined,
     })
     const planForExecution = signingKey !== undefined ? signExecutionPlan(plan, signingKey) : plan
     const dockerTarget = new LocalDockerAdapter({
       jobId: job.job_id,
       dockerRun: runDocker,
       cancel: cancelRun,
-      targetId: configuredTargetId ?? 'target_local_docker_v1',
+      targetId: configuredTargetId,
     })
     run = mode === 'docker'
       ? await dockerTarget.execute(planForExecution, { cwd: workDir, signal, onChunk, runEnv })
@@ -1008,7 +1013,7 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
   pendingFrames.push({
     seq: frameSeq,
     frame_kind: 'exit',
-    ...(leaseGeneration !== undefined ? { lease_generation: leaseGeneration } : {}),
+    lease_generation: leaseGeneration,
     payload_json: JSON.stringify({
       exit_code: run.exit_code,
       compute: (job.payload as { runner_compute?: { mode: 'cpu' } | { mode: 'nvidia'; devices: 'all' | string[] } }).runner_compute
@@ -1036,6 +1041,7 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
       project_id: job.project_id,
       contract_id: job.contract_id,
       job_id: job.job_id,
+      config_pin: projectConfigPin,
       command: job.command,
       code_commit: typeof job.payload.code_commit === 'string' ? job.payload.code_commit : '',
       code_snapshot_id: codeSnapshotId ?? null,
@@ -1208,7 +1214,7 @@ export async function executeJob(job: JobRecord, options: RunnerOptions): Promis
       : null
     // §12.6 fencing: record the claim's generation inside the manifest so the
     // kernel can reject stale runners that somehow complete late.
-    manifest.lease = { generation: job.lease_generation, token: job.lease_token }
+    manifest.lease = { generation: job.lease_generation }
     // Sign the final manifest (design §12.7): signature over the canonical
     // JSON excluding `signature`; payload_sha256 over the canonical JSON
     // before the signing fields are attached. The kernel verifies both.

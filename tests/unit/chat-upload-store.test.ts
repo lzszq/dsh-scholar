@@ -90,6 +90,25 @@ describe('ChatUploadStore', () => {
     expect(new ChatUploadStore(storage).list('project-a', 'session-a')).toEqual([])
   })
 
+  it('drops persisted upload failures with obsolete strings or extra fields', () => {
+    const base = {
+      fileName: 'paper.pdf', fileSize: 4, mediaType: 'application/pdf', state: 'failed',
+      uploadId: null, intakeId: null, projectId: 'project-a', expectedSha256: null,
+      chunkSize: null, committedOffset: 0, retryCount: 0,
+    }
+    for (const [index, lastError] of [
+      'upload_failed',
+      { code: 'upload_failed', message: 'raw transport secret' },
+      { code: 'upload_failed', status: 999 },
+    ].entries()) {
+      const storage = new MemoryStorage()
+      storage.setItem('dsh-scholar-upload-queue-v1:project-a:session-a', JSON.stringify([{
+        ...base, fileId: `file-${index}`, lastError,
+      }]))
+      expect(new ChatUploadStore(storage).list('project-a', 'session-a')).toEqual([])
+    }
+  })
+
   it('resets an unavailable or mismatched server session before re-selection', () => {
     const storage = new MemoryStorage()
     const store = new ChatUploadStore(storage)
@@ -101,7 +120,7 @@ describe('ChatUploadStore', () => {
     store.releaseBytes('project-a', 'session-a', item!.fileId)
 
     expect(store.reconcile('project-a', 'session-a', [])[0]).toMatchObject({
-      uploadId: null, committedOffset: 0, state: 'failed', lastError: 'upload_session_unavailable',
+      uploadId: null, committedOffset: 0, state: 'failed', lastError: { code: 'upload_session_unavailable' },
     })
 
     const [reselected] = store.stage('project-a', 'session-a', [uploadFile('paper.pdf', new Uint8Array([1, 2, 3, 4]))])
@@ -114,7 +133,7 @@ describe('ChatUploadStore', () => {
       media_type: 'application/octet-stream', expected_size: 4,
       expected_sha256: 'a'.repeat(64), chunk_size: 2, committed_offset: 2, status: 'open',
     }])[0]).toMatchObject({
-      uploadId: null, committedOffset: 0, state: 'failed', lastError: 'upload_session_identity_mismatch',
+      uploadId: null, committedOffset: 0, state: 'failed', lastError: { code: 'upload_session_identity_mismatch' },
     })
   })
 

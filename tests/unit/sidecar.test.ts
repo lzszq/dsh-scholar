@@ -45,9 +45,13 @@ async function freePort(): Promise<number> {
   })
 }
 
-async function waitForHealth(url: string, timeoutMs = 15_000): Promise<void> {
+async function waitForHealth(url: string, process: ChildProcess, timeoutMs = 30_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
+    if (process.exitCode !== null || process.signalCode !== null) {
+      const termination = process.signalCode === null ? `exit ${process.exitCode}` : `signal ${process.signalCode}`
+      throw new Error(`kernel process exited before becoming healthy: ${url} (${termination})`)
+    }
     try {
       const response = await fetch(`${url}/v1/health`)
       if (response.ok) return
@@ -98,6 +102,29 @@ afterEach(async () => {
 })
 
 describe('KernelSidecar (research-plugin) — SIDE-01', () => {
+  it.each(['--token', '--service-token'])('rejects secret Kernel CLI flag %s without echoing its value', async flag => {
+    const secret = 'argv-secret-canary-do-not-log'
+    const child = spawn(process.execPath, [KERNEL_BIN, flag, secret], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let output = ''
+    child.stdout?.on('data', chunk => { output += String(chunk) })
+    child.stderr?.on('data', chunk => { output += String(chunk) })
+    const exitCode = await new Promise<number | null>(resolve => child.once('exit', code => resolve(code)))
+    expect(exitCode).not.toBe(0)
+    expect(output).toContain(`unknown CLI flag '${flag}'`)
+    expect(output).not.toContain(secret)
+  })
+
+  it('fails the health wait immediately when the child was terminated by a signal', async () => {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    const exited = new Promise<void>(resolve => child.once('exit', () => resolve()))
+    child.kill('SIGTERM')
+    await exited
+
+    const startedAt = Date.now()
+    await expect(waitForHealth('http://127.0.0.1:1', child)).rejects.toThrow(/signal SIGTERM/)
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
+  })
+
   it('does not scan or mutate retired data directories during ordinary startup', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'sidecar-canonical-only-'))
     const retiredDir = mkdtempSync(join(tmpdir(), 'sidecar-retired-source-'))
@@ -242,7 +269,7 @@ describe('KernelSidecar (research-plugin) — SIDE-01', () => {
     }
   })
 
-  it('refuses to reuse a legacy kernel without runtime/endpoint.json (sidecar_identity_unknown) without killing it', async () => {
+  it('refuses to reuse a legacy kernel without runtime/endpoint.json (sidecar_identity_unknown) without killing it', { timeout: 45_000 }, async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'sidecar-legacy-'))
     tempDirs.push(dataDir)
     const port = await freePort()
@@ -253,7 +280,7 @@ describe('KernelSidecar (research-plugin) — SIDE-01', () => {
     ], { stdio: ['ignore', 'ignore', 'pipe'] })
     const kernelPid = kernel.pid ?? -1
     allPids.push(kernelPid)
-    await waitForHealth(`http://127.0.0.1:${port}`)
+    await waitForHealth(`http://127.0.0.1:${port}`, kernel)
     expect(existsSync(join(dataDir, 'runtime', 'endpoint.json'))).toBe(false)
     const sidecar = new KernelSidecar({ host: '127.0.0.1', port, dataDir, log: () => undefined })
     await expect(sidecar.start()).rejects.toThrow(/sidecar_identity_unknown/)

@@ -387,11 +387,11 @@ export async function openProjectDetailModal(root: ShadowRoot, projectId: string
   }
 
   // dsh-web guidance: next actions of the kernel for this project.
-  const nextActions = (p.next_actions ?? []).filter(Boolean)
+  const nextActions = (p.next_actions_v2 ?? []).filter(action => action.state !== 'done')
   if (nextActions.length > 0) {
     modal.appendChild(el('div', 'section-label', t('overview', 'overview.nextActions')))
     for (const a of nextActions) {
-      modal.appendChild(el('div', '', `➡️ ${a}`))
+      modal.appendChild(el('div', '', `➡️ ${a.label ?? a.code ?? 'unknown'}`))
     }
   }
 

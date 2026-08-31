@@ -9,8 +9,8 @@
  * - InMemoryAgentRegistry：注册、心跳更新 health/last_seen、offline 判定；
  * - capability 匹配（images/os/arch/runner_ver）；
  * - scheduledTarget 纯函数：capability 匹配、offline/draining 拒绝、
- *   无匹配 → 明确 retryable 错误、bound target 不可用不静默回退
- *   LocalDocker（除非 policy 显式允许）、policy 可配置（prefer local /
+ *   无匹配 → 明确 retryable 错误、bound target 不可用在任何配置下都不
+ *   回退 LocalDocker、policy 可配置（prefer local /
  *   local_only / allow_remote）；
  * - createRemoteRunnerAgent：接口层 stub fail-closed（真实 mTLS 传输未实现，
  *   任何执行调用明确抛错，绝不静默降级）。
@@ -18,13 +18,16 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildExecutionPlan,
+  computeProfileConfigHash,
   DEFAULT_TARGET_SCHEDULING_POLICY,
   isTargetAvailable,
+  getRunnerProfile,
   LOCAL_DOCKER_TARGET_ID,
   matchesTargetCapability,
   RemoteAgentRegistration,
   runnerVersionSatisfies,
   scheduledTarget,
+  TargetSchedulingPolicy as TargetSchedulingPolicySchema,
   type ExecutionPlan as ExecutionPlanType,
   type JobRecord,
   type RemoteAgentRegistration as Registration,
@@ -38,6 +41,7 @@ import {
 } from '@dsh-scholar/runner-gateway'
 
 const NOW = Date.parse('2026-08-11T12:00:00.000Z')
+const REMOTE_PROFILE = getRunnerProfile('profile_local_docker_cpu_v1')!
 
 function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
   return {
@@ -47,7 +51,19 @@ function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
     idempotency_key: 'formal:expc_test_1:v1',
     kind: 'formal',
     command: ['python', 'run.py'],
-    payload: { seed: 11, output_contract: { metrics: 'metrics.json' } },
+    payload: {
+      project_config_pin: `sha256:${'2'.repeat(64)}`,
+      runner_target_id: 'remote-gpu-1',
+      runner_target_kind: 'remote-ssh',
+      runner_target_revision: 1,
+      runner_target_hash: `sha256:${'b'.repeat(64)}`,
+      runner_profile_id: REMOTE_PROFILE.profile_id,
+      profile_config_hash: computeProfileConfigHash(REMOTE_PROFILE),
+      image_digest: REMOTE_PROFILE.image,
+      runner_compute: { mode: 'cpu' },
+      seed: 11,
+      output_contract: { metrics: 'metrics.json' },
+    },
     status: 'running',
     failure_class: null,
     lease_owner: 'runner-1',
@@ -66,16 +82,13 @@ function makeJob(overrides: Partial<JobRecord> = {}): JobRecord {
 }
 
 function makePlan(overrides: Partial<ExecutionPlanType> = {}): ExecutionPlanType {
-  return buildExecutionPlan(makeJob(), {
+  const plan = buildExecutionPlan(makeJob(), {
     run_id: 'run_remote_1',
     lease: { owner: 'runner-1', generation: 1, token: 'tok-1', expires_at: null },
-    image_digest: 'node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32',
     timeout_ms: 60000,
-    target_id: 'remote-gpu-1',
-    profile_id: 'remote-gpu-profile',
     created_at: '2026-08-11T00:00:00.000Z',
-    ...overrides,
   })
+  return { ...plan, ...overrides }
 }
 
 function reg(overrides: Partial<Registration> = {}): Registration {
@@ -235,13 +248,13 @@ describe('scheduledTarget（调度决策纯函数）', () => {
     expect(result).toEqual({ assigned: false, retryable: true, reason: 'no_capable_target', target_id: 'remote-gpu-1' })
   })
 
-  it('显式 policy.allow_bound_fallback_to_local=true 才允许回退 local-docker', () => {
-    const policy: TargetSchedulingPolicy = { ...DEFAULT_TARGET_SCHEDULING_POLICY, allow_bound_fallback_to_local: true }
-    const result = scheduledTarget(makePlan(), [local], policy, NOW)
-    expect(result).toEqual({ assigned: true, target_id: LOCAL_DOCKER_TARGET_ID })
-    // 默认 policy 下同样输入 → 不回退
-    const denied = scheduledTarget(makePlan(), [local], DEFAULT_TARGET_SCHEDULING_POLICY, NOW)
-    expect(denied.assigned).toBe(false)
+  it('旧 fallback policy 字段 strict 拒绝，bound target 永不跨 target 改派', () => {
+    expect(() => TargetSchedulingPolicySchema.parse({
+      ...DEFAULT_TARGET_SCHEDULING_POLICY,
+      allow_bound_fallback_to_local: true,
+    })).toThrow()
+    expect(scheduledTarget(makePlan(), [local], DEFAULT_TARGET_SCHEDULING_POLICY, NOW))
+      .toEqual({ assigned: false, retryable: true, reason: 'no_capable_target', target_id: 'remote-gpu-1' })
   })
 
   it('policy.local_only：bound 远端 target → retryable policy_blocked', () => {
@@ -315,7 +328,7 @@ describe('Config/SecretRef 边界（Job/UI 只见 opaque id 与安全摘要）',
   it('plan 携带 opaque target_id/profile_id；连接信息字段被 schema 拒绝', () => {
     const plan = makePlan()
     expect(plan.target_id).toBe('remote-gpu-1')
-    expect(plan.profile_id).toBe('remote-gpu-profile')
+    expect(plan.profile_id).toBe(REMOTE_PROFILE.profile_id)
     // 注册记录/plan 面不得出现 address/certificate（前面 schema 用例已覆盖拒绝）
     const asRecord = plan as unknown as Record<string, unknown>
     expect('address' in asRecord).toBe(false)

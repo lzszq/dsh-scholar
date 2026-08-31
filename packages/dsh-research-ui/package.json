@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "DSH Scholar standalone research workspace with a same-origin BFF and an isolated Research Kernel sidecar.",
   "type": "module",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "private": true,
   "files": [
     "lib/client.js",

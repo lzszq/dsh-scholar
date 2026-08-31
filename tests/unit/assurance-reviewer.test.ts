@@ -82,6 +82,7 @@ describe('read-only semantic assurance reviewer seam', () => {
       sessionId: 'session_exact',
       parent: { id: 'session_exact' },
       signal: new AbortController().signal,
+      hostConfirmation: { callId: 'call-assurance-1', rootCallId: 'root-assurance-1' },
     }, {
       coordinator: { execute },
       panel: dependencies(),
@@ -121,6 +122,7 @@ describe('read-only semantic assurance reviewer seam', () => {
       sessionId: 'session_exact',
       parent: { id: 'session_exact' },
       signal: new AbortController().signal,
+      hostConfirmation: { callId: 'call-assurance-2', rootCallId: 'root-assurance-2' },
     }, {
       coordinator: { execute },
       panel: dependencies(),
@@ -145,6 +147,7 @@ describe('read-only semantic assurance reviewer seam', () => {
     const execute = vi.fn(async () => panel())
     await runWritingSemanticReview({
       sessionId: 'session_exact', parent: { id: 'session_exact' }, signal: new AbortController().signal,
+      hostConfirmation: { callId: 'call-assurance-3', rootCallId: 'root-assurance-3' },
     }, {
       coordinator: { execute }, panel: dependencies(),
       delivery: {

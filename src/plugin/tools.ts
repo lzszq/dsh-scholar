@@ -136,7 +136,12 @@ interface ResearchToolDef {
   parameters: ParameterSchemaSpec
   output: ObjectValueSchemaSpec
   /** Args are the validated parameter values; returns the canonical tool value. */
-  execute(args: Record<string, any>, ctx: ResearchToolContext, sessionId: string | undefined, exec: { agent?: { id: string }; signal: AbortSignal }): Promise<Record<string, unknown>>
+  execute(args: Record<string, any>, ctx: ResearchToolContext, sessionId: string | undefined, exec: {
+    agent?: { id: string }
+    signal: AbortSignal
+    callId: string
+    rootCallId: string
+  }): Promise<Record<string, unknown>>
 }
 
 function nativeQuestionAnswer(
@@ -168,9 +173,19 @@ export function researchTool(def: ResearchToolDef, toolCtx: ResearchToolContext)
       schema: def.output,
       render: (_args: unknown, value: unknown) => renderText(value),
     },
-    execute: (args: unknown, exec: { agent?: { id: string }; signal: AbortSignal }) => def.execute(
+    execute: (args: unknown, exec: {
+      agent?: { id: string }
+      signal: AbortSignal
+      callId: string
+      rootCallId: string
+    }) => def.execute(
       args as Record<string, unknown>, toolCtx, exec.agent?.id,
-      { agent: exec.agent, signal: exec.signal },
+      {
+        agent: exec.agent,
+        signal: exec.signal,
+        callId: exec.callId,
+        rootCallId: exec.rootCallId,
+      },
     ),
   } as never) as unknown as ReturnType<typeof defineTool>
 }
@@ -316,13 +331,6 @@ export function intakeErrorText(code: string, fallback: string): string {
 /** ≤32 MiB per staged file — mirrors ResearchKernel.UPLOAD_MAX_FILE_BYTES
  *  (the kernel re-enforces the same cap with 413 payload_too_large). */
 export const INTAKE_MAX_FILE_BYTES = 32 * 1024 * 1024
-
-/** Agent identity for intake records. Agents are never human principals
- *  (research-onboarding.md §2.1/§5): the kernel records 'agent' as the
- *  owner/answerer and still refuses adopt — only the PI path adopts. */
-function agentPrincipal(sessionId: string | undefined): { principal_id: string; auth_method: string; session_id: string | null } {
-  return { principal_id: 'agent', auth_method: 'agent', session_id: sessionId ?? null }
-}
 
 /** Run one intake client call; stable intake error codes surface stable
  *  copy (machine code preserved), other errors pass through unchanged. */
@@ -619,6 +627,7 @@ export function registerResearchTools(ctx: { tools: { register(tool: ReturnType<
             sessionId: sessionId!,
             parent: exec.agent!,
             signal: exec.signal,
+            hostConfirmation: { callId: exec.callId, rootCallId: exec.rootCallId },
           }, {
             coordinator: ctx_.stageSubagents,
             panel: {
@@ -794,14 +803,13 @@ export function registerResearchTools(ctx: { tools: { register(tool: ReturnType<
   }, toolCtx))
 
   // ── onboarding intake (ONBOARD-01, research-onboarding.md §2/§3) ──────────
-  // Prepare-only surface: begin → stage → scan → answers → propose. There is
-  // NO adopt tool — research-onboarding.md §2.1: "DSH Agent 可 begin、stage、
-  // scan、grill、propose、status，但不存在 accept、adopt 或 Gate Decision
-  // tool"; only the Human PI (BFF/UI) may adopt an intake.
+  // Prepare-only surface: begin → stage → scan → propose. Human Grill
+  // answers and adoption are available only through the trusted native
+  // question UI/BFF session; Agents cannot assert that identity.
 
   ctx.tools.register(researchTool({
     name: 'research_intake_begin',
-    description: 'PREPARE-ONLY: create (or recover — idempotent) the single active Intake session for importing EXISTING research material (ONBOARD-01). Adoption is NOT possible here: only the Human PI adopts an intake in the authenticated UI (research-onboarding.md §2). Use research_intake_stage to add files, research_intake_scan to scan them, research_intake_answers for the Grill Me questions and research_intake_propose to build the phase proposal.',
+    description: 'PREPARE-ONLY: create (or recover — idempotent) the single active Intake session for importing EXISTING research material (ONBOARD-01). Human Grill answers and adoption are NOT possible here: use research_intake_stage and research_intake_scan, let the Human answer in the authenticated native question UI, then use research_intake_propose.',
     parameters: {
       project_id: OPT_STRING,
       source_label: { type: 'string', required: true },
@@ -878,40 +886,7 @@ export function registerResearchTools(ctx: { tools: { register(tool: ReturnType<
         artifacts: projection.artifacts,
         observations: projection.observations,
         questions: projection.questions,
-        note: 'prepare-only — answer the required questions with research_intake_answers, then propose',
-      }
-    },
-  }, toolCtx))
-
-  ctx.tools.register(researchTool({
-    name: 'research_intake_answers',
-    description: 'PREPARE-ONLY: record Grill Me answers for an intake session (ONBOARD-01 §5). answers_json is a JSON array of {question_code, answer, question_revision} — take the questions from research_intake_scan / research_intake_begin projection and keep their question_revision; `unknown` is a valid answer that keeps the gap and lowers proposal confidence. Answers are recorded with an agent identity (human_assertion provenance is reserved for the Human UI); adoption is NOT possible here — the Human PI adopts in the UI.',
-    parameters: {
-      project_id: OPT_STRING,
-      intake_id: { type: 'string', required: true },
-      answers_json: { type: 'string', required: true },
-    },
-    output: okSchema,
-    execute: async (args, ctx_, sessionId) => {
-      const projectId = await resolveProjectId(client, sessionId, args.project_id)
-      if (projectId === undefined) throw new Error('no project_id and no session-linked project')
-      const parsed = JSON.parse(String(args.answers_json)) as unknown
-      if (!Array.isArray(parsed) || parsed.some(a => typeof (a as { question_code?: unknown }).question_code !== 'string'
-        || typeof (a as { answer?: unknown }).answer !== 'string'
-        || typeof (a as { question_revision?: unknown }).question_revision !== 'number')) {
-        throw new Error('answers_json must be a JSON array of {question_code, answer, question_revision} objects')
-      }
-      const projection = await callIntake(() => client.submitIntakeAnswers(
-        projectId, String(args.intake_id),
-        parsed.map(a => ({ question_code: (a as { question_code: string }).question_code, answer: (a as { answer: string }).answer, question_revision: (a as { question_revision: number }).question_revision })),
-        agentPrincipal(sessionId),
-      ))
-      return {
-        ok: true,
-        intake_id: projection.session.intake_id,
-        status: projection.session.status,
-        questions: projection.questions,
-        note: 'prepare-only — once every required question is answered the intake is proposal_ready; propose with research_intake_propose, adoption stays with the Human PI (UI)',
+        note: 'prepare-only — the Human must answer required questions in the authenticated native question UI before research_intake_propose can succeed',
       }
     },
   }, toolCtx))
@@ -1052,6 +1027,7 @@ export function registerResearchTools(ctx: { tools: { register(tool: ReturnType<
         task: String(args.task),
         completion: typeof args.completion === 'string' ? args.completion : undefined,
         idempotencyKey: typeof args.idempotency_key === 'string' && args.idempotency_key !== '' ? args.idempotency_key : undefined,
+        hostConfirmation: { callId: exec.callId, rootCallId: exec.rootCallId },
       }, {
         client: ctx_.client as unknown as StagePanelClient,
         runtime: ctx_.ctx.subagents,

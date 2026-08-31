@@ -16,7 +16,15 @@
               "minLength": 1,
               "description": "Trusted image digest lock file (RUN-02): overridable via DSH_IMAGES_LOCK.",
               "default": "configs/runner-profiles/images.lock.json",
+              "x-dsh-key": "global.images_lock.path",
               "x-dsh-scope": "global",
+              "x-dsh-sources": [
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace",
               "x-dsh-env": "DSH_IMAGES_LOCK"
             },
             "node_fixture": {
@@ -24,7 +32,14 @@
               "pattern": "/^[^\\s@]+@sha256:[0-9a-f]{64}$/",
               "description": "Pinned node fixture digest — must equal the images.lock node_fixture entry.",
               "default": "node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32",
+              "x-dsh-key": "global.images_lock.node_fixture",
               "x-dsh-scope": "global",
+              "x-dsh-sources": [
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             },
             "texlive": {
@@ -32,7 +47,14 @@
               "pattern": "/^[^\\s@]+@sha256:[0-9a-f]{64}$/",
               "description": "Pinned TeX Live digest — must equal the images.lock texlive entry.",
               "default": "texlive/texlive@sha256:8957c916b8160049f89c24d362a6d86c09d8a04095acde37e88404c4afed85b4",
+              "x-dsh-key": "global.images_lock.texlive",
               "x-dsh-scope": "global",
+              "x-dsh-sources": [
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             }
           },
@@ -47,29 +69,41 @@
         "execution": {
           "type": "object",
           "properties": {
-            "runner_profile": {
-              "enum": [
-                "local-docker-gpu",
-                "local-docker-cpu",
-                "isolated-subprocess"
-              ],
-              "type": "string",
-              "description": "Execution profile of the project (v1 enum; superseded by execution.runner_profile_id).",
-              "default": "local-docker-cpu",
-              "x-dsh-scope": "project"
-            },
             "runner_profile_id": {
               "type": "string",
-              "description": "Opaque registered RunnerProfile id (domain-model.md §2/§9.1): overrides execution.runner_profile when set; unknown ids are rejected 422 runner_profile_unknown at project create and job submit. Job references only this opaque id — docker flags/endpoints never travel in project/job data.",
+              "minLength": 1,
+              "description": "Explicit opaque registered RunnerProfile id. null means an unconfigured DRAFT and is never resolved to a local runner implicitly; execution remains blocked until Settings saves a registered id.",
               "default": null,
-              "x-dsh-scope": "project"
+              "x-dsh-key": "execution.runner_profile_id",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             },
             "runner_target_id": {
               "type": "string",
               "minLength": 1,
               "description": "Opaque registered RunnerTarget id. The registry resolves local-process/local-docker/remote-ssh connection metadata server-side and pins its revision/hash at job submission.",
               "default": "target_local_docker_v1",
-              "x-dsh-scope": "project"
+              "x-dsh-key": "execution.runner_target_id",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             },
             "network_policy": {
               "enum": [
@@ -79,7 +113,18 @@
               "type": "string",
               "description": "Runner network policy; `none` forbids any container network other than none.",
               "default": "allowlist",
+              "x-dsh-key": "execution.network_policy",
               "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             },
             "artifact_store": {
@@ -89,13 +134,35 @@
               "type": "string",
               "description": "Artifact store backing the project.",
               "default": "local-cas",
-              "x-dsh-scope": "project"
+              "x-dsh-key": "execution.artifact_store",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             },
             "fixture_id": {
               "type": "string",
               "description": "Registered FixtureProfile id for full-auto projects (reconstruction-contracts.md §5); full-auto without a registered fixture is rejected at project create and job submit.",
               "default": null,
-              "x-dsh-scope": "project"
+              "x-dsh-key": "execution.fixture_id",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             }
           },
           "additionalProperties": false
@@ -107,38 +174,104 @@
               "type": "boolean",
               "description": "Baseline reproduction is required before experiments.",
               "default": true,
-              "x-dsh-scope": "project"
+              "x-dsh-key": "integrity.require_baseline_reproduction",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             },
             "require_experiment_contract": {
               "type": "boolean",
               "description": "Approved experiment contracts are required for formal runs.",
               "default": true,
-              "x-dsh-scope": "project"
+              "x-dsh-key": "integrity.require_experiment_contract",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             },
             "require_claim_evidence_links": {
               "type": "boolean",
               "description": "Claims must link accepted evidence.",
               "default": true,
-              "x-dsh-scope": "project"
+              "x-dsh-key": "integrity.require_claim_evidence_links",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             },
             "require_clean_room_rerun": {
               "type": "boolean",
               "description": "Release requires a clean-room rerun.",
               "default": false,
-              "x-dsh-scope": "project"
+              "x-dsh-key": "integrity.require_clean_room_rerun",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             },
             "allow_automatic_public_release": {
               "type": "boolean",
               "description": "Automatic public release is forbidden by the security baseline (§1); the Release Gate is the only path.",
               "default": false,
+              "x-dsh-key": "integrity.allow_automatic_public_release",
               "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             },
             "require_signed_manifest": {
               "type": "boolean",
               "description": "Project-level manifest signature requirement (§12.7); the kernel-level default is true.",
               "default": false,
-              "x-dsh-scope": "project"
+              "x-dsh-key": "integrity.require_signed_manifest",
+              "x-dsh-scope": "project",
+              "x-dsh-sources": [
+                "http",
+                "ui",
+                "file"
+              ],
+              "x-dsh-write-scopes": [
+                "project"
+              ],
+              "x-dsh-apply": "hot",
+              "x-dsh-security-merge": "replace"
             }
           },
           "additionalProperties": false
@@ -162,7 +295,16 @@
               "minLength": 1,
               "description": "Kernel endpoint the runner claims jobs from.",
               "default": "http://127.0.0.1:7412",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.kernel",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "mode": {
               "enum": [
@@ -172,7 +314,16 @@
               "type": "string",
               "description": "Execution mode; formal kinds are container-only (runtime enforced, execution-runtime.md §1).",
               "default": "subprocess",
+              "x-dsh-key": "runner.mode",
               "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             },
             "poll_ms": {
@@ -180,55 +331,145 @@
               "minimum": 0,
               "description": "Poll interval between claim cycles.",
               "default": 2000,
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.poll_ms",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "timeout_ms": {
               "type": "integer",
               "minimum": 0,
               "description": "Per-job execution timeout.",
               "default": 60000,
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.timeout_ms",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "heartbeat_ms": {
               "type": "integer",
               "minimum": 0,
               "description": "Lease heartbeat interval while a job executes.",
               "default": 15000,
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.heartbeat_ms",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "cancel_poll_ms": {
               "type": "integer",
               "minimum": 0,
               "description": "Cancel-watcher poll interval (terminates the real execution).",
               "default": 5000,
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.cancel_poll_ms",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "owner": {
               "type": "string",
               "description": "Lease owner identity; a random runner-<id> is generated when empty.",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.owner",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "key_file": {
               "type": "string",
               "description": "Ed25519 signing key file (0600); an ephemeral key is generated when absent.",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.key_file",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "token": {
               "type": "string",
-              "description": "Kernel bearer token for the runner client.",
+              "description": "Kernel bearer token for the runner client; injected by environment or a managed 0600 config file, never argv.",
               "default": "",
+              "x-dsh-key": "runner.token",
               "x-dsh-scope": "runner-profile",
-              "x-dsh-secret": true
+              "x-dsh-sources": [
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace",
+              "x-dsh-secret": true,
+              "x-dsh-secret-input": "secret-ref",
+              "x-dsh-env": "DSH_SCHOLAR_KERNEL_TOKEN"
             },
             "service_token": {
               "type": "string",
-              "description": "Service identity for internal kernel routes.",
+              "description": "Service identity for internal kernel routes; never argv.",
               "default": "",
+              "x-dsh-key": "runner.service_token",
               "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace",
               "x-dsh-secret": true,
+              "x-dsh-secret-input": "secret-ref",
               "x-dsh-env": "DSH_SCHOLAR_SERVICE_TOKEN"
+            },
+            "target_token": {
+              "type": "string",
+              "description": "Target-scoped service identity for RunnerTarget heartbeat; independent from the shared internal-route token and never argv.",
+              "default": "",
+              "x-dsh-key": "runner.target_token",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace",
+              "x-dsh-secret": true,
+              "x-dsh-secret-input": "secret-ref",
+              "x-dsh-env": "DSH_SCHOLAR_RUNNER_TARGET_TOKEN"
             },
             "fleet_server_port": {
               "type": "integer",
@@ -236,50 +477,122 @@
               "maximum": 65535,
               "description": "Fleet server listen port (0 = ephemeral); when provided the runner runs RemoteFleetServer instead of the local claim loop.",
               "default": 0,
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.fleet_server_port",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "fleet_url": {
               "type": "string",
               "description": "Fleet server base URL; when provided the runner runs as a remote fleet agent instead of the local claim loop.",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.fleet_url",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "agent_id": {
               "type": "string",
               "description": "Agent identity registered with the fleet server; generated agent-<id> when empty.",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.agent_id",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "fleet_target_id": {
               "type": "string",
               "description": "Opaque target id used for exact-match dispatch. Local mode defaults by mode to target_local_process_v1 or target_local_docker_v1; fleet agents must advertise their configured target.",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.fleet_target_id",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "fleet_public_key": {
               "type": "string",
               "description": "Path to the fleet server plan-signing public key PEM; agents refuse unverifiable plans without it (fail closed).",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.fleet_public_key",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "ssh_bootstrap_target": {
               "type": "string",
               "description": "Remote-SSH RunnerTarget id to connect and bootstrap as a fleet agent; empty disables SSH bootstrap.",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.ssh_bootstrap_target",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "secret_root": {
               "type": "string",
               "description": "Server-only root used to resolve file SecretRefs for remote-SSH bootstrap; never sent to the browser or remote host.",
               "default": "",
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.secret_root",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "ssh_connect_timeout_ms": {
               "type": "integer",
               "minimum": 0,
               "description": "SSH connection/bootstrap timeout in milliseconds.",
               "default": 15000,
-              "x-dsh-scope": "runner-profile"
+              "x-dsh-key": "runner.ssh_connect_timeout_ms",
+              "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "cli",
+                "env",
+                "file"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "replace"
             },
             "network": {
               "enum": [
@@ -290,21 +603,48 @@
               "type": "string",
               "description": "Container network mode; `host` is forbidden by the security floor and `network_policy=none` allows only `none`.",
               "default": "none",
+              "x-dsh-key": "runner.network",
               "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "file",
+                "http",
+                "ui"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             },
             "privileged": {
               "type": "boolean",
               "description": "Privileged containers are forbidden by the security floor.",
               "default": false,
+              "x-dsh-key": "runner.privileged",
               "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "file",
+                "http",
+                "ui"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             },
             "docker_socket": {
               "type": "boolean",
               "description": "Docker socket mounts are forbidden by the security floor.",
               "default": false,
+              "x-dsh-key": "runner.docker_socket",
               "x-dsh-scope": "runner-profile",
+              "x-dsh-sources": [
+                "file",
+                "http",
+                "ui"
+              ],
+              "x-dsh-write-scopes": [],
+              "x-dsh-apply": "restart",
+              "x-dsh-security-merge": "more-restrictive-only",
               "x-dsh-security-floor": true
             }
           },
@@ -321,51 +661,114 @@
           "minLength": 1,
           "description": "Kernel endpoint the orchestrator advances projects over.",
           "default": "http://127.0.0.1:7412",
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.kernel",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "db": {
           "type": "string",
           "description": "SQLite action-store path; empty = ephemeral temp database.",
           "default": "",
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.db",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "poll_ms": {
           "type": "integer",
           "minimum": 0,
           "description": "Poll interval between advancement rounds (bin still requires > 0).",
           "default": 5000,
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.poll_ms",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "once": {
           "type": "boolean",
           "description": "Run a single poll round and exit (tests/cron).",
           "default": false,
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.once",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "dry_run": {
           "type": "boolean",
           "description": "Compute planned actions only; no kernel writes, no persistence.",
           "default": false,
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.dry_run",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "owner": {
           "type": "string",
           "description": "Leader-election owner id for orchestrator_leases (reconstruction-contracts.md §15); empty = orch-<hostname>-<pid>.",
           "default": "",
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.owner",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "lease_seconds": {
           "type": "integer",
           "minimum": 0,
           "description": "orchestrator_leases expiry in seconds (§15); the owning instance refreshes every poll round and releases on close.",
           "default": 60,
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.lease_seconds",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "token_file": {
           "type": "string",
           "description": "0600 file with the kernel bearer token; every kernel request carries Authorization: Bearer <token>.",
           "default": "",
-          "x-dsh-scope": "orchestrator"
+          "x-dsh-key": "orchestrator.token_file",
+          "x-dsh-scope": "orchestrator",
+          "x-dsh-sources": [
+            "cli",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         }
       },
       "additionalProperties": false
@@ -378,7 +781,16 @@
           "minLength": 1,
           "description": "Kernel HTTP listen host.",
           "default": "127.0.0.1",
-          "x-dsh-scope": "kernel"
+          "x-dsh-key": "kernel.host",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "port": {
           "type": "integer",
@@ -386,49 +798,189 @@
           "maximum": 65535,
           "description": "Kernel HTTP listen port (0 = ephemeral, published via endpoint file).",
           "default": 7412,
-          "x-dsh-scope": "kernel"
+          "x-dsh-key": "kernel.port",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "token": {
           "type": "string",
-          "description": "Kernel bearer token; never logged, never in argv when the env path is used.",
+          "description": "Kernel bearer token; supplied only through environment or managed config files, never argv.",
           "default": "",
+          "x-dsh-key": "kernel.token",
           "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-secret": true,
+          "x-dsh-secret-input": "secret-ref",
           "x-dsh-env": "DSH_SCHOLAR_KERNEL_TOKEN"
         },
         "service_token": {
           "type": "string",
-          "description": "Internal-route service identity (x-service-token).",
+          "description": "Internal-route service identity (x-service-token); never accepted on argv.",
           "default": "",
+          "x-dsh-key": "kernel.service_token",
           "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-secret": true,
+          "x-dsh-secret-input": "secret-ref",
           "x-dsh-env": "DSH_SCHOLAR_SERVICE_TOKEN"
         },
         "db": {
           "type": "string",
           "description": "SQLite database path; empty = ephemeral temp database.",
           "default": "",
-          "x-dsh-scope": "kernel"
+          "x-dsh-key": "kernel.db",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "cas": {
           "type": "string",
           "description": "CAS root for immutable artifacts.",
           "default": ".research-cas",
-          "x-dsh-scope": "kernel"
+          "x-dsh-key": "kernel.cas",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
+        },
+        "secret_root": {
+          "type": "string",
+          "description": "Server-only SecretRef root for target identities, model credentials and SSH connection material; never returned in plaintext.",
+          "default": "",
+          "x-dsh-key": "kernel.secret_root",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
+          "x-dsh-secret": true,
+          "x-dsh-secret-input": "secret-ref",
+          "x-dsh-env": "DSH_SCHOLAR_SECRET_ROOT"
         },
         "endpoint_file": {
           "type": "string",
           "description": "0600 endpoint identity file written after bind (SIDE-01).",
           "default": "",
+          "x-dsh-key": "kernel.endpoint_file",
           "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-env": "DSH_SCHOLAR_KERNEL_ENDPOINT_FILE"
         },
         "require_signed_manifest": {
           "type": "boolean",
           "description": "Reject unsigned run manifests at completion (RUN-01: default true).",
           "default": true,
+          "x-dsh-key": "kernel.require_signed_manifest",
           "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "file",
+            "http",
+            "ui"
+          ],
+          "x-dsh-write-scopes": [
+            "runtime"
+          ],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "more-restrictive-only",
           "x-dsh-security-floor": true
+        },
+        "pty_idle_ttl_s": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "description": "Idle lifetime in seconds pinned into each newly opened PTY session; existing sessions are unchanged.",
+          "default": 900,
+          "x-dsh-key": "kernel.pty_idle_ttl_s",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "file",
+            "http",
+            "ui"
+          ],
+          "x-dsh-write-scopes": [
+            "runtime"
+          ],
+          "x-dsh-apply": "hot",
+          "x-dsh-security-merge": "replace"
+        },
+        "pty_retention_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 67108864,
+          "description": "Bounded output bytes pinned into each newly opened PTY session; existing replay windows are unchanged.",
+          "default": 1048576,
+          "x-dsh-key": "kernel.pty_retention_bytes",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "file",
+            "http",
+            "ui"
+          ],
+          "x-dsh-write-scopes": [
+            "runtime"
+          ],
+          "x-dsh-apply": "hot",
+          "x-dsh-security-merge": "replace"
+        },
+        "pty_lease_ttl_s": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "description": "Lease lifetime in seconds pinned into each newly opened PTY session; existing lease expiry is unchanged.",
+          "default": 3600,
+          "x-dsh-key": "kernel.pty_lease_ttl_s",
+          "x-dsh-scope": "kernel",
+          "x-dsh-sources": [
+            "file",
+            "http",
+            "ui"
+          ],
+          "x-dsh-write-scopes": [
+            "runtime"
+          ],
+          "x-dsh-apply": "hot",
+          "x-dsh-security-merge": "replace"
         }
       },
       "additionalProperties": false
@@ -441,7 +993,16 @@
           "minLength": 1,
           "description": "Standalone BFF listen host.",
           "default": "127.0.0.1",
+          "x-dsh-key": "standalone.host",
           "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-env": "DSH_SCHOLAR_STANDALONE_HOST"
         },
         "port": {
@@ -450,7 +1011,16 @@
           "maximum": 65535,
           "description": "Standalone BFF listen port.",
           "default": 18610,
+          "x-dsh-key": "standalone.port",
           "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-env": "DSH_SCHOLAR_STANDALONE_PORT"
         },
         "kernel_port": {
@@ -459,42 +1029,94 @@
           "maximum": 65535,
           "description": "Shared Research Kernel port used by both DSH and the standalone BFF.",
           "default": 7412,
+          "x-dsh-key": "standalone.kernel_port",
           "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-env": "DSH_SCHOLAR_STANDALONE_KERNEL_PORT"
         },
         "kernel_data_dir": {
           "type": "string",
           "description": "Authoritative shared Kernel data directory; empty = $DSH_HOME/research-kernel or ~/.dsh/research-kernel.",
           "default": "",
+          "x-dsh-key": "standalone.kernel_data_dir",
           "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-env": "DSH_SCHOLAR_KERNEL_DATA"
         },
         "data_dir": {
           "type": "string",
           "description": "Standalone BFF state directory (browser token/session/model only); empty = $DSH_HOME/research-ui-standalone or ~/.dsh-scholar-standalone/research-ui-standalone.",
           "default": "",
+          "x-dsh-key": "standalone.data_dir",
           "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
           "x-dsh-env": "DSH_SCHOLAR_STANDALONE_DATA"
         },
         "token": {
           "type": "string",
-          "description": "Loopback bearer token; auto-generated and persisted 0600 when empty.",
+          "description": "Loopback bearer token; auto-generated and persisted in a 0600 managed file, never argv.",
           "default": "",
+          "x-dsh-key": "standalone.token",
           "x-dsh-scope": "standalone",
-          "x-dsh-secret": true
+          "x-dsh-sources": [
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace",
+          "x-dsh-secret": true,
+          "x-dsh-secret-input": "secret-ref"
         },
         "principal": {
           "type": "string",
           "description": "Operator principal identity (GOV-01 local resolver).",
           "default": "",
-          "x-dsh-scope": "standalone"
+          "x-dsh-key": "standalone.principal",
+          "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "replace"
         },
         "frame_ancestors": {
           "type": "string",
           "minLength": 1,
           "description": "Comma-separated exact HTTPS or loopback-HTTP DSH origins allowed by CSP frame-ancestors; no wildcard, path, query, fragment, or credentials.",
           "default": "http://127.0.0.1:3080,http://localhost:3080,http://[::1]:3080",
+          "x-dsh-key": "standalone.frame_ancestors",
           "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "env",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "more-restrictive-only",
           "x-dsh-security-floor": true,
           "x-dsh-env": "DSH_SCHOLAR_STANDALONE_FRAME_ANCESTORS"
         },
@@ -502,7 +1124,15 @@
           "type": "boolean",
           "description": "Tokenless mode — loopback bind only (127.0.0.0/8, ::1, localhost).",
           "default": false,
+          "x-dsh-key": "standalone.no_token",
           "x-dsh-scope": "standalone",
+          "x-dsh-sources": [
+            "cli",
+            "file"
+          ],
+          "x-dsh-write-scopes": [],
+          "x-dsh-apply": "restart",
+          "x-dsh-security-merge": "more-restrictive-only",
           "x-dsh-security-floor": true
         }
       },

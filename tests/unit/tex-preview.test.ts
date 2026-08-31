@@ -48,6 +48,18 @@ function fenceArgs(kernel: ResearchKernel, jobId: string): { lease_generation: n
   return { lease_generation: j.lease_generation, lease_token: j.lease_token }
 }
 
+function manifestIdentity(kernel: ResearchKernel, jobId: string): Record<string, unknown> {
+  const job = kernel.getJob(jobId)
+  return {
+    run_id: job.run_id,
+    job_id: job.job_id,
+    project_id: job.project_id,
+    contract_id: job.contract_id,
+    config_pin: job.payload.project_config_pin,
+    lease: { generation: job.lease_generation },
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -220,7 +232,7 @@ describe('TEX-03 preview: supersede + stale semantics', () => {
         owner: 'test-runner',
         ...fenceArgs(kernel, first.job!.job_id),
         status: 'succeeded',
-        run_manifest: { run_id: kernel.getJob(first.job!.job_id).run_id!, job_id: first.job!.job_id, exit_code: 0, tex_diagnostics: [] },
+        run_manifest: { ...manifestIdentity(kernel, first.job!.job_id), exit_code: 0, tex_diagnostics: [] },
       })
       throw new Error('expected job_not_running')
     } catch (error) {
@@ -244,8 +256,8 @@ describe('TEX-03 preview: supersede + stale semantics', () => {
       status: 'succeeded',
       run_manifest: {
         // §5 RUN-REMOTE-01: secure kinds 必须携带 claim 的 run_id + metrics_artifact。
-        run_id: kernel.getJob(first.job!.job_id).run_id!,
-        job_id: first.job!.job_id, project_id, exit_code: 0,
+        ...manifestIdentity(kernel, first.job!.job_id),
+        exit_code: 0,
         metrics_artifact: log.artifact_id,
         container_digest: `docker:${kernel.getJob(first.job!.job_id).image_digest}`,
         tex_pdf_artifact: pdf.artifact_id, tex_log_artifact: log.artifact_id,
@@ -337,8 +349,8 @@ describe('TEX-03 preview: authoritative separation', () => {
       ...fenceArgs(kernel, preview.job!.job_id),
       status: 'succeeded',
       run_manifest: {
-        run_id: kernel.getJob(preview.job!.job_id).run_id!,
-        job_id: preview.job!.job_id, project_id, exit_code: 0,
+        ...manifestIdentity(kernel, preview.job!.job_id),
+        exit_code: 0,
         metrics_artifact: log.artifact_id,
         container_digest: `docker:${kernel.getJob(preview.job!.job_id).image_digest}`,
         tex_pdf_artifact: pdf.artifact_id, tex_log_artifact: log.artifact_id,

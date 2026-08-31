@@ -1,7 +1,7 @@
 /**
  * GUIDE-01 NextAction v2 card model (gui-plugin-plan §5.1, api-contracts.md
- * §21): PURE logic that turns one structured kernel action (or a legacy
- * projection) into what the Overview card should look like. No DOM — the
+ * §21): PURE logic that turns one structured kernel action into what the
+ * Overview card should look like. No DOM — the
  * panel layer (panels/overview.ts) only assembles nodes from this model.
  *
  * Rendering rules (api-contracts.md §21 — UI 只负责翻译 label 与路由):
@@ -218,21 +218,14 @@ export function nextActionCardModel(
   }
 }
 
-/**
- * Backward-compatible input resolution (acceptance §8 ui-guide): the v2
- * structured projection wins when present (even empty → clean "none" state);
- * older kernels that only emit `next_actions: string[]` keep working.
- * A malformed v2 field (mixed types) degrades to the legacy path.
- */
-export type NextActionInput =
-  | { kind: 'v2'; actions: NextActionV2[] }
-  | { kind: 'legacy'; labels: string[] }
+/** Resolve only the structured authority. Missing or malformed wire data is
+ * a safe empty state; labels are never reinterpreted as executable actions. */
+export interface NextActionInput { actions: NextActionV2[] }
 
-export function resolveNextActionInput(p: Pick<Projection, 'next_actions' | 'next_actions_v2'>): NextActionInput {
+export function resolveNextActionInput(p: Pick<Projection, 'next_actions_v2'>): NextActionInput {
   const v2 = p.next_actions_v2
   if (Array.isArray(v2) && v2.every(a => typeof a === 'object' && a !== null && typeof (a as NextActionV2).code === 'string')) {
-    return { kind: 'v2', actions: v2 as NextActionV2[] }
+    return { actions: v2 as NextActionV2[] }
   }
-  const legacy = (p.next_actions ?? []).filter((s): s is string => typeof s === 'string' && s !== '')
-  return { kind: 'legacy', labels: legacy }
+  return { actions: [] }
 }

@@ -33,6 +33,8 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   ConfigRegistryError,
+  computeProfileConfigHash,
+  getRunnerProfile,
   parseCli,
   validateConfig,
   type AgentClaimRequest,
@@ -98,6 +100,7 @@ function sha256HexBytes(bytes: Buffer): string {
 
 /** secure kinds 的 output contract（metrics 路径；fake executor 据此写 MetricsFileV1）。 */
 const OUT = { metrics: 'metrics.json' }
+const REMOTE_PROFILE = getRunnerProfile('profile_local_docker_cpu_v1')!
 
 interface RecordedFrame {
   job_id: string
@@ -135,6 +138,17 @@ class FakeFleetKernel implements FleetKernelClient {
   readonly completes: RecordedComplete[] = []
   manifestPublicKeyPem: string | null = null
 
+  async getRunnerTarget(targetId: string) {
+    return {
+      target_id: targetId,
+      kind: 'remote-ssh' as const,
+      enabled: true,
+      draining: false,
+      revision: 1,
+      config_hash: `sha256:${'7'.repeat(64)}`,
+    }
+  }
+
   seedJob(overrides: Partial<JobRecord> & { job_id: string; project_id: string } & Record<string, unknown>): JobRecord & { run_id?: string | null } {
     const record: JobRecord & { run_id?: string | null } = {
       contract_id: null,
@@ -156,6 +170,18 @@ class FakeFleetKernel implements FleetKernelClient {
       created_at: '2026-08-11T00:00:00.000Z',
       updated_at: '2026-08-11T00:00:00.000Z',
       ...overrides,
+    }
+    record.payload = {
+      project_config_pin: `sha256:${'4'.repeat(64)}`,
+      runner_target_id: 'remote-gpu-1',
+      runner_target_kind: 'remote-ssh',
+      runner_target_revision: 1,
+      runner_target_hash: `sha256:${'7'.repeat(64)}`,
+      runner_profile_id: REMOTE_PROFILE.profile_id,
+      profile_config_hash: computeProfileConfigHash(REMOTE_PROFILE),
+      image_digest: REMOTE_PROFILE.image,
+      runner_compute: { mode: 'cpu' },
+      ...(record.payload ?? {}),
     }
     this.jobs.set(record.job_id, record)
     return record
@@ -623,7 +649,7 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
 
   it('无匹配 target → 任务留在服务端 pending（retryable，不静默改派）；匹配 agent 后拿到同一 Job', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_nomatch', project_id: 'prj_1', payload: { target_id: 'other-target', image_digest: DIGEST } })
+    fixture.kernel.seedJob({ job_id: 'job_nomatch', project_id: 'prj_1', payload: { runner_target_id: 'other-target', image_digest: DIGEST } })
     const { server, baseUrl } = await startFleetServer(fixture.fleet)
     try {
       const wrongAgent = createRemoteRunnerAgent(
@@ -656,7 +682,7 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
 
   it('全链（真实 HTTP）：runFleetAgentMain 客户端循环 register→heartbeat→claim→执行→frames/artifacts/complete', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_cli', project_id: 'prj_1', payload: { target_id: 'local-docker', image_digest: DIGEST, output_contract: OUT } })
+    fixture.kernel.seedJob({ job_id: 'job_cli', project_id: 'prj_1', payload: { runner_target_id: 'local-docker', image_digest: DIGEST, output_contract: OUT } })
     const { server, baseUrl } = await startFleetServer(fixture.fleet)
     try {
       const agentKey = makeKeypair('agent-cli')
@@ -696,7 +722,7 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
 
   it('离线 spool 恢复（HTTP 层）：断网期间全量进本地有界 spool，恢复后按序重放完成 Job', async () => {
     const fixture = makeFleet()
-    fixture.kernel.seedJob({ job_id: 'job_spool_http', project_id: 'prj_1', payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
+    fixture.kernel.seedJob({ job_id: 'job_spool_http', project_id: 'prj_1', payload: { runner_target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT } })
     const { server, baseUrl } = await startFleetServer(fixture.fleet)
     try {
       const failing = new FailingFleetTransport(new HttpRemoteFleetTransport(baseUrl))
@@ -768,7 +794,18 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
       if ((req.method ?? 'GET') === 'POST' && (req.url ?? '').startsWith('/v1/jobs-claim/run')) {
         const job: JobRecord & { run_id?: string | null } = {
           job_id: 'job_bearer', project_id: 'prj_1', contract_id: null, idempotency_key: 'ik-bearer',
-          kind: 'formal', command: [], payload: { target_id: 'remote-gpu-1', image_digest: DIGEST, output_contract: OUT },
+          kind: 'formal', command: [], payload: {
+            project_config_pin: `sha256:${'4'.repeat(64)}`,
+            runner_target_id: 'remote-gpu-1',
+            runner_target_kind: 'remote-ssh',
+            runner_target_revision: 1,
+            runner_target_hash: `sha256:${'7'.repeat(64)}`,
+            runner_profile_id: REMOTE_PROFILE.profile_id,
+            profile_config_hash: computeProfileConfigHash(REMOTE_PROFILE),
+            image_digest: DIGEST,
+            runner_compute: { mode: 'cpu' },
+            output_contract: OUT,
+          },
           status: 'running', failure_class: null, lease_owner: 'fleet-owner', lease_expires_at: '2099-01-01T00:00:00.000Z',
           heartbeat_at: null, lease_generation: 1, lease_token: 'lt-1', attempts: 1, max_attempts: 3,
           run_manifest: null, error: '', created_at: '2026-08-11T00:00:00.000Z', updated_at: '2026-08-11T00:00:00.000Z',
@@ -776,6 +813,14 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
         }
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify([job]))
+        return
+      }
+      if ((req.method ?? 'GET') === 'GET' && (req.url ?? '').startsWith('/v1/runner-targets/')) {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          target_id: 'remote-gpu-1', kind: 'remote-ssh', enabled: true, draining: false,
+          revision: 1, config_hash: `sha256:${'7'.repeat(64)}`,
+        }))
         return
       }
       res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(bytes.byteLength) })

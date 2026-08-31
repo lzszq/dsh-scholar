@@ -19,6 +19,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ResearchKernel } from '../../packages/research-kernel/src/kernel'
+import type { PtyAdapter } from '../../packages/research-kernel/src/pty-session'
 import { startKernelServer } from '../../packages/research-kernel/src/server'
 import { PtyClientModel, type PtyResult, type PtySessionWire } from '../../packages/dsh-research-ui/src/client/pty-session-model'
 import { WorkspaceWatchClient, applyWorkspaceListSince, initialWorkspaceTreeState } from '../../packages/dsh-research-ui/src/client/workspace-model'
@@ -66,29 +67,59 @@ async function until(fn: () => boolean, timeoutMs = 6000): Promise<void> {
 describe('SSE-01 client ↔ kernel integration (real SSE endpoints)', () => {
   it('PTY: PtyClientModel consumes the real frames/stream (live tail + exit end)', async () => {
     const kernel = freshKernel()
-    const project = kernel.createProject({ name: 'p', workspace: '/w', brief: makeBrief(), creator_principal_id: 'pi-1' } as never)
+    const adapter: PtyAdapter = {
+      id: 'local-pty',
+      spawn: () => ({ ok: true }),
+      write: () => {}, resize: () => {}, signal: () => {}, kill: () => {},
+    }
+    kernel.setPtyAdapter(adapter)
+    const project = kernel.createProject({
+      name: 'p', workspace: '/w', brief: makeBrief(), creator_principal_id: 'pi-1',
+      execution: {
+        runner_profile_id: 'profile_isolated_subprocess_v1',
+        runner_target_id: 'target_local_process_v1',
+        network_policy: 'none', artifact_store: 'local-cas', fixture_id: null,
+      },
+    } as never)
     const ws = kernel.workspaceEnsure(project.project_id, 'scratch', 's')
+    const contextProjection = kernel.ptyContexts(project.project_id, 'pi-1')
+      .find(candidate => candidate.context_kind === 'research')!
+    const context = kernel.ptyResolveContext(contextProjection.context_id, 'pi-1')
     // A fresh kernel has no PTY adapter (HTTP open → 501); open the session
     // via the kernel API and let the model's transport serve that row — the
     // FRAMES STREAM (the part under test) is the real HTTP route.
     const session = kernel.ptyOpen({
-      project_id: project.project_id,
+      context_id: context.context_id,
       workspace_id: ws.workspace_id,
-      profile: 'local-docker-cpu',
-      target: 'target-1',
+      label: 'SSE client shell',
+      purpose: 'exercise the browser stream client',
       preset: 'bash',
-      cwd: 'scratch',
+      cwd: '.',
       cols: 80,
       rows: 24,
-    } as never, { principal: { principal_id: 'pi-1' }, adapter: null })
+    }, { context })
     const { server, url } = await startKernelServer({ kernel, port: 0 })
     try {
       const base = url.replace(/\/$/, '')
       const fetchImpl = sseFetch(base, 'pi-1')
       const transport = {
         open: async (): Promise<PtyResult<PtySessionWire>> => ({ ok: true, data: session }),
-        getSession: async (sessionId: string): Promise<PtyResult<PtySessionWire>> => {
-          const response = await fetch(`${base}/v1/pty/sessions/${sessionId}`, { headers: { 'x-principal-id': 'pi-1' } })
+        attach: async (sessionId: string, _lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> => ({
+          ok: true,
+          data: kernel.ptyAttach(sessionId, context, expectedGeneration),
+        }),
+        detach: async (sessionId: string, _lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> => ({
+          ok: true,
+          data: kernel.ptyDetach(sessionId, context, expectedGeneration),
+        }),
+        close: async (sessionId: string, _lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> => ({
+          ok: true,
+          data: kernel.ptyClose(sessionId, context, expectedGeneration),
+        }),
+        getSession: async (sessionId: string, lease: string, expectedGeneration: number): Promise<PtyResult<PtySessionWire>> => {
+          const response = await fetch(`${base}/v1/pty/sessions/${sessionId}?expected_generation=${expectedGeneration}`, {
+            headers: { 'x-principal-id': 'pi-1', 'x-pty-lease': lease },
+          })
           return response.ok ? { ok: true, data: await response.json() as PtySessionWire } : { ok: false, error: { code: 'http_error', status: response.status } }
         },
         control: async (): Promise<PtyResult<{ delivered?: boolean }>> => ({ ok: true, data: {} }),
@@ -100,12 +131,12 @@ describe('SSE-01 client ↔ kernel integration (real SSE endpoints)', () => {
         sessionRefreshEvery: 0,
       })
       const ok = await model.open({
-        project_id: project.project_id,
+        context_id: context.context_id,
         workspace_id: ws.workspace_id,
-        profile: 'local-docker-cpu',
-        target: 'target-1',
+        label: 'SSE client shell',
+        purpose: 'exercise the browser stream client',
         preset: 'bash',
-        cwd: 'scratch',
+        cwd: '.',
         cols: 80,
         rows: 24,
       })

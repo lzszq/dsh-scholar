@@ -4,6 +4,11 @@ import {
   SCHOLAR_CHAT_MAX_IMAGES,
   type ScholarChatImage,
 } from '@dsh-scholar/research-schemas/chat-agent'
+import {
+  ChatScopeTombstoneRegistry,
+  chatScopeKey,
+  chatScopeTombstoneRegistry,
+} from './chat-scope-abort'
 
 const CHAT_VISION_MEDIA_TYPES = new Set<ScholarChatImage['mediaType']>([
   ...SCHOLAR_CHAT_IMAGE_MEDIA_TYPES,
@@ -57,16 +62,15 @@ function assertBrowserBatch(files: readonly BrowserImageFile[]): void {
 export class ChatVisionTurnStore {
   private readonly scopes = new Map<string, Map<string, BrowserImageFile>>()
 
-  private scopeKey(projectId: string, sessionId: string): string {
-    return JSON.stringify([projectId, sessionId])
-  }
+  constructor(private readonly tombstones = new ChatScopeTombstoneRegistry()) {}
 
   stage(projectId: string, sessionId: string, fileId: string, file: BrowserImageFile): void {
     this.stageBatch(projectId, sessionId, [{ fileId, file }])
   }
 
   stageBatch(projectId: string, sessionId: string, items: readonly QueuedChatVisionImage[]): void {
-    const key = this.scopeKey(projectId, sessionId)
+    if (this.tombstones.closed(projectId, sessionId)) return
+    const key = chatScopeKey(projectId, sessionId)
     const next = new Map(this.scopes.get(key) ?? [])
     for (const { fileId, file } of items) {
       if (!isChatVisionImage(file)) throw new ChatVisionInputError('vision_image_rejected')
@@ -77,7 +81,8 @@ export class ChatVisionTurnStore {
   }
 
   list(projectId: string, sessionId: string): QueuedChatVisionImage[] {
-    const scope = this.scopes.get(this.scopeKey(projectId, sessionId))
+    if (this.tombstones.closed(projectId, sessionId)) return []
+    const scope = this.scopes.get(chatScopeKey(projectId, sessionId))
     return scope === undefined
       ? []
       : [...scope].map(([fileId, file]) => ({ fileId, file }))
@@ -93,7 +98,7 @@ export class ChatVisionTurnStore {
   }
 
   consume(projectId: string, sessionId: string, fileIds: readonly string[]): void {
-    const key = this.scopeKey(projectId, sessionId)
+    const key = chatScopeKey(projectId, sessionId)
     const scope = this.scopes.get(key)
     if (scope === undefined) return
     for (const fileId of fileIds) scope.delete(fileId)
@@ -105,7 +110,7 @@ export class ChatVisionTurnStore {
   }
 
   clear(projectId: string, sessionId: string): void {
-    this.scopes.delete(this.scopeKey(projectId, sessionId))
+    this.scopes.delete(chatScopeKey(projectId, sessionId))
   }
 
   clearProject(projectId: string): void {
@@ -116,7 +121,7 @@ export class ChatVisionTurnStore {
   }
 }
 
-export const chatVisionTurnStore = new ChatVisionTurnStore()
+export const chatVisionTurnStore = new ChatVisionTurnStore(chatScopeTombstoneRegistry)
 
 export function isChatVisionImage(file: Pick<BrowserImageFile, 'type'>): file is Pick<BrowserImageFile, 'type'> & { type: ScholarChatImage['mediaType'] } {
   return CHAT_VISION_MEDIA_TYPES.has(file.type as ScholarChatImage['mediaType'])

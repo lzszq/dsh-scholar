@@ -1,0 +1,24 @@
+{
+  "name": "@dsh-scholar/analysis-engine",
+  "version": "0.1.0",
+  "description": "Pure deterministic statistics engine shared by DSH Scholar analysis adapters.",
+  "type": "module",
+  "license": "BSD-3-Clause",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}

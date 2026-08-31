@@ -4,7 +4,7 @@
   "description": "DSH Research OS — a fully automated scientific research plugin for DSH (DeepSeek Harness): survey, idea, experiment contract, durable runner jobs, claim-evidence ledger, manuscript and release bundle.",
   "packageManager": "pnpm@11.20.0",
   "type": "module",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "private": true,
   "files": [
     "lib",
@@ -154,6 +154,7 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
+    "yaml": "2.9.0",
     "@dsh-scholar/runner-gateway": "workspace:^",
     "react": "^18.2.0"
   },

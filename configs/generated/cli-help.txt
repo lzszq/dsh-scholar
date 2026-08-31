@@ -13,8 +13,6 @@ Options (runner-profile):
   --cancel-poll-ms <number> — Cancel-watcher poll interval (terminates the real execution).
   --owner <string> — Lease owner identity; a random runner-<id> is generated when empty.
   --key-file <string> — Ed25519 signing key file (0600); an ephemeral key is generated when absent.
-  --token <secret> [secret] — Kernel bearer token for the runner client.
-  --service-token <secret> [secret] — Service identity for internal kernel routes. (env: DSH_SCHOLAR_SERVICE_TOKEN)
   --fleet-server <number> — Fleet server listen port (0 = ephemeral); when provided the runner runs RemoteFleetServer instead of the local claim loop.
   --agent <string> — Fleet server base URL; when provided the runner runs as a remote fleet agent instead of the local claim loop.
   --agent-id <string> — Agent identity registered with the fleet server; generated agent-<id> when empty.
@@ -37,10 +35,9 @@ Options (orchestrator):
 Options (kernel):
   --host <string> — Kernel HTTP listen host. (default: 127.0.0.1)
   --port <number> — Kernel HTTP listen port (0 = ephemeral, published via endpoint file).
-  --token <secret> [secret] — Kernel bearer token; never logged, never in argv when the env path is used. (env: DSH_SCHOLAR_KERNEL_TOKEN)
-  --service-token <secret> [secret] — Internal-route service identity (x-service-token). (env: DSH_SCHOLAR_SERVICE_TOKEN)
   --db <string> — SQLite database path; empty = ephemeral temp database.
   --cas <string> — CAS root for immutable artifacts. (default: .research-cas)
+  --secret-root <secret> [secret] — Server-only SecretRef root for target identities, model credentials and SSH connection material; never returned in plaintext. (env: DSH_SCHOLAR_SECRET_ROOT)
   --endpoint-file <string> — 0600 endpoint identity file written after bind (SIDE-01). (env: DSH_SCHOLAR_KERNEL_ENDPOINT_FILE)
 
 Options (standalone):
@@ -49,7 +46,6 @@ Options (standalone):
   --kernel-port <number> — Shared Research Kernel port used by both DSH and the standalone BFF. (env: DSH_SCHOLAR_STANDALONE_KERNEL_PORT)
   --kernel-data-dir <string> — Authoritative shared Kernel data directory; empty = $DSH_HOME/research-kernel or ~/.dsh/research-kernel. (env: DSH_SCHOLAR_KERNEL_DATA)
   --data-dir <string> — Standalone BFF state directory (browser token/session/model only); empty = $DSH_HOME/research-ui-standalone or ~/.dsh-scholar-standalone/research-ui-standalone. (env: DSH_SCHOLAR_STANDALONE_DATA)
-  --token <secret> [secret] — Loopback bearer token; auto-generated and persisted 0600 when empty.
   --principal <string> — Operator principal identity (GOV-01 local resolver).
   --frame-ancestors <string> — Comma-separated exact HTTPS or loopback-HTTP DSH origins allowed by CSP frame-ancestors; no wildcard, path, query, fragment, or credentials. (default: http://127.0.0.1:3080,http://localhost:3080,http://[::1]:3080) (env: DSH_SCHOLAR_STANDALONE_FRAME_ANCESTORS)
   --no-token <boolean> — Tokenless mode — loopback bind only (127.0.0.0/8, ::1, localhost).

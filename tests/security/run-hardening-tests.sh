@@ -274,15 +274,18 @@ kill "$RUNNER2_PID" "$KERNEL2_PID" 2>/dev/null || true
 # (The kernel answers 422 principal_required / 403 pty_principal_mismatch /
 # 403 lease_required / 403 lease_invalid; unknown sessions stay 404.)
 echo "== direct-kernel pty fencing (principal + owner + lease) =="
-PTYP=$(api -X POST "http://127.0.0.1:$PORT/v1/projects" -d "{\"name\":\"pty-fence\",\"workspace\":\"/w/pty\",\"creator_principal_id\":\"pty-owner\",\"brief\":$BRIEF}" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).project_id))")
+PTYP=$(api -X POST "http://127.0.0.1:$PORT/v1/projects" -d "{\"name\":\"pty-fence\",\"workspace\":\"/w/pty\",\"creator_principal_id\":\"pty-owner\",\"brief\":$BRIEF,\"execution\":{\"runner_profile_id\":\"profile_isolated_subprocess_v1\",\"runner_target_id\":\"target_local_process_v1\",\"network_policy\":\"none\",\"artifact_store\":\"local-cas\"}}" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).project_id))")
 [[ -n "$PTYP" ]] && ok "pty-fence project created ($PTYP)" || bad "pty-fence project create"
 PTYWS=$(api -X POST "http://127.0.0.1:$PORT/v1/projects/$PTYP/workspaces" -d '{"kind":"scratch","name":"s"}' | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).workspace_id||''))")
 [[ -n "$PTYWS" ]] && ok "pty-fence workspace created ($PTYWS)" || bad "pty-fence workspace create"
+PTY_CONTEXT=$(curl -s "http://127.0.0.1:$PORT/v1/pty/contexts?project_id=$PTYP" -H 'x-principal-id: pty-owner' \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);console.log((Array.isArray(a)?a:[]).find(x=>x.context_kind==='research')?.context_id||'')})")
 PTY_OPEN=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/pty/sessions" -H 'content-type: application/json' -H 'x-principal-id: pty-owner' \
-  -d "{\"project_id\":\"$PTYP\",\"workspace_id\":\"$PTYWS\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\"}")
+  -d "{\"context_id\":\"$PTY_CONTEXT\",\"workspace_id\":\"$PTYWS\",\"label\":\"hardening owner shell\",\"purpose\":\"PTY fencing test\",\"preset\":\"sh\",\"cwd\":\".\"}")
 PTY_ID=$(printf '%s' "$PTY_OPEN" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).pty_session_id||''))")
 PTY_LEASE=$(printf '%s' "$PTY_OPEN" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).lease_token||''))")
-if [[ -n "$PTY_ID" && -n "$PTY_LEASE" ]]; then
+PTY_GEN=$(printf '%s' "$PTY_OPEN" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).generation||''))")
+if [[ -n "$PTY_ID" && -n "$PTY_LEASE" && -n "$PTY_GEN" ]]; then
   ok "pty session opened via kernel ($PTY_ID, lease pinned at open)"
 else
   bad "pty open via kernel (got: $(printf '%s' "$PTY_OPEN" | head -c 160))"
@@ -290,55 +293,58 @@ fi
 
 code_of() { node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).error?.code||'')}catch(e){console.log('')}})"; }
 # GET session / frames / control without principal -> 422 principal_required.
-for PTY_URL in "$PORT/v1/pty/sessions/$PTY_ID" "$PORT/v1/pty/sessions/$PTY_ID/frames?after_seq=0"; do
-  OUT=$(curl -s -w '\n%{http_code}' "http://127.0.0.1:$PTY_URL")
+for PTY_URL in "$PORT/v1/pty/sessions/$PTY_ID?expected_generation=$PTY_GEN" "$PORT/v1/pty/sessions/$PTY_ID/frames?after_seq=0&expected_generation=$PTY_GEN"; do
+  OUT=$(curl -s -w '\n%{http_code}' -H "x-pty-lease: $PTY_LEASE" "http://127.0.0.1:$PTY_URL")
   R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
   [[ "$R" == "422" && "$C" == "principal_required" ]] && ok "GET $PTY_URL without principal -> 422 principal_required" || bad "no-principal GET expected 422 principal_required, got HTTP $R ($C)"
 done
-OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -d '{"client_seq":1,"type":"bytes","payload":{"text":"x","byte_length":1}}' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
+OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H "x-pty-lease: $PTY_LEASE" -d "{\"expected_generation\":$PTY_GEN,\"client_seq\":1,\"type\":\"bytes\",\"payload\":{\"text\":\"x\",\"byte_length\":1}}" "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
 R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
 [[ "$R" == "422" && "$C" == "principal_required" ]] && ok "control without principal -> 422 principal_required" || bad "no-principal control expected 422, got HTTP $R ($C)"
 # Wrong owner -> 403 pty_principal_mismatch on GET / frames / control.
-for PTY_URL in "$PORT/v1/pty/sessions/$PTY_ID" "$PORT/v1/pty/sessions/$PTY_ID/frames?after_seq=0"; do
-  OUT=$(curl -s -w '\n%{http_code}' -H 'x-principal-id: evil' "http://127.0.0.1:$PTY_URL")
+for PTY_URL in "$PORT/v1/pty/sessions/$PTY_ID?expected_generation=$PTY_GEN" "$PORT/v1/pty/sessions/$PTY_ID/frames?after_seq=0&expected_generation=$PTY_GEN"; do
+  OUT=$(curl -s -w '\n%{http_code}' -H 'x-principal-id: evil' -H "x-pty-lease: $PTY_LEASE" "http://127.0.0.1:$PTY_URL")
   R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
   [[ "$R" == "403" && "$C" == "pty_principal_mismatch" ]] && ok "GET $PTY_URL as non-owner -> 403 pty_principal_mismatch" || bad "non-owner GET expected 403, got HTTP $R ($C)"
 done
-OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: evil' -H "x-pty-lease: $PTY_LEASE" -d '{"client_seq":1,"type":"bytes","payload":{"text":"x","byte_length":1}}' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
+OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: evil' -H "x-pty-lease: $PTY_LEASE" -d "{\"expected_generation\":$PTY_GEN,\"client_seq\":1,\"type\":\"bytes\",\"payload\":{\"text\":\"x\",\"byte_length\":1}}" "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
 R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
 [[ "$R" == "403" && "$C" == "pty_principal_mismatch" ]] && ok "control as non-owner -> 403 pty_principal_mismatch" || bad "non-owner control expected 403, got HTTP $R ($C)"
 # Control without lease -> 403 lease_required; with wrong lease -> 403 lease_invalid.
-OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -d '{"client_seq":1,"type":"bytes","payload":{"text":"x","byte_length":1}}' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
+OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -d "{\"expected_generation\":$PTY_GEN,\"client_seq\":1,\"type\":\"bytes\",\"payload\":{\"text\":\"x\",\"byte_length\":1}}" "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
 R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
 [[ "$R" == "403" && "$C" == "lease_required" ]] && ok "control without lease -> 403 lease_required" || bad "no-lease control expected 403 lease_required, got HTTP $R ($C)"
-OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -H 'x-pty-lease: lease_wrong' -d '{"client_seq":1,"type":"bytes","payload":{"text":"x","byte_length":1}}' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
+OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -H 'x-pty-lease: lease_wrong' -d "{\"expected_generation\":$PTY_GEN,\"client_seq\":1,\"type\":\"bytes\",\"payload\":{\"text\":\"x\",\"byte_length\":1}}" "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
 R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
 [[ "$R" == "403" && "$C" == "lease_invalid" ]] && ok "control with wrong lease -> 403 lease_invalid" || bad "wrong-lease control expected 403 lease_invalid, got HTTP $R ($C)"
 # Frames: lease optional, but a wrong lease is 403 lease_invalid.
-OUT=$(curl -s -w '\n%{http_code}' -H 'x-principal-id: pty-owner' -H 'x-pty-lease: lease_wrong' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/frames?after_seq=0")
+OUT=$(curl -s -w '\n%{http_code}' -H 'x-principal-id: pty-owner' -H 'x-pty-lease: lease_wrong' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/frames?after_seq=0&expected_generation=$PTY_GEN")
 R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
 [[ "$R" == "403" && "$C" == "lease_invalid" ]] && ok "frames with wrong lease -> 403 lease_invalid" || bad "wrong-lease frames expected 403 lease_invalid, got HTTP $R ($C)"
 # Cross-project control: a session of ANOTHER project (owned by pty-owner2)
 # is 403 for pty-owner — ownership is pinned at open, not project membership.
-PTYP2=$(api -X POST "http://127.0.0.1:$PORT/v1/projects" -d "{\"name\":\"pty-fence-2\",\"workspace\":\"/w/pty2\",\"creator_principal_id\":\"pty-owner2\",\"brief\":$BRIEF}" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).project_id))")
+PTYP2=$(api -X POST "http://127.0.0.1:$PORT/v1/projects" -d "{\"name\":\"pty-fence-2\",\"workspace\":\"/w/pty2\",\"creator_principal_id\":\"pty-owner2\",\"brief\":$BRIEF,\"execution\":{\"runner_profile_id\":\"profile_isolated_subprocess_v1\",\"runner_target_id\":\"target_local_process_v1\",\"network_policy\":\"none\",\"artifact_store\":\"local-cas\"}}" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).project_id))")
 PTYWS2=$(api -X POST "http://127.0.0.1:$PORT/v1/projects/$PTYP2/workspaces" -d '{"kind":"scratch","name":"s"}' | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).workspace_id||''))")
+PTY_CONTEXT2=$(curl -s "http://127.0.0.1:$PORT/v1/pty/contexts?project_id=$PTYP2" -H 'x-principal-id: pty-owner2' \
+  | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const a=JSON.parse(d);console.log((Array.isArray(a)?a:[]).find(x=>x.context_kind==='research')?.context_id||'')})")
 PTY_OPEN2=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/pty/sessions" -H 'content-type: application/json' -H 'x-principal-id: pty-owner2' \
-  -d "{\"project_id\":\"$PTYP2\",\"workspace_id\":\"$PTYWS2\",\"profile\":\"p\",\"target\":\"t\",\"preset\":\"sh\",\"cwd\":\".\"}")
+  -d "{\"context_id\":\"$PTY_CONTEXT2\",\"workspace_id\":\"$PTYWS2\",\"label\":\"hardening other shell\",\"purpose\":\"cross-project fencing test\",\"preset\":\"sh\",\"cwd\":\".\"}")
 PTY_ID2=$(printf '%s' "$PTY_OPEN2" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).pty_session_id||''))")
 PTY_LEASE2=$(printf '%s' "$PTY_OPEN2" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).lease_token||''))")
+PTY_GEN2=$(printf '%s' "$PTY_OPEN2" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).generation||''))")
 if [[ -n "$PTY_ID2" ]]; then
-  OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -H "x-pty-lease: $PTY_LEASE2" -d '{"client_seq":1,"type":"bytes","payload":{"text":"x","byte_length":1}}' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID2/control")
+  OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -H "x-pty-lease: $PTY_LEASE2" -d "{\"expected_generation\":$PTY_GEN2,\"client_seq\":1,\"type\":\"bytes\",\"payload\":{\"text\":\"x\",\"byte_length\":1}}" "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID2/control")
   R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
   [[ "$R" == "403" && "$C" == "pty_principal_mismatch" ]] && ok "cross-project control (other owner) -> 403 pty_principal_mismatch" || bad "cross-project control expected 403, got HTTP $R ($C)"
 else
   bad "second pty session open for cross-project test"
 fi
 # Unknown session id with a valid principal -> 404 (no enumeration).
-OUT=$(curl -s -w '\n%{http_code}' -H 'x-principal-id: pty-owner' "http://127.0.0.1:$PORT/v1/pty/sessions/pty_nope")
+OUT=$(curl -s -w '\n%{http_code}' -H 'x-principal-id: pty-owner' "http://127.0.0.1:$PORT/v1/pty/sessions/pty_nope?expected_generation=1")
 R=$(printf '%s' "$OUT" | tail -1); C=$(printf '%s' "$OUT" | sed '$d' | code_of)
 [[ "$R" == "404" && "$C" == "pty_session_not_found" ]] && ok "unknown pty session id -> 404 pty_session_not_found" || bad "unknown session expected 404, got HTTP $R ($C)"
 # Owner + correct lease still controls the session (positive control).
-OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -H "x-pty-lease: $PTY_LEASE" -d '{"client_seq":1,"type":"bytes","payload":{"text":"ok","byte_length":2}}' "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
+OUT=$(curl -s -w '\n%{http_code}' -X POST -H 'content-type: application/json' -H 'x-principal-id: pty-owner' -H "x-pty-lease: $PTY_LEASE" -d "{\"expected_generation\":$PTY_GEN,\"client_seq\":1,\"type\":\"bytes\",\"payload\":{\"text\":\"ok\",\"byte_length\":2}}" "http://127.0.0.1:$PORT/v1/pty/sessions/$PTY_ID/control")
 R=$(printf '%s' "$OUT" | tail -1)
 [[ "$R" == "200" ]] && ok "owner + correct lease control -> 200" || bad "owner control expected 200, got HTTP $R"
 
