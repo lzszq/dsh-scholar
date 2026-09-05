@@ -26,6 +26,8 @@ import type {
   RemoteCompleteResponse,
   RemoteFramesRequest,
   RemoteFramesResponse,
+  RemoteRunHeartbeatRequest,
+  RemoteRunHeartbeatResponse,
 } from '@dsh-scholar/research-schemas'
 import { FleetServerError, type RemoteFleetServer } from './remote-fleet-server.js'
 import { RemoteWireError, type RemoteFleetTransport } from './remote-agent.js'
@@ -65,6 +67,10 @@ export class InMemoryFleetTransport implements RemoteFleetTransport {
 
   claims(agentId: string, req: AgentClaimRequest): Promise<AgentClaimResponse> {
     return this.wrap(() => this.fleet.handleClaims(agentId, wireClone(req)))
+  }
+
+  heartbeatRun(agentId: string, runId: string, req: RemoteRunHeartbeatRequest): Promise<RemoteRunHeartbeatResponse> {
+    return this.wrap(() => this.fleet.handleRunHeartbeat(agentId, runId, wireClone(req)))
   }
 
   uploadFrames(agentId: string, runId: string, req: RemoteFramesRequest): Promise<RemoteFramesResponse> {
@@ -133,6 +139,11 @@ export class FailingFleetTransport implements RemoteFleetTransport {
   claims(agentId: string, req: AgentClaimRequest): Promise<AgentClaimResponse> {
     this.guard('claims')
     return this.inner.claims(agentId, req)
+  }
+
+  heartbeatRun(agentId: string, runId: string, req: RemoteRunHeartbeatRequest, signal?: AbortSignal): Promise<RemoteRunHeartbeatResponse> {
+    this.guard('heartbeatRun')
+    return this.inner.heartbeatRun(agentId, runId, req, signal)
   }
 
   uploadFrames(agentId: string, runId: string, req: RemoteFramesRequest): Promise<RemoteFramesResponse> {

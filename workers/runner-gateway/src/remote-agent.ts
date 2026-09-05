@@ -64,6 +64,8 @@ import {
   type RemoteFrame,
   type RemoteFramesRequest,
   type RemoteFramesResponse,
+  type RemoteRunHeartbeatRequest,
+  type RemoteRunHeartbeatResponse,
 } from '@dsh-scholar/research-schemas'
 import { AgentOutboundSpool, type AgentSpoolEntry } from './agent-spool.js'
 import {
@@ -113,7 +115,12 @@ export class RemoteWireError extends Error {
 
 /** 是否可 spool 重试的传输类错误（网络断开/服务端暂不可用；lease_stale 除外）。 */
 export function isSpoolableWireError(error: unknown): error is RemoteWireError {
-  return error instanceof RemoteWireError && error.retryable && error.code !== 'lease_stale'
+  return error instanceof RemoteWireError && error.retryable && !isTerminalWireError(error)
+}
+
+function isTerminalWireError(error: unknown): error is RemoteWireError {
+  return error instanceof RemoteWireError && ['lease_stale', 'lease_conflict', 'job_not_running',
+    'job_cancelled', 'claim_unknown', 'runner_target_stale'].includes(error.code)
 }
 
 /** 远端执行错误基类（环境类——调用方按 retryable 处理，不静默降级）。 */
@@ -134,8 +141,9 @@ export class RemoteRunnerAgentNotImplementedError extends RemoteRunnerAgentError
 export interface RemoteFleetTransport {
   readonly kind: string
   register(req: AgentRegisterRequest): Promise<AgentRegisterResponse>
-  heartbeat(agentId: string, req: AgentHeartbeatRequest): Promise<AgentHeartbeatResponse>
+  heartbeat(agentId: string, req: AgentHeartbeatRequest, signal?: AbortSignal): Promise<AgentHeartbeatResponse>
   claims(agentId: string, req: AgentClaimRequest): Promise<AgentClaimResponse>
+  heartbeatRun(agentId: string, runId: string, req: RemoteRunHeartbeatRequest, signal?: AbortSignal): Promise<RemoteRunHeartbeatResponse>
   uploadFrames(agentId: string, runId: string, req: RemoteFramesRequest): Promise<RemoteFramesResponse>
   stageArtifact(agentId: string, runId: string, req: RemoteArtifactStageRequest): Promise<RemoteArtifactStageResponse>
   finalizeArtifact(agentId: string, runId: string, req: RemoteArtifactFinalizeRequest): Promise<RemoteArtifactFinalizeResponse>
@@ -153,47 +161,59 @@ export class HttpRemoteFleetTransport implements RemoteFleetTransport {
 
   constructor(
     private readonly baseUrl: string,
-    private readonly options: { serviceToken?: string; timeoutMs?: number } = {},
+    private readonly options: { serviceToken?: string; runnerTargetToken?: string; timeoutMs?: number } = {},
   ) {}
 
-  private async call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     let response: Response
+    let responseText: string
     try {
       response = await fetch(`${this.baseUrl}${path}`, {
         method,
         headers: {
           'content-type': 'application/json',
           ...this.options.serviceToken !== undefined ? { 'x-service-token': this.options.serviceToken } : {},
+          ...this.options.runnerTargetToken !== undefined ? { 'x-runner-target-token': this.options.runnerTargetToken } : {},
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(this.options.timeoutMs ?? 15_000),
+        signal: signal === undefined ? AbortSignal.timeout(this.options.timeoutMs ?? 15_000)
+          : AbortSignal.any([signal, AbortSignal.timeout(this.options.timeoutMs ?? 15_000)]),
       })
+      // fetch resolves at the response headers. A disconnect or timeout
+      // while reading the body is still a retryable transport failure.
+      responseText = await response.text()
     } catch (error) {
       throw new RemoteWireError(0, 'transport_unreachable', `fleet transport unreachable at ${this.baseUrl}: ${(error as Error).message}`, true)
     }
     if (!response.ok) {
       let envelope: { error?: { code?: string; message?: string; retryable?: boolean } } | null = null
       try {
-        envelope = await response.json() as { error?: { code?: string; message?: string; retryable?: boolean } }
+        envelope = JSON.parse(responseText) as { error?: { code?: string; message?: string; retryable?: boolean } }
       } catch { /* keep empty */ }
       const code = envelope?.error?.code ?? `http_${response.status}`
       const message = envelope?.error?.message ?? `request ${method} ${path} failed`
-      const retryable = envelope?.error?.retryable ?? (response.status === 409 || response.status === 404 || response.status === 502 || response.status === 503)
+      const retryable = envelope?.error?.retryable ?? (response.status === 409 || response.status === 404 || response.status === 429 || response.status >= 500)
       throw new RemoteWireError(response.status, code, message, retryable)
     }
-    return await response.json() as T
+    // A complete but malformed JSON response is a protocol error, distinct
+    // from a response body that could not be received.
+    return JSON.parse(responseText) as T
   }
 
   register(req: AgentRegisterRequest): Promise<AgentRegisterResponse> {
     return this.call('POST', '/v1/agents/register', req)
   }
 
-  heartbeat(agentId: string, req: AgentHeartbeatRequest): Promise<AgentHeartbeatResponse> {
-    return this.call('POST', `/v1/agents/${encodeURIComponent(agentId)}/heartbeat`, req)
+  heartbeat(agentId: string, req: AgentHeartbeatRequest, signal?: AbortSignal): Promise<AgentHeartbeatResponse> {
+    return this.call('POST', `/v1/agents/${encodeURIComponent(agentId)}/heartbeat`, req, signal)
   }
 
   claims(agentId: string, req: AgentClaimRequest): Promise<AgentClaimResponse> {
     return this.call('POST', `/v1/agents/${encodeURIComponent(agentId)}/claims`, req)
+  }
+
+  heartbeatRun(agentId: string, runId: string, req: RemoteRunHeartbeatRequest, signal?: AbortSignal): Promise<RemoteRunHeartbeatResponse> {
+    return this.call('POST', `/v1/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}/heartbeat`, req, signal)
   }
 
   uploadFrames(agentId: string, runId: string, req: RemoteFramesRequest): Promise<RemoteFramesResponse> {
@@ -593,6 +613,8 @@ export interface RemoteAgentOptions {
   spool?: { maxEntries?: number; maxBytes?: number }
   /** 轮询间隔（runPollLoop 用）。 */
   pollIntervalMs?: number
+  heartbeatIntervalMs?: number
+  supervisionIntervalMs?: number
   now?: () => number
 }
 
@@ -618,6 +640,11 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
   private readonly containerRun: RemoteContainerRunFn
   private readonly spool: AgentOutboundSpool
   private readonly pollIntervalMs: number
+  private readonly heartbeatIntervalMs: number
+  private readonly supervisionIntervalMs: number
+  private readonly clock: () => number
+  private offlineAfterMs = 30_000
+  private flushing: Promise<void> | null = null
 
   /** prepare 的 fingerprint 基准（start 对账，plan 不可变断言）。 */
   private preparedFingerprint: string | null = null
@@ -645,6 +672,9 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
     this.executor = options.executor ?? ((plan, context) => defaultRemoteExecutor(plan, context, this.dockerProbe, this.containerRun))
     this.spool = new AgentOutboundSpool(options.spool)
     this.pollIntervalMs = options.pollIntervalMs ?? 2_000
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 10_000
+    this.supervisionIntervalMs = options.supervisionIntervalMs ?? 5_000
+    this.clock = options.now ?? Date.now
   }
 
   get target_id(): string {
@@ -667,15 +697,17 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
     if (!response.acknowledged) {
       throw new RemoteRunnerAgentError(`fleet server did not acknowledge agent ${this.agent_id} (target ${this.target_id})`)
     }
+    this.offlineAfterMs = response.offline_after_ms
     return this.registration
   }
 
   /** 心跳（保持 health.last_seen 新鲜；服务端不认可 → 明确错误，须重新注册）。 */
-  async heartbeat(): Promise<void> {
-    const response = await this.transport.heartbeat(this.agent_id, { schema_version: 1 })
+  async heartbeat(signal?: AbortSignal): Promise<void> {
+    const response = await this.transport.heartbeat(this.agent_id, { schema_version: 1 }, signal)
     if (!response.accepted) {
       throw new RemoteRunnerAgentError(`fleet server does not acknowledge agent ${this.agent_id} — re-register required`)
     }
+    this.offlineAfterMs = response.offline_after_ms
   }
 
   // ── claim / 轮询 ─────────────────────────────────────────────────────────
@@ -692,26 +724,40 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
    */
   async runPollLoop(signal?: AbortSignal): Promise<number> {
     let runs = 0
-    while (signal?.aborted !== true) {
-      try {
-        await this.heartbeat()
-      } catch { /* 离线；继续轮询 */ }
-      try {
-        await this.flushSpool()
-      } catch { /* 下次再试 */ }
-      let claims: AgentClaim[] = []
-      try {
-        claims = await this.claimOnce(1)
-      } catch { /* 无工作/离线 */ }
-      for (const claim of claims) {
-        try {
-          await this.runClaim(claim, { signal })
-          runs += 1
-        } catch { /* 单 run 失败不终止轮询 */ }
+    const stop = new AbortController()
+    const loopSignal = signal === undefined ? stop.signal : AbortSignal.any([signal, stop.signal])
+    const keepalive = (async () => {
+      while (!loopSignal.aborted) {
+        try { await this.heartbeat(loopSignal) } catch (error) {
+          if (error instanceof RemoteWireError && error.code === 'agent_not_registered') {
+            try { await this.register() } catch { /* next heartbeat retries registration */ }
+          }
+        }
+        await delay(Math.max(1, Math.min(this.heartbeatIntervalMs, this.offlineAfterMs / 3)), loopSignal)
       }
-      await delay(this.pollIntervalMs, signal)
+    })()
+    try {
+      while (!loopSignal.aborted) {
+        try {
+          await this.flushSpool()
+        } catch { /* 下次再试 */ }
+        let claims: AgentClaim[] = []
+        try {
+          claims = await this.claimOnce(1)
+        } catch { /* 无工作/离线 */ }
+        for (const claim of claims) {
+          try {
+            await this.runClaim(claim, { signal: loopSignal })
+            runs += 1
+          } catch { /* 单 run 失败不终止轮询 */ }
+        }
+        await delay(this.pollIntervalMs, loopSignal)
+      }
+      return runs
+    } finally {
+      stop.abort()
+      await keepalive
     }
-    return runs
   }
 
   // ── ExecutionTarget port ─────────────────────────────────────────────────
@@ -759,11 +805,11 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
     const controller = new AbortController()
     const executionContext: AgentExecutionContext = {
       cwd: context.cwd ?? process.cwd(),
-      signal: context.signal ?? controller.signal,
+      signal: context.signal === undefined ? controller.signal : AbortSignal.any([context.signal, controller.signal]),
       onChunk: context.onChunk,
       runEnv: context.runEnv,
     }
-    const outcome = this.executeClaim(claim, executionContext)
+    const outcome = this.executeSupervised(claim, executionContext, controller)
     this.inflight.set(parsed.run_id, { controller, outcome })
     void outcome.then(
       () => this.inflight.delete(parsed.run_id),
@@ -819,6 +865,12 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
    *   log artifact 与 complete 才是权威输出记录）。
    */
   async flushSpool(): Promise<void> {
+    if (this.flushing !== null) return this.flushing
+    this.flushing = this.flushSpoolOnce()
+    try { await this.flushing } finally { this.flushing = null }
+  }
+
+  private async flushSpoolOnce(): Promise<void> {
     // 1) 上次失败的 gap 先补发（保证 gap 永远先于该 run 的存活帧）。
     const gaps = [...this.pendingGaps, ...this.spool.takeOverflowGaps()]
     this.pendingGaps = []
@@ -843,16 +895,19 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
           lease_token: lease.token,
         })
       } catch (error) {
-        if (isSpoolableWireError(error)) this.pendingGaps.push(gap)
+        if (!isTerminalWireError(error)) this.pendingGaps.push(gap)
         // lease_stale → 死 gap（run 已被接管）：丢弃（保留本地诊断）。
       }
     }
+    // The Kernel skips lower sequence numbers after a later frame arrives.
+    // Keep every surviving frame and completion behind unacknowledged gaps.
+    if (this.pendingGaps.length > 0) return
     // 2) 按序重放 spool 条目。
     await this.spool.drain(async entry => {
       try {
         await this.dispatch(entry)
       } catch (error) {
-        if (error instanceof RemoteWireError && error.code === 'lease_stale') return // 死条目：丢弃并继续
+        if (isTerminalWireError(error)) return // dead attempt: discard and continue
         throw error // 传输类错误：停止重放，保序重试
       }
     })
@@ -860,7 +915,8 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
 
   /** spool 中是否仍有该 run 的条目（complete 发送顺序保证用）。 */
   private spoolHasEntriesFor(runId: string): boolean {
-    return this.spool.hasEntriesFor(runId)
+    return this.spool.hasEntriesFor(runId) || this.spool.hasOverflowGapFor(runId)
+      || this.pendingGaps.some(gap => gap.runId === runId)
   }
 
   // ── 核心：执行一个 claim ─────────────────────────────────────────────────
@@ -882,11 +938,12 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
       return done.ok
     }
     const controller = new AbortController()
-    const outcome = this.executeClaim(claim, {
-      signal: context.signal ?? controller.signal,
+    const outcome = this.executeSupervised(claim, {
+      cwd: context.cwd,
+      signal: context.signal === undefined ? controller.signal : AbortSignal.any([context.signal, controller.signal]),
       onChunk: context.onChunk,
       runEnv: context.runEnv,
-    })
+    }, controller)
     this.inflight.set(runId, { controller, outcome })
     void outcome.then(
       result => {
@@ -908,6 +965,67 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
       if (oldest !== undefined) this.completedRuns.delete(oldest)
     }
     this.completedRuns.set(runId, entry)
+  }
+
+  /** Renewal/cancel polling never waits for the executor. A separate local
+   * expiry watchdog stops work even while a network request is hung. */
+  private async executeSupervised(claim: AgentClaim, context: AgentExecutionContext, controller: AbortController): Promise<RunOutcome> {
+    if (claim.lease.owner !== claim.plan.lease.owner || claim.lease.generation !== claim.plan.lease.generation
+      || claim.lease.token !== claim.plan.lease.token) {
+      throw new RemoteRunnerAgentError('claim fencing fields differ from the signed execution plan')
+    }
+    const stop = new AbortController()
+    const supervisionSignal = AbortSignal.any([stop.signal, controller.signal, ...(context.signal === undefined ? [] : [context.signal])])
+    let expiresAt = claim.lease.expires_at
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    const armWatchdog = (): void => {
+      if (watchdog !== undefined) clearTimeout(watchdog)
+      if (expiresAt === null) return
+      const remaining = Date.parse(expiresAt) - this.now()
+      if (!Number.isFinite(remaining) || remaining <= 0) {
+        controller.abort(new RemoteWireError(409, 'lease_stale', 'remote lease expired', false))
+        return
+      }
+      watchdog = setTimeout(() => controller.abort(new RemoteWireError(409, 'lease_stale', 'remote lease expired', false)), remaining)
+      watchdog.unref()
+    }
+    const renew = async (): Promise<void> => {
+      try {
+        const response = await this.transport.heartbeatRun(this.agent_id, claim.plan.run_id, {
+          schema_version: 1, claim_id: claim.claim_id, job_id: claim.plan.job_id,
+          lease: { owner: claim.lease.owner, generation: claim.lease.generation, token: claim.lease.token },
+        }, supervisionSignal)
+        if (supervisionSignal.aborted) return
+        if (response.run_id !== claim.plan.run_id) throw new RemoteWireError(409, 'lease_stale', 'run heartbeat identity mismatch', false)
+        if (response.status === 'cancelled') {
+          controller.abort(new RemoteWireError(409, 'job_cancelled', 'Kernel cancelled the remote job', false))
+          return
+        }
+        expiresAt = response.lease_expires_at
+        armWatchdog()
+      } catch (error) {
+        if (!isSpoolableWireError(error) || (error instanceof RemoteWireError && error.status === 409)) controller.abort(error)
+        // Temporary transport errors never extend the last acknowledged lease.
+      }
+    }
+    armWatchdog()
+    const supervision = (async () => {
+      // Claim delivery already carries a fenced lease. Poll promptly without
+      // blocking startup or making network availability a fake run result.
+      while (!supervisionSignal.aborted) {
+        await delay(Math.max(1, Math.min(this.supervisionIntervalMs,
+          expiresAt === null ? this.supervisionIntervalMs : (Date.parse(expiresAt) - this.now()) / 3)), supervisionSignal)
+        if (!supervisionSignal.aborted) await renew()
+      }
+    })()
+    try {
+      context.signal?.throwIfAborted()
+      return await this.executeClaim(claim, context)
+    } finally {
+      stop.abort()
+      if (watchdog !== undefined) clearTimeout(watchdog)
+      await supervision
+    }
   }
 
   private async executeClaim(claim: AgentClaim, context: AgentExecutionContext): Promise<RunOutcome> {
@@ -986,7 +1104,7 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
         pendingFrames = []
         pendingMinSeq = 0
         pendingMaxSeq = 0
-        if (batch.length === 0) return Promise.resolve()
+        if (batch.length === 0) return flushChain
         flushChain = flushChain.then(async () => {
           await this.sendWithSpool({
             kind: 'frames',
@@ -1034,7 +1152,9 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
         DSH_SEED: plan.output_contract.seed !== null ? String(plan.output_contract.seed) : '',
         ...context.runEnv,
       }
+      context.signal?.throwIfAborted()
       const outcome = await this.executor(plan, { cwd: workDir, signal: context.signal, onChunk, runEnv: executionEnv })
+      if (context.signal?.aborted && context.signal.reason instanceof RemoteWireError) throw context.signal.reason
 
       // 5.1) §12.5 (RUN-01c parity)：secure kinds 的 metrics facts 来自容器
       //     写回的 MetricsFileV1（与本地 runner 同一校验/同一 artifact 形状）。
@@ -1247,7 +1367,8 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
       const metricsFailure = metricsFileError !== null && outcome.exit_code === 0
         ? { failure_class: 'code_error' as const, error: metricsFileError }
         : null
-      const status: 'succeeded' | 'failed' = outcome.exit_code === 0 && metricsFileError === null ? 'succeeded' : 'failed'
+      const status: 'succeeded' | 'failed' | 'cancelled' = context.signal?.aborted === true
+        ? 'cancelled' : outcome.exit_code === 0 && metricsFileError === null ? 'succeeded' : 'failed'
       const failureClass = metricsFailure !== null
         ? metricsFailure.failure_class
         : outcome.exit_code === 0 ? null : environmentFailure ? 'environment' : 'unknown'
@@ -1313,6 +1434,20 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
    * - 其余错误原样抛出。
    */
   private async sendWithSpool(entry: Omit<AgentSpoolEntry, 'id'>, fatalOnReject = false): Promise<unknown> {
+    // A concurrent replay may currently be sending a gap or an earlier
+    // batch. Wait before either sending or mutating its queue.
+    if (this.flushing !== null) await this.flushing
+    // A finalize must never overtake a failed stage. Independent artifact
+    // uploads can still succeed while frames are buffered; complete waits
+    // for all outstanding messages in executeClaim.
+    const bufferedFrames = (entry.kind === 'frames' || entry.kind === 'exit_frame')
+      && (this.spool.hasEntriesFor(entry.runId, ['frames', 'exit_frame']) || this.spool.hasOverflowGapFor(entry.runId)
+        || this.pendingGaps.some(gap => gap.runId === entry.runId))
+    if (bufferedFrames || (entry.kind === 'artifact_finalize' && this.spool.hasEntriesFor(entry.runId, ['artifact_stage']))) {
+      const result = this.spool.push(entry)
+      if (!result.accepted) throw new RemoteRunnerAgentError(`run ${entry.runId}: outbound spool overflow (${result.reason})`)
+      return undefined
+    }
     try {
       return await this.dispatch({ ...entry, id: `tmp_${randomUUID().replaceAll('-', '').slice(0, 8)}` })
     } catch (error) {
@@ -1325,7 +1460,7 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
         }
         return undefined
       }
-      if (error instanceof RemoteWireError && error.code === 'lease_stale') {
+      if (isTerminalWireError(error)) {
         // lease 过期：旧 agent 只能丢弃或保留本地诊断，不能完成 Job。
         if (fatalOnReject) {
           throw new RemoteRunnerAgentError(
@@ -1353,7 +1488,7 @@ export class RemoteRunnerAgentImpl implements RemoteRunnerAgent {
   }
 
   private now(): number {
-    return Date.now()
+    return this.clock()
   }
 }
 

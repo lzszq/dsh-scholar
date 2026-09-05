@@ -167,6 +167,8 @@ export interface FleetAgentMainOptions {
   fleetUrl: string
   /** x-service-token（本地 wire 等价实现；生产必须 mTLS）。 */
   serviceToken?: string
+  /** Target-scoped identity, forwarded to Kernel only in an HTTP header. */
+  runnerTargetToken?: string
   agentId: string
   targetId: string
   runnerVersion: string
@@ -179,6 +181,8 @@ export interface FleetAgentMainOptions {
   executor?: AgentExecutor
   /** claim 轮询间隔（ms）。 */
   pollIntervalMs?: number
+  heartbeatIntervalMs?: number
+  supervisionIntervalMs?: number
   /** 注册重试上限（ms；fleet 服务端可能尚未就绪）。 */
   registerMaxWaitMs?: number
   signal?: AbortSignal
@@ -196,6 +200,7 @@ export interface FleetAgentMainOptions {
 export async function runFleetAgentMain(options: FleetAgentMainOptions): Promise<number> {
   const transport = new HttpRemoteFleetTransport(options.fleetUrl, {
     serviceToken: options.serviceToken,
+    runnerTargetToken: options.runnerTargetToken,
   })
   const registration = buildAgentRegistration({
     agentId: options.agentId,
@@ -209,6 +214,8 @@ export async function runFleetAgentMain(options: FleetAgentMainOptions): Promise
     signingKey: options.signingKey,
     executor: options.executor,
     pollIntervalMs: options.pollIntervalMs,
+    heartbeatIntervalMs: options.heartbeatIntervalMs,
+    supervisionIntervalMs: options.supervisionIntervalMs,
   }) as RemoteRunnerAgentImpl
 
   await registerWithRetry(agent, options.registerMaxWaitMs ?? 60_000, options.signal)

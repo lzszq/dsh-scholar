@@ -170,8 +170,13 @@ export class AgentOutboundSpool {
   }
 
   /** 是否仍有该 run 的条目（complete 发送顺序保证用）。 */
-  hasEntriesFor(runId: string): boolean {
-    return this.entries.some(e => e.runId === runId)
+  hasEntriesFor(runId: string, kinds?: AgentSpoolEntryKind[]): boolean {
+    return this.entries.some(e => e.runId === runId && (kinds === undefined || kinds.includes(e.kind)))
+  }
+
+  /** Evicted frames still need an acknowledged gap before later frames. */
+  hasOverflowGapFor(runId: string): boolean {
+    return this.overflowGaps.has(runId)
   }
 
   /** 清空（进程退出/诊断用）。 */

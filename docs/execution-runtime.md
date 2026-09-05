@@ -97,6 +97,8 @@ Runner 的唯一输入是当前 Kernel claim envelope。`run_id`、lease generat
 
 **opaque RunnerProfile 注册表 + Job 固定 profile/config hash 已实现（commit 451d7d5）**：domain-model.md §9.1 的 profile 注册表（research-schemas `runner-profile.ts`）与 Job 固定 pin 已闭环——Job/UI 只引用 opaque `profile_id`（`profile_local_docker_cpu_v1` / `profile_local_docker_gpu_v1`（无 GPU 路径，CPU-only pin）/ `profile_isolated_subprocess_v1`（trusted-smoke-fixture 专用）），docker flags/endpoint/凭据永远不进 Job 数据（`RunnerProfile` `.strict()` + 未知 id 422 `runner_profile_unknown`）；kernel submitJob 对 secure kinds 注入 `payload.runner_profile_id` + `payload.profile_config_hash`；runner executeJob 按注册表复算校验（未知 id / hash 不一致 → `failure_class=environment`，绝不执行），docker 参数（limits/network/opaque profile_id）取自 profile 记录，缺省值与既有容器基线字节级一致；ExecutionPlan 增 `profile_config_hash` pin，RemoteFleetServer plan 固定同一 pin（不一致 → retryable 不带病分发）。证据：tests/unit/runner-profile.test.ts 11/11、kernel.test.ts 109/109、根 pnpm test 664/664、三个包 build 全绿、run-terminal/run-fencing 不破坏、verify-docs 18/18（详见 hardening-v0.2-status.md §8 PROF-01 行）。
 
+2026-09-06 远端运行补充：认证 Target 心跳必须写入 Kernel 的 durable health/last_seen_at；不得放宽就绪判定。Fleet 仅对具体 attempt 去重，终态立即释放容量，回执限量限时；finalize 失败保留 stage，成功响应丢失可幂等重试。Agent 心跳、Job 续租/取消监督和租约到期 watchdog 独立于长任务执行，停止时完整释放资源。具体 wire、身份和内存恢复边界见 [remote-runner-wire.md](remote-runner-wire.md) §3–5；真实 Kernel/HTTP/子进程自动回归不替代真实 SSH/GPU/mTLS 验收。
+
 ## 6. 实时 Terminal
 
 现有“任务结束后拼接 stdout/stderr”不足以满足产品。Execution adapter 必须接受 onChunk 回调，并同时保留有界本地 spool。

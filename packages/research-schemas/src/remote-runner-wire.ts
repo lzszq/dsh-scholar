@@ -120,6 +120,28 @@ export const AgentClaimResponse = z.object({
 }).strict()
 export type AgentClaimResponse = z.infer<typeof AgentClaimResponse>
 
+/** Running-attempt supervision. Every renewal carries the complete fence;
+ * cancellation is read from the authoritative Kernel job. */
+export const RemoteRunHeartbeatRequest = z.object({
+  schema_version: z.literal(REMOTE_WIRE_SCHEMA_VERSION),
+  claim_id: z.string().min(1),
+  job_id: z.string().min(1),
+  lease: z.object({
+    owner: z.string().min(1),
+    generation: z.number().int().positive(),
+    token: z.string().min(1),
+  }).strict(),
+}).strict()
+export type RemoteRunHeartbeatRequest = z.infer<typeof RemoteRunHeartbeatRequest>
+
+export const RemoteRunHeartbeatResponse = z.object({
+  schema_version: z.literal(REMOTE_WIRE_SCHEMA_VERSION),
+  run_id: z.string().min(1),
+  status: z.enum(['running', 'cancelled']),
+  lease_expires_at: z.string().nullable(),
+}).strict()
+export type RemoteRunHeartbeatResponse = z.infer<typeof RemoteRunHeartbeatResponse>
+
 // ── frames（复用 kernel terminal frame 语义）──────────────────────────────
 
 /**

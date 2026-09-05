@@ -71,6 +71,22 @@ export const ArtifactRecord = z.object({
 })
 export type ArtifactRecord = z.infer<typeof ArtifactRecord>
 
+/** Runner artifact registration must bind a live attempt at commit time.
+ * Fencing fields are transient credentials, never artifact metadata. */
+export const JobArtifactCreateInput = z.object({
+  project_id: z.string().min(1),
+  run_id: z.string().min(1),
+  owner: z.string().min(1),
+  lease_generation: z.number().int().positive(),
+  lease_token: z.string().min(1),
+  kind: ArtifactKind,
+  content_base64: z.string().min(1),
+  metadata: z.record(z.unknown()).optional(),
+  media_type: z.string().min(1).max(256).optional(),
+  file_name: z.string().min(1).max(255).optional(),
+}).strict()
+export type JobArtifactCreateInput = z.infer<typeof JobArtifactCreateInput>
+
 /** Durable job state — the runner authority across process restarts (design §4.6.1, §9.3). */
 export const JobStatus = z.enum(['queued', 'running', 'succeeded', 'failed', 'cancelled', 'retryable'])
 export type JobStatus = z.infer<typeof JobStatus>

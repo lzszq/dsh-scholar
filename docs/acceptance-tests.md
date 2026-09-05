@@ -841,3 +841,16 @@ REL-01 自动化场景（tests/security/run-release-bundle-tests.sh）：
 - `pty-runtime-policy-settings-i18n`：动态 Settings 对三个新增 schema key 必须在 zh/en 中提供等价的人类标签，locale parity 与 full-model missing-key 检查均为零；不得把 raw dotted key 当作可接受的 UI 文案。
 - `pty-runtime-policy-new-session-pin`：先创建 PTY A，再以 expected revision CAS 原子写入三项并创建 PTY B。receipt 的三个 key 只能出现在 `hot_applied_keys`；A 的 idle TTL、retention、lease expiry 与 config hash 保持不变，B 精确固定新值和新的 effective config pin，adapter spawn plan 使用 B 的同一 pin。
 - `pty-runtime-policy-server-owned`：`POST /v1/pty/sessions` 继续 strict 拒绝 caller-supplied idle/retention/lease/config hash；配置修改不得重写运行中的 PTY 行，也不得延长已有 lease。重启后 durable runtime layer仍产生相同 effective values；后续 open 使用该层，不回退代码常量或浏览器参数。
+
+## 34. Remote/OCR lifecycle review（2026-09-06）
+
+- `remote-capacity-attempt-recovery`：连续完成至少 12 个任务，默认 8 容量不得耗尽；终态与产物回执按数量/TTL 淘汰；满 pending 队列先清过期项；真实 Kernel recover 后的新 run/generation 再次分发，旧续租被 fenced。
+- `remote-finalize-retry-spool`：上游 503、成功响应丢失和并发 finalize 可恢复到同一 artifact；重复 stage 声明冲突拒绝；失败 stage 先于 finalize，complete 等待 spool；完全相同 complete 重放不重复落库。
+- `remote-response-body-retry`：真实 HTTP 在 200 响应头之后断开或挂起 body，归类为可重试网络失败；一次截断的续租响应不停止真实子进程，后续心跳正常续租。无 envelope 的 429/5xx 可重试，完整非法 JSON 与 stale lease 保持协议/终态错误。
+- `remote-frame-replay-order`：64 与 130 个 chunk 的首次上传失败后，所有 seq 和文本均按序保存、exit 最后、spool 清空且 Job 成功；overflow gap 的首次补发失败时不得提前发送幸存帧或 complete。
+- `remote-artifact-commit-fence`：Fleet 已发起 finalize、Kernel 尚未注册产物时取消 Job，返回 409 且零 CAS/Artifact/outbox 新增；缺 service token 为 403，缺字段为 422，错项目/run/owner/generation/token 或过期租约为 409。合法上传和内容复用均在事务内，产物不持久化租约 secret。
+- `remote-kernel-heartbeat-cancel`：缺失/错 Target token、跨 target/agent 冒用零状态更新；并发认证注册不能把同一 Agent 改绑另一 Target；SSH 固定引导脚本经 stdin 接收两类身份，argv 不含凭据且临时密钥退出即删除；认证注册/心跳更新 durable Target，未探测任务由拒绝转为可提交；真实子进程越过初始短租约仍为同 attempt，Agent/Target 在线，取消 API 杀进程，续租请求挂起时独立 watchdog 仍在到期后杀进程且不上传结果，停止后无心跳。
+- `mineru-production-protocol`：Flash 与 Pipeline/VLM 分别执行官方上传/轮询协议的本地 HTTP fixture，模型/页/语言 pin 精确，身份不流向对象存储/CDN；拒绝未知 URL、私网 DNS、重定向、越界流、坏 ZIP/路径及外来结果；超时/取消释放资源，缺 provenance 不虚构。
+- `ocr-runtime-start-stop-preserve`：正常 HTTP 与实际 Kernel 二进制消费 queued 请求；Provider pin 改变不调用 transport；取消不被迟到结果覆盖；停止/重启保留请求 id、attempts、项目/工作区/源字节与迁移 checksum。所有数据在临时目录，绝不打开真实用户数据目录。
+
+自动证据文件：`remote-http-transport.test.ts`、`remote-wire.test.ts`、`remote-kernel-lifecycle.test.ts`、`fleet-bin.test.ts`、`ssh-bootstrap.test.ts`、`mineru-transport.test.ts`、`mineru-http.test.ts`、`ocr-service.test.ts` 与既有 OCR lifecycle/HTTP/worker 测试。新代码必须重新运行 build/test/docs/baseline/security，不能沿用 review 的 1753 项结果。真实 SSH/GPU/mTLS、浏览器取消交互与 MinerU 外部服务仍为 `NOT_RUN_MANUAL_PENDING`。

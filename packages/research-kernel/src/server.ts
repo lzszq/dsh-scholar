@@ -38,6 +38,7 @@ import {
   KnowledgeActivationIntent,
   KnowledgePackageEvaluation,
   KnowledgePackageRecord,
+  JobArtifactCreateInput,
   ProtocolRevision,
   ResearchRunOutcomeWrite,
   ResearchSynthesis,
@@ -53,6 +54,9 @@ import {
 } from '@dsh-scholar/research-schemas'
 
 export interface KernelServerOptions {
+  /** Starts the production OCR consumer with the HTTP runtime. Embedders
+   * can explicitly disable it or inject a transport for isolated tests. */
+  ocrWorker?: false | import('./ocr-service.js').MinerUOcrServiceOptions
   kernel: ResearchKernel
   host?: string
   port?: number
@@ -872,6 +876,7 @@ function intakePrincipalFromRequest(
  */
 const SERVICE_ROUTES: ReadonlyArray<{ method: string; re: RegExp; label: string }> = [
   { method: 'POST', re: /^\/v1\/jobs-claim\/run$/, label: 'jobs-claim' },
+  { method: 'POST', re: /^\/v1\/jobs\/[^/]+\/artifacts$/, label: 'jobs/artifacts' },
   { method: 'POST', re: /^\/v1\/runner-keys$/, label: 'runner-keys' },
   { method: 'POST', re: /^\/v1\/recover\/leases$/, label: 'recover/leases' },
   { method: 'POST', re: /^\/v1\/runner-targets\/[^/]+\/heartbeat$/, label: 'runner-targets/heartbeat' },
@@ -2660,6 +2665,11 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
           break
         }
         case 'jobs': {
+          if (id !== undefined && sub === 'artifacts' && subId === undefined && method === 'POST') {
+            const { content_base64, ...input } = JobArtifactCreateInput.parse(body)
+            send(res, 201, kernel.registerJobArtifact(id, { ...input, content: Buffer.from(content_base64, 'base64') }))
+            return
+          }
           if (id !== undefined && sub === undefined && method === 'GET') {
             ok(res, kernel.getJob(id))
             return
@@ -4742,6 +4752,8 @@ export function startKernelServer(options: KernelServerOptions): Promise<{ serve
   return new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(port, host, () => {
+      if (options.ocrWorker !== false) kernel.startOcrWorker(options.ocrWorker)
+      server.once('close', () => { void kernel.stopOcrWorker() })
       const address = server.address()
       const actualPort = typeof address === 'object' && address !== null ? address.port : port
       resolve({ server, url: `http://${host}:${actualPort}`, port: actualPort })

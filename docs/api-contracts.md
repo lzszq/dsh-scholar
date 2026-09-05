@@ -219,6 +219,8 @@ Runner/Worker 输出不能走浏览器上传。内部 artifact stage、分块上
 | POST | /internal/v2/runner-keys | Runner admin | Ed25519 public key 注册和轮换 |
 | POST | /internal/v2/recover/leases | Orchestrator | 过期 lease 恢复 |
 
+当前 Fleet 使用 `POST /v1/jobs/{job_id}/artifacts` 登记运行产物，要求 `x-service-token` 与 strict `JobArtifactCreateInput`：`{project_id,run_id,owner,lease_generation,lease_token,kind,content_base64,metadata?,media_type?,file_name?}`。Kernel 以同一 SQLite 写事务校验项目、run、owner、generation、token、running 状态与未过期租约，并登记 CAS/Artifact/outbox；取消或恢复先提交、任一身份不匹配、租约过期均为 409 `lease_stale`，缺失字段为 422。成功/内容复用返回 201 ArtifactRecord；复用也须重新校验租约。租约凭据只用于提交校验，不写入 Artifact metadata 或事件；job_id/run_id 由 Kernel 绑定。
+
 internal 请求使用 Runner service bearer/mTLS，再叠加 Job owner、generation 和 token。complete 必须校验 Manifest signature、Job/Project/Contract、快照、镜像、Artifact 所有权。任何失败都不得部分写入 succeeded。精确 wire 类型和算法见 reconstruction-contracts.md。
 
 ## 9. Terminal SSE
@@ -359,7 +361,7 @@ zh/en 字典随 dsh-research-ui client bundle 发布，不由 Kernel 动态返�
 | POST | `/v2/intakes/{id}/grill-answers` | 每次一个 Human assertion + question revision；返回 next question |
 | POST | `/v2/intakes/{id}/ocr-requests` | 显式 provider/model ID 的异步 OCR；Idempotency-Key |
 | GET | `/v2/intakes/{id}/ocr-requests/{request}` | OCR 状态、安全错误、结果 refs 与来源/confidence |
-| DELETE | `/v2/intakes/{id}/ocr-requests/{request}` | 在执行前取消；终态请求幂等返回或明确冲突 |
+| DELETE | `/v2/intakes/{id}/ocr-requests/{request}` | 取消 queued/running 请求并中止在途 OCR；终态请求幂等返回或明确冲突 |
 | POST | `/v2/intakes/{id}/proposals` | 生成确定性阶段/映射 proposal |
 | POST | `/bff/research/intakes/{id}/accept` | PI Human adoption；expected proposal/target revision |
 | POST | `/bff/research/intakes/{id}/reject` | Human reject/cleanup request |
@@ -668,3 +670,5 @@ Knowledge Activation 与 Assurance execution 的成功 response 对应一条数�
 - 只有本 upload 新建仍为 `staged` 的隔离 artifact 时，session 才持有 `owns_artifact=1`。关闭后的补偿 abort 可删除该 artifact；去重命中、已扫描 artifact 不归本 session 所有。共享 staged artifact 的所有权在 abort 时转移；重复 abort 不得清零未完成的 ownership ledger。direct/multipart same-SHA stage 与 cleanup 使用同一写锁，stage 先接管新 generation，cleanup 只有在当前 artifact row 不存在时才 unlink，从而禁止旧账本删除后来重建的材料。
 - 浏览器关闭 session 时由单一 lifecycle coordinator 先发布独立于 transcript 的 page-lifetime exact-scope tombstone，同步封死 turn、attachment、vision 与 upload continuation，再写 durable local outbox；若 storage 写失败，则保留可见 session 直到 Kernel ACK，但该可见项也不能重新提交或接受迟到 transcript/attachment 写。outbox 在项目激活和成功 project-list refresh 时自动重放，只有 tombstone route 的 2xx 才确认该条 close；route 404 同时可能表示防枚举 membership denial，不得当作物理删除 ACK。真正的项目删除由成功 project-list + projection authority reconciliation 调用 project discard，并在那里清理项目全部 outbox。网络/4xx/5xx 均不得丢单条 close outbox。
 - page lifetime 只有一个 session/project tombstone authority；turn、attachment、upload、vision 与 transcript 都读取它，但每类资源独立持有自己的 controller/driver map。hydrated outbox 在远端请求前必须重建 tombstone。上传 queue failure wire 为 `{code,status?}`，2xx begin/append 也需 strict shape 与单调 offset 校验；malformed 或 offset regression 立即 fail-stop。
+
+2026-09-06 remote/OCR runtime 补充：Fleet 注册与心跳必须转交 Agent 的 Target 专属凭据并等待 Kernel heartbeat 成功；`POST /v1/agents/{agent_id}/runs/{run_id}/heartbeat` 接收 claim_id/job_id 与 owner/generation/token，返回权威 running/cancelled 和最新租约 expiry，详见 [wire 规范](remote-runner-wire.md)。正常 Kernel HTTP 入口默认消费 OCR 队列，结果允许在缺少真实页/置信度元数据时仅有 Markdown 和空 observations，仍关联原始请求 pin，详见 [OCR 规范](init-grill-upload-models.md)。

@@ -127,6 +127,8 @@ Workspace 与 Interactive Terminal 都可以独立停靠；Dock 不改变 Worksp
 
 ### 6.2 本机与远端执行
 
+Agent 认证心跳会同步 Kernel 的环境状态；未认证或过期仍显示未就绪。长任务期间独立续租与检查取消，Runs 中的取消会终止远端执行；持续断网超过已确认租约时停止进程。完成任务会释放领取容量，产物暂时上传失败可经内存 spool 重试；Agent/Fleet 进程重启会丢失该内存缓冲，不能保证其日志和回执仍在。
+
 执行 target 经项目配置 `execution.runner_target_id`/`execution.runner_profile_id` 选择。先进入 Settings →“实验环境”创建或编辑 target（label、kind、capability、enabled/draining 与 remote SecretRef metadata），再在同一折叠组的“当前项目默认实验环境”选择器保存；页面不输入 SSH 明文、hostname 或任意命令。只覆盖一次运行时，在 `/run` 或 `/reproduce` 的 JSON 中加入 `"runner_target_id":"target_remote_lab_a"`，它优先于项目默认。远端离线时任务明确失败或等待，不会静默改在本机/subprocess 运行。服务端已实现 RUN-REMOTE-01 wire、RemoteFleetServer、RemoteRunnerAgentImpl、持久 Target Registry 和 target-aware claim；真实 mTLS 证书链、跨主机 sandbox/网络分区、Remote PTY 与浏览器视觉验收仍属后续人工阶段。
 
 runner CLI（`node workers/runner-gateway/lib/bin/runner.js`）已接线四个互斥角色（FLEET-01，用法与互斥规则见 remote-runner-wire.md §9）：默认 `--kernel` 本地 claim 循环；`--fleet-server <port>` 启动 Fleet 服务端；`--agent <fleet-url>` 启动已在远端机器上的 Agent；`--agent <fleet-url> --ssh-bootstrap-target <id>` 从受控 SecretRef 通过 SSH 引导远端 Agent。fleet/SSH 角色与本地 `--mode` 互斥；开发 wire 的共享 service identity 只能经 `DSH_SCHOLAR_SERVICE_TOKEN` 环境或受控 0600 配置文件注入，runner 不接受任何 token/service-token/target-token argv；生产必须 mTLS。
@@ -142,7 +144,7 @@ node workers/runner-gateway/lib/bin/runner.js \
   --fleet-public-key /srv/dsh-scholar/fleet-public.pem
 ~~~
 
-`lab-gpu-01` 必须是已登记且启用的 `remote-ssh` target；三个 file SecretRef 分别解析 endpoint JSON（只允许 `host/port/user`）、0600 credential 和预固定 known_hosts。适配器固定 `BatchMode`、`StrictHostKeyChecking=yes`、`IdentitiesOnly=yes`，只启动 `dsh-scholar-runner`，不接受 ProxyCommand、项目 argv 或任意远端 shell。远端主机必须已安装该 runner，并通过受控环境提供 Fleet service token；bootstrap 会先在中央 Kernel 注册 manifest 公钥，再通过加密 SSH stdin 下发临时 plan 公钥/manifest key，退出时删除。生产仍必须把 HTTP service-token 链路升级为 mTLS。
+`lab-gpu-01` 必须是已登记且启用的 `remote-ssh` target；三个 file SecretRef 分别解析 endpoint JSON（只允许 `host/port/user`）、0600 credential 和预固定 known_hosts。适配器固定 `BatchMode`、`StrictHostKeyChecking=yes`、`IdentitiesOnly=yes`，只启动 `dsh-scholar-runner`，不接受 ProxyCommand、项目 argv 或任意远端 shell。远端主机必须已安装该 runner。直接启动 Agent 时通过 `DSH_SCHOLAR_SERVICE_TOKEN` 和 `DSH_SCHOLAR_RUNNER_TARGET_TOKEN` 注入共享服务身份与此 Target 专属身份；后者必须匹配 Registry 的 service_identity。SSH bootstrap 从同一 Target 的 file SecretRef 解析专属凭据，先在 Kernel 注册 manifest 公钥，再通过加密 SSH stdin 下发密钥与 token（不放 argv），临时密钥文件退出时删除。生产仍必须把 HTTP service-token 链路升级为 mTLS。
 
 ## 7. Evidence 与 Claim
 
@@ -218,7 +220,7 @@ Settings 的「模型与 OCR」组当前提供 MinerU 配置：官方 Open API �
 
 当前项目只提交 `purpose=ocr`、provider/model ID、binding revision 与本次 Provider revision；endpoint/credential 不进入项目。Kernel 校验 MinerU 固定 descriptor、enabled、模型目录、能力和 Pipeline/VLM SecretRef，并快照 provider revision + config hash。Provider 保存与项目 binding 是同一个 `ocr-mineru` Settings operation；任一步验证或写入失败都会连同同一 transaction 中的其他配置一起回滚，不存在部分保存。
 
-当前已实现 MinerU Provider 配置、可选 SecretRef、当前项目 binding、双层 PI/Operator 权限与 zh/en Settings 写面，以及 `/v2/intakes/{id}/ocr-requests` 的 create/read/cancel、持久队列、重启恢复、幂等和 `observed_unverified` provenance。OCR worker 只通过固定 provider/model/config/source/page/language 的窄 transport port 调用服务；仓库未内置可绕过该 pin 的备用模型。真实 MinerU 网络调用仍为 `NOT_RUN_MANUAL_PENDING`，在真实 Provider 验收前只能把该能力标为“代码可用、外部服务待验收”。
+正常 Kernel 服务现在自动消费 `/v2/intakes/{id}/ocr-requests` 队列，无需手动启动 worker。Flash 使用官方匿名轻量 API，Pipeline/VLM 使用官方精准上传/轮询 API；精准模式 token 放在服务端 secret root 内的 0600 普通文件，以 file SecretRef 引用。取消会中止在途调用，正常停止/重启保留同一请求及来源和配置 pin；不会切换模型。Flash 不支持不连续 PDF 页选择；只返回 Markdown 时没有可用的逐页置信度，系统不会虚构。结果始终为 `observed_unverified`。本轮完成生产适配器、启停接线和隔离自动回归；真实 MinerU 服务、配额与识别质量仍是 `NOT_RUN_MANUAL_PENDING`，不能把本地 fixture 当作真实兼容验收。详细限制见 [OCR 规范](init-grill-upload-models.md#51-mineru-生产消费与兼容边界2026-09-06)。
 
 ## 12. 常见问题
 

@@ -94,6 +94,20 @@ Settings 的“Models & OCR”折叠组提供 Provider 列表、新建/编辑/�
 - OCR 文本是不可信外部内容：不得执行其中指令，不得访问 secret，不得成为 Human answer、Gate Decision、verified Evidence 或 supported Claim。
 - 失败只返回稳定 error code 和安全诊断；Provider 原始响应、prompt、secret、endpoint 与 token 不进入普通日志、Trajectory、浏览器或 Bundle。
 
+### 5.1 MinerU 生产消费与兼容边界（2026-09-06）
+
+正常 Kernel HTTP 启动自动创建单消费者，按持久队列调用 worker；不再依赖外部手动调用 `runOnce()`。每个请求重新解析服务器 Provider，校验 model/revision/hash；Pipeline/VLM 仅从 secret root 内非 symlink 的 0600 普通 file SecretRef 读取 token，keyring/vault 无 resolver 时稳定失败。取消中止在途 I/O，正常停止服务同步将仍为 running 的本请求重新入队，随后等待清理；重启保留 request_id、source/config/page/language pin 和 attempts。SIGKILL/崩溃遗留的 running 请求会在 Kernel 重启、构造 OcrStore 时重新入队；此队列只支持单 Kernel 实例持有，不支持多个 Kernel 并行打开同一数据库后自动接管彼此的请求。不能把本地幂等宣称为上游恰好一次：Provider 在成功提交但本地响应丢失/重启的窗口可能留下重复任务。
+
+协议依据：[MinerU 官方 Open API](https://mineru.net/doc/docs/index_en/) 与 [官方输出格式](https://opendatalab.github.io/MinerU/reference/output_files/)，核实日期 2026-09-06。Flash 是本产品目录对匿名轻量接口的名称，使用 `/api/v1/agent/parse/file` 获取上传 URL、PUT 源字节、`/api/v1/agent/parse/{task_id}` 轮询并下载 Markdown；不会发送 token 或 `model_version=flash`。Pipeline/VLM 使用 `/api/v4/file-urls/batch`，显式固定 `model_version`、`files[].data_id/is_ocr/page_ranges`，PUT 后轮询 `/api/v4/extract-results/batch/{batch_id}` 并读取 ZIP 中 `full.md`/可选 `layout.json`。不把自托管 MinerU API 当成同一协议。
+
+页/语言映射必须明确：`auto/zh/zh-CN` 映射官方 `ch`，`zh-TW`→`chinese_cht`，`ja/ko`→`japan/korean`；未知语言拒绝。Flash 只支持连续 PDF 页范围且最多选择 20 页，不连续选择拒绝而非扩大到整文；精准模式发送精确页集合。页选择对图片只能表示单页 1。Flash 源文件最多 10 MiB，精准模式最多 200 MiB；上游实际页数/配额限制仍可能拒绝请求。
+
+只保存规范化 Markdown 与真实带 page_idx/score 的结构化文本 span；页码使用上游零基索引加一，超出请求 pin 拒绝且不猜测重编号。Flash 只有 Markdown、或结果缺 score 时，observations 可为空，source/model/config/页选择仍由持久请求关联；不得从 Markdown 推测页码或填造 confidence=1。缺失/低置信度信息只能保留为未核实，不能自动生成 Human answer/Gate/Evidence。
+
+连接期只允许官方 API origin 与文档中的三个精确传输主机：`mineru.oss-cn-shanghai.aliyuncs.com`、`oss-mineru.openxlab.org.cn`、`cdn-mineru.openxlab.org.cn`。HTTPS、无重定向、无环境代理；DNS 所有答案必须为可接受公网地址，连接固定已校验地址；Authorization 只发 API，不随签名上传 URL 或 CDN 下载转发。JSON/Markdown/ZIP 上限分别为 1/8/32 MiB，ZIP 使用现有路径/解压数量/大小/比例约束且只在内存读取，整体调用默认 10 分钟超时。错误只持久化安全 code，不保存上游 envelope、URL 或 token。
+
+本地 HTTP 协议 fixture、真实 Kernel 二进制消费与取消/重启测试只证明实现和接线。真实 MinerU Flash/Pipeline/VLM、配额、跨网络下载与中英扫描质量继续为 `NOT_RUN_MANUAL_PENDING`。
+
 ## 6. Chat 视觉模型
 
 Scholar Chat 的图片输入复用同一个上传入口，但“研究材料接入”和“当前轮视觉上下文”是两个相互独立的结果：文件继续进入项目 active Intake，Chat 消息只持久化 Intake stage ref；受支持图片的原始字节仅在当前自由对话请求中瞬态编码，不写入 Chat state/localStorage，也不得自动变成 OCR Observation、Evidence、Claim、Brief answer 或任何 Gate Decision。slash command 与确定性 Grill answer 不消费待发送图片；只有视觉模型成功完成自由对话轮次后，客户端才清除本轮视觉标记。待发送图片及其 `File` handle 必须由当前 project/session 的 live client state 持有，上传进度、附件消息或普通投影触发的局部/全页 render 不得清空；只有成功消费、用户显式移除、切换到不再持有该 live session 的页面或 hard reload 才可 fail closed。不得把 render-local `Set` 当作该状态的权威所有者。

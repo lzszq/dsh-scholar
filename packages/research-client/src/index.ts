@@ -9,7 +9,7 @@ import type {
   AdoptionReceipt, ArtifactRecord, AssuranceAudit, AssuranceSemanticReviewReceipt, ChildExecutionIdentity, Claim, CorpusSnapshot, Decision, DirectionAdoption, DirectionProposal,
   EvidenceItem, ExperimentContract, Gate,
   GrillAnswerView, IdeaCard, IntakeArtifact, IntakeProjection, IntakeSession,
-  JobRecord, KernelEvent, KnowledgeActivationIntent, KnowledgeActivationRequest, KnowledgeCapability, KnowledgePackageEvaluation, KnowledgePackageRecord, ObservedPhase,
+  JobRecord, JobArtifactCreateInput, KernelEvent, KnowledgeActivationIntent, KnowledgeActivationRequest, KnowledgeCapability, KnowledgePackageEvaluation, KnowledgePackageRecord, ObservedPhase,
   PaperRef, PaperReproductionSpec, PhaseProposal, ProjectDeletionReceipt, ProtocolRevision,
   FrozenProtocolPin, JobSpecBound, ResearchIntent,
   ReproductionAttempt, ReproductionReportInput, ReproducibilityReport, ResearchProject, ResearchSynthesis,
@@ -1087,6 +1087,11 @@ export class ResearchClient {
     return this.request('POST', '/v1/artifacts', input)
   }
 
+  /** Commit a runner output only while its exact job lease is still live. */
+  registerJobArtifact(jobId: string, input: JobArtifactCreateInput): Promise<ArtifactRecord> {
+    return this.request('POST', `/v1/jobs/${encodeURIComponent(jobId)}/artifacts`, input)
+  }
+
   listArtifacts(projectId: string): Promise<ArtifactRecord[]> {
     return this.request('GET', `/v1/projects/${projectId}/artifacts`)
   }
@@ -1399,6 +1404,7 @@ export class ResearchClient {
   heartbeatRunnerTarget(
     targetId: string,
     input: { expected_revision: number; health: 'online' | 'offline' },
+    targetToken: string | undefined = this.runnerTargetToken,
   ): Promise<{
     target_id: string
     health: 'unknown' | 'online' | 'offline'
@@ -1409,7 +1415,7 @@ export class ResearchClient {
       'POST',
       `/v1/runner-targets/${encodeURIComponent(targetId)}/heartbeat`,
       input,
-      this.runnerTargetToken === undefined ? {} : { 'x-runner-target-token': this.runnerTargetToken },
+      targetToken === undefined ? {} : { 'x-runner-target-token': targetToken },
     )
   }
 

@@ -200,12 +200,15 @@ async function runFleetAgentMainCli(): Promise<void> {
   const runs = await runFleetAgentMain({
     fleetUrl,
     serviceToken,
+    runnerTargetToken,
     agentId,
     targetId,
     runnerVersion,
     publicKeyPem: fleetPublicKey,
     signingKey,
     pollIntervalMs: pollMs,
+    heartbeatIntervalMs: heartbeatMs,
+    supervisionIntervalMs: Math.min(heartbeatMs, cancelPollMs),
     registerMaxWaitMs: 60_000,
     signal,
   })
@@ -243,6 +246,7 @@ async function runSshBootstrapMain(): Promise<void> {
     connectTimeoutMs: (cli['runner.ssh_connect_timeout_ms'] as number | undefined) ?? 15000,
     fleetPublicKeyPem: readFileSync(fleetPublicKeyFile, 'utf8'),
     manifestPrivateKeyPem: privateKeyPem,
+    serviceToken,
     onStdout: text => process.stdout.write(text),
     onStderr: text => process.stderr.write(text),
   })

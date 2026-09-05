@@ -169,6 +169,12 @@ export class OcrStore {
     } catch (error) { this.db.exec('ROLLBACK'); throw error }
   }
 
+  /** Graceful worker shutdown preserves the same request and its pins. */
+  release(requestId: string): void {
+    this.db.prepare("UPDATE ocr_requests SET status = 'queued', started_at = NULL, updated_at = ? WHERE request_id = ? AND status = 'running'")
+      .run(now(), requestId)
+  }
+
   complete(requestId: string, markdown: string, observations: OcrNormalizedObservationValue[]): OcrRequestValue {
     const row = this.db.prepare('SELECT * FROM ocr_requests WHERE request_id = ?').get(requestId) as OcrRequestRow | undefined
     if (row === undefined) throw new OcrStoreError(404, 'ocr_request_not_found', 'OCR request not found')

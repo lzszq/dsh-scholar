@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   buildSshBootstrapArgs,
   parseRemoteSshEndpoint,
   resolveSshBootstrap,
+  startSshAgentBootstrap,
   SshBootstrapError,
 } from '../../workers/runner-gateway/src/ssh-bootstrap'
 
@@ -22,8 +24,10 @@ function fixture() {
   writeFileSync(join(root, 'runner/key'), 'private')
   chmodSync(join(root, 'runner/key'), 0o600)
   writeFileSync(join(root, 'runner/known_hosts'), 'lab.example ssh-ed25519 pinned')
+  writeFileSync(join(root, 'runner/identity'), 'test-target-token-0000000000000000000001', { mode: 0o600 })
   const target = {
     target_id: 'lab-a', kind: 'remote-ssh' as const, enabled: true, draining: false,
+    service_identity: { scheme: 'file' as const, name: 'runner/identity', available: true },
     connection: {
       endpoint: { scheme: 'file' as const, name: 'runner/endpoint.json', available: true },
       credential: { scheme: 'file' as const, name: 'runner/key', available: true },
@@ -69,5 +73,46 @@ describe('EXEC-ENV-02 SSH → RemoteRunnerAgent bootstrap', () => {
     expect(() => resolveSshBootstrap({ ...target, draining: true }, root)).toThrow(/disabled or draining/)
     expect(() => resolveSshBootstrap({ ...target, connection: { ...target.connection, known_hosts: { ...target.connection.known_hosts, available: false } } }, root)).toThrow(/unavailable/)
     expect(() => resolveSshBootstrap({ ...target, connection: { ...target.connection, credential: { scheme: 'vault', name: 'runner/key', available: true } } }, root)).toThrow(/no resolver/)
+  })
+
+  it('passes both identities via stdin into the fixed bootstrap script and removes temporary key files', async () => {
+    const { root, target } = fixture()
+    const output = join(root, 'captured.json')
+    const serviceToken = 'test-service-$(unused)-`literal`'
+    const targetToken = readFileSync(join(root, 'runner/identity'), 'utf8')
+    writeFileSync(join(root, 'dsh-scholar-runner'), `#!${process.execPath}
+      const fs = require('node:fs');
+      const args = process.argv.slice(2);
+      const keys = ['--fleet-public-key', '--key-file'].map(flag => args[args.indexOf(flag) + 1]);
+      fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify({
+        args, keys, keyContents: keys.map(path => fs.readFileSync(path, 'utf8')),
+        modes: keys.map(path => fs.statSync(path).mode & 0o777),
+        service: process.env.DSH_SCHOLAR_SERVICE_TOKEN, target: process.env.DSH_SCHOLAR_RUNNER_TARGET_TOKEN,
+      }));
+    `, { mode: 0o700 })
+    let sshArgs: string[] = []
+    const handle = startSshAgentBootstrap({
+      resolved: resolveSshBootstrap(target, root), fleetUrl: 'https://fleet.example', agentId: 'lab-a-agent',
+      connectTimeoutMs: 15000, fleetPublicKeyPem: 'fixture public key\n', manifestPrivateKeyPem: 'fixture private key\n', serviceToken,
+      // Execute the actual fixed bootstrap shell locally; no SSH server or
+      // external machine is contacted by this credential-channel regression.
+      spawnProcess: ((_command: string, args: string[]) => {
+        sshArgs = args
+        return spawn('/bin/sh', ['-c', args.at(-1)!], { stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: `${root}:${process.env.PATH}` } })
+      }) as typeof spawn,
+    })
+    try {
+      expect(await handle.completion).toBe(0)
+      const captured = JSON.parse(readFileSync(output, 'utf8'))
+      expect(captured).toMatchObject({ service: serviceToken, target: targetToken, modes: [0o600, 0o600], keyContents: ['fixture public key\n', 'fixture private key\n'] })
+      for (const secret of [serviceToken, targetToken, 'fixture private key']) {
+        expect(sshArgs.join(' ')).not.toContain(secret)
+        expect(captured.args.join(' ')).not.toContain(secret)
+      }
+      expect(captured.keys.every((path: string) => !existsSync(path))).toBe(true)
+    } finally {
+      if (handle.child.exitCode === null && handle.child.signalCode === null) handle.child.kill('SIGTERM')
+      await handle.completion
+    }
   })
 })
