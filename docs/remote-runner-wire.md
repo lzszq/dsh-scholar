@@ -66,6 +66,8 @@ service 证书；撤销即断开）。**本阶段环境无 CA/mTLS 设施**，�
   Agent 预留必填语义）；
 - 真实证书吊销/轮换/跨租户隔离未验收。
 
+注册与心跳还必须携带 Agent 专属的 `x-runner-target-token`。Fleet 读取当前 Target revision，原样转交该凭据到 Kernel 的 Target heartbeat 端点；Kernel 校验 `service_identity` SecretRef 后才允许 Fleet 更新注册表与 `last_seen_at`。不得用 Gateway 自己的 Target token 补齐缺失 Agent 凭据；失败保持原状态。注册时绑定 agent_id→target，并在异步 Kernel 鉴权后再次核对绑定，防止并发注册跨 Target 覆盖；后续 Agent 路由核对同一身份；共享 service token、自报 target 或证书指纹均不能替代该证明。凭据不进入 Job、Plan、注册记录和回执。该机制没有完成真实 mTLS 证书映射/轮换的验收。
+
 ## 4. 端点
 
 所有路径前缀 `/v1/agents`。除 CAS 外均为 JSON POST；错误面统一
@@ -76,6 +78,7 @@ service 证书；撤销即断开）。**本阶段环境无 CA/mTLS 设施**，�
 | POST | `/v1/agents/register` | `AgentRegisterRequest`/`AgentRegisterResponse` | 注册（capabilities/labels/health/cert_fingerprint）；`acknowledged=true` 表示服务端认可该 target |
 | POST | `/v1/agents/{agent_id}/heartbeat` | `AgentHeartbeatRequest`/`AgentHeartbeatResponse` | 心跳（可携带 draining、更新 capability/labels）；未注册 → 404 `agent_not_registered` |
 | POST | `/v1/agents/{agent_id}/claims` | `AgentClaimRequest`/`AgentClaimResponse` | 拉取匹配 claim（含签名 ExecutionPlan + lease generation/token）；空数组 = 无工作 |
+| POST | `/v1/agents/{agent_id}/runs/{run_id}/heartbeat` | `RemoteRunHeartbeatRequest`/`RemoteRunHeartbeatResponse` | claim/job/owner/generation/token 精确匹配，Kernel Job 续租并返回 running/cancelled 与最新 expiry |
 | POST | `/v1/agents/{agent_id}/runs/{run_id}/frames` | `RemoteFramesRequest`/`RemoteFramesResponse` | terminal frames（kernel 语义：全局 seq 单调、chunk/gap/exit、retention 记账） |
 | POST | `/v1/agents/{agent_id}/runs/{run_id}/artifacts` | `RemoteArtifactStageRequest`/`RemoteArtifactStageResponse` | stage：声明 sha256/size/kind/元数据，不携带内容 |
 | POST | 同上（finalize 分支） | `RemoteArtifactFinalizeRequest`/`RemoteArtifactFinalizeResponse` | finalize：携带内容，服务端复算 sha256 比对（不一致 → 409 `cas_hash_mismatch` 不落库） |
@@ -100,6 +103,12 @@ service 证书；撤销即断开）。**本阶段环境无 CA/mTLS 设施**，�
 - claim 响应中的 ExecutionPlan 由服务端签名（Ed25519，§12.7 同源语义）；
   代理端必须验签，缺签名/验签失败/未配置公钥 → 拒绝执行。
 
+终态 claim 必须立即释放 outstanding 容量（默认 8）；终态回执独立限量/限时保存（每类默认 1024 条、15 分钟）。去重键绑定 job_id/run_id/lease_generation，只保留活跃 attempt；pending/outstanding 租约过期先清理再检查容量。Kernel 恢复后的新 generation 必须重新分发，不能因旧 job_id 丢弃。Plan 保持不可变签名，续租后的 expiry 单独保存在 claim envelope。
+
+Agent 心跳独立于执行循环，间隔不超过 Fleet offline 窗口的三分之一。运行监督按 `min(heartbeat-ms,cancel-poll-ms,剩余租约/3)` 调用 run heartbeat（默认监督 5 秒）：读取 Kernel 当前 Job、校验 attempt 并续租；cancelled 或 fencing 失败终止执行进程树。网络错误不得延长本地已确认租约，独立 expiry watchdog 在断网/请求挂起时停止执行。结束、取消与停止循环必须清除定时器和取消监听；Kernel 不得续租终态或已过期 Job。
+
+HTTP 成功响应头不代表请求已完整返回：响应体读取阶段的断连和超时也归为可重试的 `transport_unreachable`，不得因此取消仍持有有效租约的实验。完整但非法的 JSON 仍是协议错误；无 JSON envelope 的 429/5xx 继续按临时错误重试，显式 fencing 拒绝不重试。
+
 ### 5.2 frames：kernel terminal 语义复用
 
 - 全局 seq 单调（幂等回放/乱序跳过由 kernel 执行）、stream_seq 按通道、
@@ -115,6 +124,7 @@ service 证书；撤销即断开）。**本阶段环境无 CA/mTLS 设施**，�
 frames/stage/finalize/complete 保存到本地有界 spool（`maxEntries`/
 `maxBytes`，默认 256 条 / 4 MiB），恢复后按序重放：
 
+- 同一 run 的新 chunk/exit 不得越过已缓冲的帧或待确认 gap；恰好满 64 帧的批次也必须等待发送链完成。gap 未确认时保留后续帧和 complete，直到重放成功；并发 flush 期间不允许新发送或队列修改越过在途重放。
 - 只有 `frames`（chunk 数据）条目可淘汰；淘汰时记录该 run 的 overflow 区间，
   **重放前先补发 gap frame**（`frame_kind='gap'`，payload 带
   dropped_from_seq/dropped_to_seq/dropped_bytes/reason=`agent_spool_overflow`）
@@ -136,8 +146,7 @@ frames/stage/finalize/complete 保存到本地有界 spool（`maxEntries`/
 > fleet 重启后 kernel lease 过期（默认 300s TTL）→ 旧 claim 的后续写入 409
 > `lease_stale`、job 回 queued retryable → fleet 重新 claim 分发；spool 内存
 > 条目随 agent 进程丢失 → terminal 帧缺 seq（kernel retention/gap 语义兜底），
-> 业务终态仍由 complete/cancel transaction 决定（同一 run 不会因 spool 丢失
-> 被重复执行——执行与 complete 都在 agent 侧按 run_id 幂等）。
+> 业务终态仍由 complete/cancel transaction 决定；内存幂等只覆盖同一 Agent 进程，不能保证重启后的同一 run 恰好执行一次。
 
 ### 5.4 artifacts：staged + finalize + sha256
 
@@ -145,7 +154,10 @@ frames/stage/finalize/complete 保存到本地有界 spool（`maxEntries`/
   内容，服务端复算 sha256 并与 stage 声明比对——不一致 → 409
   `cas_hash_mismatch`（不落库）；size 不一致 → 409 `cas_size_mismatch`；
 - stage 表有界（`maxStages`）；finalize 内容上限 32 MiB（与 UPLOAD-01 同一量级）；
-- 代理端自生成 `stage_id`（跨 spool 重放保持一致）。
+- 代理端自生成 `stage_id`（跨 spool 重放保持一致）；同 id 的重复声明必须完全一致，否则 `stage_conflict`。
+- finalize 成功前保留 stage；上游 5xx/429 可重试；并发 finalize 合并一次注册；成功后保留有界回执，响应丢失后返回相同 artifact_id/hash 与 `reused=true`。已恢复/终态 attempt 不得写入产物。
+- Fleet finalize 必须调用 Kernel 的 `POST /v1/jobs/{job_id}/artifacts`，携带 project/run/owner/generation/token。Kernel 在 `BEGIN IMMEDIATE` 事务内验证 running 状态、完整身份和未过期租约，再写 CAS、Artifact 与 outbox；取消或恢复先提交时返回 409 `lease_stale`，不会新增 blob、Artifact 或事件。普通 `/v1/artifacts` 不用于远端 run 的 finalize；租约字段不进入产物 metadata。
+- Agent spool 中的失败 stage 必须先于对应 finalize 重放，complete 等待 frames/artifacts；完全相同的 complete 重放使用终态回执，不能重复完成。回执过期或 Fleet 重启后的 unknown claim 不得解释为成功。
 
 ### 5.5 complete：manifest 签名 + fencing
 

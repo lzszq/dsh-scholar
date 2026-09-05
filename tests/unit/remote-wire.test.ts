@@ -30,7 +30,7 @@
 import { createHash, createPublicKey, generateKeyPairSync, verify } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   buildExecutionPlan,
   computeProfileConfigHash,
@@ -63,6 +63,7 @@ import {
   defaultSubprocessExecutor,
   InMemoryFleetTransport,
   RemoteFleetServer,
+  RemoteWireError,
   startFleetHttpServer,
   type AgentExecutor,
   type AgentExecutionContext,
@@ -145,9 +146,10 @@ class FakeFleetKernel implements FleetKernelClient {
     draining: false, revision: 1, config_hash: TARGET_CONFIG_HASH,
   }
 
+  async heartbeatRunnerTarget() {}
+
   async getRunnerTarget(targetId: string) {
-    if (targetId !== this.runnerTarget.target_id) throw kernelError(404, 'runner_target_unknown', `unknown target ${targetId}`)
-    return this.runnerTarget
+    return { ...this.runnerTarget, target_id: targetId }
   }
 
   seedJob(overrides: Partial<JobRecord> & { job_id: string; project_id: string } & Record<string, unknown>): JobRecord & { run_id?: string | null } {
@@ -287,7 +289,7 @@ class FakeFleetKernel implements FleetKernelClient {
     return { appended, last_seq: lastSeq, truncated: false, total_bytes: 0, dropped_bytes: 0 }
   }
 
-  async registerArtifact(input: {
+  async registerJobArtifact(_jobId: string, input: {
     project_id: string
     kind: string
     content_base64: string
@@ -450,7 +452,7 @@ class FakeFleetKernel implements FleetKernelClient {
 
 // ── 测试夹具 ───────────────────────────────────────────────────────────────
 
-const NOW = Date.parse('2026-08-11T12:00:00.000Z')
+const NOW = Date.now()
 
 function makeKeypair(keyId = 'runner-test-1'): { signingKey: RunnerSigningKey; publicKeyPem: string } {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519')
@@ -1009,6 +1011,11 @@ describe('wire 离线 spool（有界保存、恢复重放、gap 不静默丢弃�
 
     // 恢复：flush → 先补 gap（淘汰区间），再按序重放 exit_frame 与 complete。
     failing.clearFailures()
+    vi.spyOn(failing, 'uploadFrames').mockRejectedValueOnce(new RemoteWireError(0, 'transport_unreachable', 'gap response unavailable', true))
+    await agent.flushSpool()
+    expect(kernel.framesFor(run1)).toHaveLength(0)
+    expect(kernel.completes.filter(c => c.job_id.startsWith('job_gap_r'))).toHaveLength(0)
+    expect(agent.spoolStats().entries).toBeGreaterThan(0)
     await agent.flushSpool()
     expect(agent.spoolStats().entries).toBe(0)
     expect(kernel.jobs.get('job_gap_r1')?.status).toBe('succeeded')
@@ -1446,3 +1453,130 @@ class TamperingCasTransport implements RemoteFleetTransport {
     return { ...response, sha256: 'f'.repeat(64) } // 声明 hash ≠ 内容 hash
   }
 }
+
+// Review 2026-09-06: exercise the failures hidden by single-run happy paths.
+describe('remote lifecycle regression', () => {
+  it('replays a finalize whose success response was lost and completes through Agent spool', async () => {
+    const fixture = makeFleet()
+    fixture.kernel.seedJob({ job_id: 'lost-finalize', project_id: 'prj_1', payload: { output_contract: OUT } })
+    const { agent, transport } = makeAgent(fixture, { executor: fakeExecutor([{ channel: 'stdout', text: 'spool\n' }]).executor })
+    const finalize = transport.finalizeArtifact.bind(transport)
+    const registered = vi.spyOn(fixture.kernel, 'registerJobArtifact')
+    vi.spyOn(transport, 'finalizeArtifact').mockImplementationOnce(async (...args) => {
+      await finalize(...args)
+      throw new RemoteWireError(0, 'transport_unreachable', 'response lost after commit', true)
+    })
+    await claimAndRun(agent)
+    expect(fixture.kernel.jobs.get('lost-finalize')?.status).toBe('succeeded')
+    expect(agent.spoolStats().entries).toBe(0)
+    expect(registered).toHaveBeenCalledTimes(2) // log + metrics, each exactly once
+  })
+
+  it('preserves a failed stage before finalize and replays a lost complete response', async () => {
+    const fixture = makeFleet()
+    fixture.kernel.seedJob({ job_id: 'stage-order', project_id: 'prj_1', payload: { output_contract: OUT } })
+    const { agent, transport } = makeAgent(fixture, { executor: fakeExecutor([{ channel: 'stdout', text: 'spool\n' }]).executor })
+    vi.spyOn(transport, 'stageArtifact').mockRejectedValueOnce(new RemoteWireError(503, 'unavailable', 'stage unavailable', true))
+    const complete = transport.complete.bind(transport)
+    vi.spyOn(transport, 'complete').mockImplementationOnce(async (...args) => {
+      await complete(...args)
+      throw new RemoteWireError(0, 'transport_unreachable', 'complete response lost', true)
+    })
+    await claimAndRun(agent)
+    await agent.flushSpool()
+    expect(fixture.kernel.jobs.get('stage-order')?.status).toBe('succeeded')
+    expect(fixture.kernel.completes).toHaveLength(1)
+    expect(agent.spoolStats().entries).toBe(0)
+  })
+
+  it('bounds terminal receipts separately and expires them without retaining capacity', async () => {
+    const fixture = makeFleet({ maxReceipts: 2, receiptTtlMs: 1000 })
+    const { agent } = makeAgent(fixture, { executor: fakeExecutor([{ channel: 'stdout', text: 'ok\n' }]).executor })
+    await agent.register()
+    for (let i = 0; i < 5; i++) {
+      fixture.kernel.seedJob({ job_id: `receipt-${i}`, project_id: 'prj_1', payload: { output_contract: OUT } })
+      const [claim] = await agent.claimOnce()
+      await agent.runClaim(claim!)
+      expect(fixture.fleet.stats().settled_receipts).toBeLessThanOrEqual(2)
+      expect(fixture.fleet.stats().artifact_receipts).toBeLessThanOrEqual(2)
+    }
+    fixture.clock.value += 1001
+    expect(fixture.fleet.stats()).toMatchObject({ outstanding: 0, stages: 0, settled_receipts: 0, artifact_receipts: 0 })
+  })
+  it('releases capacity after every completion, including beyond the default eight claims', async () => {
+    const fixture = makeFleet()
+    const { agent } = makeAgent(fixture, { executor: fakeExecutor([{ channel: 'stdout', text: 'ok\n' }]).executor })
+    await agent.register()
+    for (let i = 0; i < 12; i++) {
+      fixture.kernel.seedJob({ job_id: `capacity-${i}`, project_id: 'prj_1', payload: { output_contract: OUT } })
+      const claims = await agent.claimOnce()
+      expect(claims, `claim ${i + 1}`).toHaveLength(1)
+      await agent.runClaim(claims[0]!)
+      expect(fixture.kernel.jobs.get(`capacity-${i}`)?.status).toBe('succeeded')
+      expect(fixture.fleet.stats().outstanding).toBe(0)
+    }
+  })
+
+  it('prunes a full pending queue and dispatches a recovered attempt of the same job', async () => {
+    const fixture = makeFleet({ maxPendingJobs: 1 })
+    fixture.kernel.seedJob({ job_id: 'recovered', project_id: 'prj_1' })
+    expect(await fixture.fleet.pump()).toBe(1)
+    const first = fixture.kernel.jobs.get('recovered')!
+    fixture.clock.value += 301_000
+    expect(await fixture.fleet.pump()).toBe(1)
+    const { agent } = makeAgent(fixture)
+    await agent.register()
+    await agent.heartbeat()
+    const claims = await agent.claimOnce()
+    expect(claims).toHaveLength(1)
+    expect(claims[0]!.plan.run_id).not.toBe(first.run_id)
+    expect(claims[0]!.lease.generation).toBe(2)
+    expect(fixture.fleet.stats()).toMatchObject({ pending: 0, outstanding: 1 })
+  })
+
+  it('retries a failed finalize and returns a receipt after a lost successful response', async () => {
+    const fixture = makeFleet()
+    fixture.kernel.seedJob({ job_id: 'finalize-retry', project_id: 'prj_1' })
+    const { agent } = makeAgent(fixture)
+    await agent.register()
+    const [claim] = await agent.claimOnce()
+    const runId = claim!.plan.run_id
+    const content = 'retryable artifact'
+    const request: RemoteArtifactFinalizeRequest = {
+      schema_version: 1, run_id: runId, stage_id: 'stable-stage', content_base64: Buffer.from(content).toString('base64'),
+    }
+    fixture.fleet.handleStageArtifact(agent.agent_id, runId, {
+      schema_version: 1, run_id: runId, stage_id: request.stage_id, sha256: sha256Hex(content), size: Buffer.byteLength(content), kind: 'log',
+    })
+    const register = vi.spyOn(fixture.kernel, 'registerJobArtifact').mockRejectedValueOnce(kernelError(503, 'temporarily_unavailable', 'try again'))
+    await expect(fixture.fleet.handleFinalizeArtifact(agent.agent_id, runId, request)).rejects.toMatchObject({ status: 503, retryable: true })
+    const response = await fixture.fleet.handleFinalizeArtifact(agent.agent_id, runId, request)
+    const replay = await fixture.fleet.handleFinalizeArtifact(agent.agent_id, runId, request)
+    expect(replay).toMatchObject({ artifact_id: response.artifact_id, sha256: response.sha256, reused: true })
+    expect(register).toHaveBeenCalledTimes(2)
+    expect(fixture.fleet.stats().stages).toBe(0)
+  })
+
+  it('coalesces concurrent finalizes and rejects reuse of a stage id for different metadata', async () => {
+    const fixture = makeFleet()
+    fixture.kernel.seedJob({ job_id: 'finalize-concurrent', project_id: 'prj_1' })
+    const { agent } = makeAgent(fixture)
+    await agent.register()
+    const [claim] = await agent.claimOnce()
+    const runId = claim!.plan.run_id
+    const stage: RemoteArtifactStageRequest = {
+      schema_version: 1, run_id: runId, stage_id: 'same-stage', sha256: sha256Hex('abc'), size: 3, kind: 'log',
+    }
+    fixture.fleet.handleStageArtifact(agent.agent_id, runId, stage)
+    expect(() => fixture.fleet.handleStageArtifact(agent.agent_id, runId, { ...stage, kind: 'data' }))
+      .toThrow(expect.objectContaining({ code: 'stage_conflict' }))
+    const register = vi.spyOn(fixture.kernel, 'registerJobArtifact')
+    const finalize: RemoteArtifactFinalizeRequest = { schema_version: 1, run_id: runId, stage_id: stage.stage_id!, content_base64: 'YWJj' }
+    const responses = await Promise.all([
+      fixture.fleet.handleFinalizeArtifact(agent.agent_id, runId, finalize),
+      fixture.fleet.handleFinalizeArtifact(agent.agent_id, runId, finalize),
+    ])
+    expect(responses[0]!.artifact_id).toBe(responses[1]!.artifact_id)
+    expect(register).toHaveBeenCalledTimes(1)
+  })
+})

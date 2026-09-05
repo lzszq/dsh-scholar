@@ -181,6 +181,9 @@ export {
   type MinerUOcrTransport, type MinerUExtractInput, type MinerUExtractResult,
   type MinerUTransportBinding, type OcrSourceBytes, type OcrWorkerKernelPort,
 } from './ocr-worker.js'
+export { HttpMinerUTransport, normalizeMinerUArchive, type MinerUTransportOptions } from './mineru-transport.js'
+export { requestMinerU, validateMinerUUrl, validateMinerUAddress, type MinerUHttpInput, type MinerUHttpRequest } from './mineru-http.js'
+export { MinerUOcrService, readMinerUCredential, type MinerUOcrServiceOptions } from './ocr-service.js'
 export {
   openPtySessionStore, PtySessionStore, PtyError, NullPtyAdapter,
   PTY_CURRENT_DDL, PTY_DDL, PTY_SESSIONS_TABLE_DDL,

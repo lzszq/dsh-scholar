@@ -21,6 +21,7 @@ export interface RemoteSshTargetView {
   kind: 'local-process' | 'local-docker' | 'remote-ssh'
   enabled: boolean
   draining: boolean
+  service_identity?: SshSecretRefView
   connection?: {
     endpoint: SshSecretRefView
     credential: SshSecretRefView
@@ -39,6 +40,7 @@ export interface ResolvedSshBootstrap {
   endpoint: RemoteSshEndpoint
   credential_file: string
   known_hosts_file: string
+  target_identity_file: string
 }
 
 export class SshBootstrapError extends Error {
@@ -85,17 +87,21 @@ export function resolveSshBootstrap(target: RemoteSshTargetView, secretRoot: str
   if (target.kind !== 'remote-ssh') throw new SshBootstrapError(`target ${target.target_id} is not remote-ssh`)
   if (!target.enabled || target.draining) throw new SshBootstrapError(`target ${target.target_id} is disabled or draining`)
   if (target.connection === undefined) throw new SshBootstrapError(`target ${target.target_id} has no SSH SecretRefs`)
+  if (target.service_identity === undefined) throw new SshBootstrapError('target has no service identity SecretRef')
   const endpointFile = resolveSecretFile(secretRoot, target.connection.endpoint, 'endpoint')
   const credentialFile = resolveSecretFile(secretRoot, target.connection.credential, 'credential')
   const knownHostsFile = resolveSecretFile(secretRoot, target.connection.known_hosts, 'known_hosts')
+  const targetIdentityFile = resolveSecretFile(secretRoot, target.service_identity, 'service identity')
   if ((statSync(credentialFile).mode & 0o077) !== 0) {
     throw new SshBootstrapError('credential file must not be group/world accessible (expected mode 0600 or stricter)')
   }
+  if ((statSync(targetIdentityFile).mode & 0o777) !== 0o600) throw new SshBootstrapError('target identity file must have mode 0600')
   return {
     target_id: target.target_id,
     endpoint: parseRemoteSshEndpoint(readFileSync(endpointFile, 'utf8')),
     credential_file: credentialFile,
     known_hosts_file: knownHostsFile,
+    target_identity_file: targetIdentityFile,
   }
 }
 
@@ -121,8 +127,12 @@ export function buildSshBootstrapArgs(input: {
     'trap \'rm -f "$key_file" "$manifest_key_file"\' EXIT HUP INT TERM',
     'IFS= read -r fleet_key_b64',
     'IFS= read -r manifest_key_b64',
+    'IFS= read -r service_token_b64',
+    'IFS= read -r target_token_b64',
     'printf %s "$fleet_key_b64" | base64 -d > "$key_file"',
     'printf %s "$manifest_key_b64" | base64 -d > "$manifest_key_file"',
+    'export DSH_SCHOLAR_SERVICE_TOKEN="$(printf %s "$service_token_b64" | base64 -d)"',
+    'export DSH_SCHOLAR_RUNNER_TARGET_TOKEN="$(printf %s "$target_token_b64" | base64 -d)"',
     `dsh-scholar-runner --agent ${shellQuote(fleet.toString())} --agent-id ${shellQuote(input.agentId)} --target-id ${shellQuote(targetId)} --fleet-public-key "$key_file" --key-file "$manifest_key_file"`,
     'exit_code=$?',
     'rm -f "$key_file" "$manifest_key_file"',
@@ -160,14 +170,20 @@ export function startSshAgentBootstrap(input: {
   connectTimeoutMs: number
   fleetPublicKeyPem: string
   manifestPrivateKeyPem: string
+  serviceToken?: string
   spawnProcess?: typeof spawn
   onStdout?: (text: string) => void
   onStderr?: (text: string) => void
 }): SshBootstrapHandle {
   const args = buildSshBootstrapArgs(input)
+  const targetToken = readFileSync(input.resolved.target_identity_file, 'utf8').trim()
+  if (Buffer.byteLength(targetToken) < 32 || Buffer.byteLength(targetToken) > 4096 || /[\r\n]/.test(targetToken)) {
+    throw new SshBootstrapError('target identity token is invalid')
+  }
   const spawnProcess = input.spawnProcess ?? spawn
   const child = spawnProcess('ssh', args, { stdio: ['pipe', 'pipe', 'pipe'] }) as ChildProcessWithoutNullStreams
-  child.stdin.end(`${Buffer.from(input.fleetPublicKeyPem).toString('base64')}\n${Buffer.from(input.manifestPrivateKeyPem).toString('base64')}\n`)
+  child.stdin.end([input.fleetPublicKeyPem, input.manifestPrivateKeyPem, input.serviceToken ?? '', targetToken]
+    .map(value => Buffer.from(value).toString('base64')).join('\n') + '\n')
   child.stdout.on('data', chunk => input.onStdout?.(String(chunk)))
   child.stderr.on('data', chunk => {
     const endpoint = input.resolved.endpoint

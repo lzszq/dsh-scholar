@@ -57,7 +57,7 @@ function fixture(): {
 }
 
 async function withServer(kernel: ResearchKernel, work: (base: string) => Promise<void>): Promise<void> {
-  const { server, port } = await startKernelServer({ kernel, host: '127.0.0.1', port: 0 })
+  const { server, port } = await startKernelServer({ kernel, host: '127.0.0.1', port: 0, ocrWorker: false })
   try {
     await work(`http://127.0.0.1:${port}`)
   } finally {

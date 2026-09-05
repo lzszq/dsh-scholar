@@ -16,7 +16,7 @@ import { z } from 'zod'
 import {
   ArtifactKind, ArtifactRecord, BudgetConstraints, BudgetRecord, Claim, CodeSnapshot, CorpusSnapshot, Decision, DirectionGatePayload,
   EvidenceItem, ExecutionConfig, ExperimentContract, FrozenProtocolPin, Gate, IdeaCard, IntegrityConfig, NoveltyAudit,
-  JobRecord, KernelEvent, KernelEventKind, Paper, Passage, ResearchIntent, ResearchProject, ResearchBrief,
+  JobRecord, type JobArtifactCreateInput, KernelEvent, KernelEventKind, Paper, Passage, ResearchIntent, ResearchProject, ResearchBrief,
   RunnerKey, SessionLink, TRANSITION_TABLE, buildClaimId, buildContractId, buildGateId, buildIdeaId,
   buildProjectId, canonicalJsonDeep, getFixtureProfile, getRunnerProfile, randomId, resolveRunnerProfileId, runnerTargetConfigHash, validateConfig, RUNNER_PROFILE_IDS, ProjectStatus as ProjectStatusSchema, type GateType, type JobSpecBound, type JobStatus, type NextAction, type ProjectStatus,
   type HumanPrincipal, type IntakeArtifact, type IntakeObservation, type IntakeProjection, type IntakeSession,
@@ -88,6 +88,7 @@ import { uploadStagedPath, intakeQuotaCheck } from './chunked-upload.js'
 import { RunnerTargetRegistry } from './runner-target-registry.js'
 import { OcrStore, OcrStoreError } from './ocr-store.js'
 import type { OcrSourceBytes } from './ocr-worker.js'
+import { MinerUOcrService, type MinerUOcrServiceOptions } from './ocr-service.js'
 import { ConfigWriteStore, ConfigWriteStoreError, readRuntimeConfigForOwner } from './config-write-store.js'
 import { SettingsWriteCoordinator } from './settings-write-coordinator.js'
 import { assessRunnerEnvironment } from './runner-environment-readiness.js'
@@ -984,6 +985,7 @@ export class ResearchKernel {
   readonly intakeQuotaBytes: number
   /** MODEL-01: secret root for file-scheme SecretRef availability (null = none). */
   readonly secretRoot: string | null
+  private ocrService: MinerUOcrService | null = null
   /** MODEL-01: provider base-URL allowlist (SSRF fail closed). */
   readonly providerUrlAllowlist: ProviderUrlAllowlist
   /** EXEC-ENV-02: authoritative configurable local/Docker/remote-SSH targets. */
@@ -1262,6 +1264,7 @@ export class ResearchKernel {
   }
 
   close(): void {
+    void this.stopOcrWorker()
     if (this.ptySweepTimer !== null) clearInterval(this.ptySweepTimer)
     for (const timer of this.previewTimers.values()) clearTimeout(timer)
     this.previewTimers.clear()
@@ -3094,6 +3097,25 @@ export class ResearchKernel {
     this.db.prepare('INSERT INTO artifacts (artifact_id, project_id, kind, size_bytes, sha256, metadata, media_type, file_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(record.artifact_id, record.project_id, record.kind, record.size_bytes, record.sha256, JSON.stringify(record.metadata), record.media_type, record.file_name, record.created_at)
     this.emit(record.project_id, 'artifact.registered', { artifact_id: record.artifact_id, kind: record.kind, size_bytes: record.size_bytes })
+  }
+
+  /** Validate the live attempt and register its output under the same write
+   * lock as cancellation/recovery. A Fleet-side read alone cannot fence it. */
+  registerJobArtifact(jobId: string, input: Omit<JobArtifactCreateInput, 'content_base64'> & { content: Uint8Array | string }): ArtifactRecord {
+    return withTransaction(this.db, () => {
+      const job = this.getJob(jobId)
+      if (job.status !== 'running' || job.project_id !== input.project_id || job.run_id !== input.run_id
+        || job.lease_owner !== input.owner || job.lease_generation !== input.lease_generation
+        || job.lease_expires_at === null || !Number.isFinite(Date.parse(job.lease_expires_at))
+        || Date.parse(job.lease_expires_at) <= Date.now() || !this.leaseTokenMatches(jobId, input.lease_token)) {
+        throw new KernelError(409, 'lease_stale', 'artifact registration requires the current running job attempt')
+      }
+      return this.registerArtifact({
+        project_id: input.project_id, kind: input.kind, content: input.content,
+        metadata: { ...input.metadata, job_id: jobId, run_id: input.run_id },
+        media_type: input.media_type, file_name: input.file_name,
+      })
+    })
   }
 
   registerArtifact(input: {
@@ -5104,6 +5126,20 @@ export class ResearchKernel {
    * a restart requeues any `running` request in OcrStore construction. */
   claimNextOcrRequest(): OcrRequest | null {
     return this.ocrStoreCall(() => this.ocr.claimNext())
+  }
+
+  startOcrWorker(options: MinerUOcrServiceOptions = {}): MinerUOcrService {
+    return this.ocrService ??= new MinerUOcrService(this, options)
+  }
+
+  stopOcrWorker(): Promise<void> {
+    const service = this.ocrService
+    this.ocrService = null
+    return service?.stop() ?? Promise.resolve()
+  }
+
+  releaseOcrRequest(requestId: string): void {
+    this.ocr.release(requestId)
   }
 
   /** Load and re-hash the exact pinned Intake source, never a newer path. */
@@ -7441,6 +7477,10 @@ export class ResearchKernel {
    */
   heartbeatJob(jobId: string, owner: string, generation?: number | null, token?: string | null, leaseTtlSeconds = 300): JobRecord {
     const job = this.getJob(jobId)
+    if (job.status !== 'running') throw new KernelError(409, 'job_not_running', `job ${jobId} is not running`)
+    if (job.lease_expires_at === null || Date.parse(job.lease_expires_at) <= Date.now()) {
+      throw new KernelError(409, 'lease_stale', `job ${jobId} lease has expired`)
+    }
     if (job.lease_owner !== null && job.lease_owner !== owner) {
       throw new KernelError(409, 'lease_conflict', `job ${jobId} leased by ${job.lease_owner}`)
     }

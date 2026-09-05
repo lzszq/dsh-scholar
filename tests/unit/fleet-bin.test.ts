@@ -138,6 +138,8 @@ class FakeFleetKernel implements FleetKernelClient {
   readonly completes: RecordedComplete[] = []
   manifestPublicKeyPem: string | null = null
 
+  async heartbeatRunnerTarget() {}
+
   async getRunnerTarget(targetId: string) {
     return {
       target_id: targetId,
@@ -275,7 +277,7 @@ class FakeFleetKernel implements FleetKernelClient {
     return { appended, last_seq: lastSeq, truncated: false, total_bytes: 0, dropped_bytes: 0 }
   }
 
-  async registerArtifact(input: {
+  async registerJobArtifact(_jobId: string, input: {
     project_id: string
     kind: string
     content_base64: string
@@ -435,7 +437,7 @@ class FakeFleetKernel implements FleetKernelClient {
 
 // ── 测试夹具 ───────────────────────────────────────────────────────────────
 
-const NOW = Date.parse('2026-08-11T12:00:00.000Z')
+const NOW = Date.now()
 
 function makeKeypair(keyId = 'runner-test-1'): { signingKey: RunnerSigningKey; publicKeyPem: string } {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519')
@@ -815,7 +817,7 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
         res.end(JSON.stringify([job]))
         return
       }
-      if ((req.method ?? 'GET') === 'GET' && (req.url ?? '').startsWith('/v1/runner-targets/')) {
+      if ((req.url ?? '').startsWith('/v1/runner-targets/')) {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({
           target_id: 'remote-gpu-1', kind: 'remote-ssh', enabled: true, draining: false,
@@ -846,10 +848,9 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
         owner: 'fleet-owner',
         now: () => NOW,
       })
-      noToken.handleRegister(makeRegistration())
-      await expect(noToken.handleClaims('agent-gpu-1', { schema_version: 1, limit: 1 }))
+      await expect(noToken.handleRegister(makeRegistration()))
         .rejects.toMatchObject({ status: 401, retryable: false })
-      expect(seen.some(r => r.path.startsWith('/v1/jobs-claim/'))).toBe(true)
+      expect(seen.some(r => r.path.startsWith('/v1/runner-targets/'))).toBe(true)
 
       // 3) 带 kernel token：claim 成功 + CAS 字节往返 hash/size 完全一致。
       const withToken = new RemoteFleetServer({
@@ -858,7 +859,7 @@ describe('FLEET-01 HTTP 传输（startFleetServer 真实 listener + HttpRemoteFl
         owner: 'fleet-owner',
         now: () => NOW,
       })
-      withToken.handleRegister(makeRegistration())
+      await withToken.handleRegister(makeRegistration())
       const claims2 = await withToken.handleClaims('agent-gpu-1', { schema_version: 1, limit: 1 })
       expect(claims2.claims).toHaveLength(1)
       const cas = await withToken.handleCas('agent-gpu-1', `sha256:${bytes.toString('hex')}`, 'prj_1')

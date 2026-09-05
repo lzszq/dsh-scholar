@@ -46,6 +46,7 @@ import {
   RemoteArtifactStageRequest as RemoteArtifactStageRequestSchema,
   RemoteCompleteRequest as RemoteCompleteRequestSchema,
   RemoteFramesRequest as RemoteFramesRequestSchema,
+  RemoteRunHeartbeatRequest as RemoteRunHeartbeatRequestSchema,
   signExecutionPlan,
   type AgentHeartbeatRequest,
   type AgentHeartbeatResponse,
@@ -57,6 +58,7 @@ import {
   type CasFetchResponse,
   type ExecutionPlan,
   type JobRecord,
+  type JobArtifactCreateInput,
   type PlanSigningKey,
   type RemoteAgentRegistration,
   type RemoteArtifactFinalizeRequest,
@@ -67,10 +69,13 @@ import {
   type RemoteCompleteResponse,
   type RemoteFramesRequest,
   type RemoteFramesResponse,
+  type RemoteRunHeartbeatRequest,
+  type RemoteRunHeartbeatResponse,
   type RemoteWireErrorEnvelope,
 } from '@dsh-scholar/research-schemas'
 import type { AgentRegistry } from './agent-registry.js'
 import { appendTerminalFramesWithLease } from './kernel-client.js'
+import { canonicalJson } from './manifest-signing.js'
 
 // ── kernel client 面（远程 fleet 复用本地 runner 同一 kernel 路径）─────────
 
@@ -80,6 +85,11 @@ import { appendTerminalFramesWithLease } from './kernel-client.js'
  * （appendTerminalFramesWithLease 的 owner/token 头语义）。
  */
 export interface FleetKernelClient {
+  heartbeatRunnerTarget(
+    targetId: string,
+    input: { expected_revision: number; health: 'online' | 'offline' },
+    targetToken: string,
+  ): Promise<unknown>
   claimJobs(
     owner: string,
     limit: number,
@@ -90,14 +100,7 @@ export interface FleetKernelClient {
       include_unpinned?: boolean
     },
   ): Promise<JobRecord[]>
-  registerArtifact(input: {
-    project_id: string
-    kind: string
-    content_base64: string
-    metadata?: Record<string, unknown>
-    media_type?: string
-    file_name?: string
-  }): Promise<{ artifact_id: string; sha256?: string }>
+  registerJobArtifact(jobId: string, input: JobArtifactCreateInput): Promise<{ artifact_id: string; sha256?: string }>
   completeJob(input: {
     job_id: string
     owner: string
@@ -151,8 +154,10 @@ export interface FleetKernelClient {
 /** ResearchClient → FleetKernelClient 适配（frames 复用本地 runner 的 lease 头路径）。 */
 export function createFleetKernelClient(client: ResearchClient): FleetKernelClient {
   return {
+    // Never substitute the gateway's own identity for the connecting agent.
+    heartbeatRunnerTarget: (targetId, input, token) => client.heartbeatRunnerTarget(targetId, input, token),
     claimJobs: (owner, limit, ttl, filter) => client.claimJobs(owner, limit, ttl, filter),
-    registerArtifact: input => client.registerArtifact(input),
+    registerJobArtifact: (jobId, input) => client.registerJobArtifact(jobId, input),
     completeJob: input => client.completeJob(input),
     heartbeatJob: (jobId, owner, gen, token) => client.heartbeatJob(jobId, owner, gen, token),
     getJob: jobId => client.getJob(jobId),
@@ -188,7 +193,7 @@ export function fleetErrorEnvelope(error: unknown): RemoteWireErrorEnvelope {
     return {
       code: kernel.code,
       message: kernel.message,
-      retryable: kernel.status === 409 || kernel.code === 'lease_stale' || kernel.code === 'lease_conflict',
+      retryable: kernel.status >= 500 || kernel.status === 429 || kernel.status === 409,
     }
   }
   return { code: 'internal', message: (error as Error).message ?? String(error), retryable: false }
@@ -199,7 +204,7 @@ export function mapKernelError(error: unknown): FleetServerError {
   if (error instanceof FleetServerError) return error
   if (error instanceof Error && 'status' in error && 'code' in error) {
     const kernel = error as { status: number; code: string; message: string }
-    const retryable = kernel.status === 409 || kernel.code === 'lease_stale' || kernel.code === 'lease_conflict'
+    const retryable = kernel.status >= 500 || kernel.status === 429 || kernel.status === 409
     return new FleetServerError(kernel.status, kernel.code, kernel.message, retryable)
   }
   return new FleetServerError(502, 'kernel_unreachable', (error as Error).message ?? String(error), true)
@@ -226,6 +231,10 @@ interface OutstandingClaim {
   /** lease 过期/协议拒绝后置 settled：旧 agent 的后续写入一律 409。 */
   settled: boolean
   settled_code: string | null
+  /** Mutable lease observation, kept outside the signed immutable plan. */
+  lease_expires_at: string | null
+  settled_at?: number
+  completion?: { request_hash: string; response: RemoteCompleteResponse }
 }
 
 /** staged artifact（finalize 前只持有 hash/size 声明）。 */
@@ -235,11 +244,12 @@ interface PendingStage {
   project_id: string
   sha256: string
   size: number
-  kind: string
+  kind: RemoteArtifactStageRequest['kind']
   media_type: string | null
   file_name: string | null
   metadata: Record<string, unknown>
   created_at: string
+  finalizing?: Promise<RemoteArtifactFinalizeResponse>
 }
 
 export interface RemoteFleetServerOptions {
@@ -260,6 +270,9 @@ export interface RemoteFleetServerOptions {
   maxStages?: number
   /** finalize 内容上限（默认 32 MiB，与 UPLOAD-01 同一量级）。 */
   maxFinalizeBytes?: number
+  /** Each receipt cache is bounded by both count and age; contains no bytes. */
+  maxReceipts?: number
+  receiptTtlMs?: number
   /** 从 Job 解析绑定的 target_id；默认取 payload.target_id（缺省 local-docker）。 */
   /** 显式时钟（测试确定性）。 */
   now?: () => number
@@ -269,6 +282,8 @@ export interface RemoteFleetServerStats {
   pending: number
   outstanding: number
   stages: number
+  settled_receipts: number
+  artifact_receipts: number
 }
 
 /**
@@ -287,6 +302,8 @@ export class RemoteFleetServer {
   private readonly maxOutstandingPerAgent: number
   private readonly maxStages: number
   private readonly maxFinalizeBytes: number
+  private readonly maxReceipts: number
+  private readonly receiptTtlMs: number
   private readonly now: () => number
 
   /** 已 claim 但未分发的任务（FIFO）。 */
@@ -294,8 +311,12 @@ export class RemoteFleetServer {
   /** 已分发任务：agent_id → run_id → claim。 */
   private readonly outstanding = new Map<string, Map<string, OutstandingClaim>>()
   private readonly stages = new Map<string, PendingStage>()
-  /** 曾 claim 的 job_id（防重复 pump；kernel 是最终去重权威）。 */
-  private readonly claimedJobIds = new Set<string>()
+  /** Only live attempts are deduplicated. Kernel owns job-level retries. */
+  private readonly claimedAttempts = new Set<string>()
+  private readonly settledClaims = new Map<string, OutstandingClaim>()
+  private readonly finalizedStages = new Map<string, { stage: PendingStage; response: RemoteArtifactFinalizeResponse; at: number }>()
+  private pumping: Promise<number> | null = null
+  private readonly agentIdentities = new Map<string, string>()
 
   constructor(options: RemoteFleetServerOptions) {
     this.registry = options.registry
@@ -309,21 +330,39 @@ export class RemoteFleetServer {
     this.maxOutstandingPerAgent = options.maxOutstandingPerAgent ?? 8
     this.maxStages = options.maxStages ?? 64
     this.maxFinalizeBytes = options.maxFinalizeBytes ?? 32 * 1024 * 1024
+    this.maxReceipts = options.maxReceipts ?? 1024
+    this.receiptTtlMs = options.receiptTtlMs ?? 15 * 60_000
     this.now = options.now ?? (() => Date.now())
   }
 
   stats(): RemoteFleetServerStats {
+    this.pruneExpiredState()
     let outstanding = 0
     for (const byRun of this.outstanding.values()) outstanding += byRun.size
-    return { pending: this.pending.length, outstanding, stages: this.stages.size }
+    return {
+      pending: this.pending.length, outstanding, stages: this.stages.size,
+      settled_receipts: this.settledClaims.size, artifact_receipts: this.finalizedStages.size,
+    }
   }
 
   // ── 注册 / 心跳 ──────────────────────────────────────────────────────────
 
   /** POST /v1/agents/register */
-  handleRegister(req: AgentRegisterRequest): AgentRegisterResponse {
+  async handleRegister(req: AgentRegisterRequest, targetToken = ''): Promise<AgentRegisterResponse> {
     const parsed = validateWire<AgentRegisterRequest>(AgentRegisterRequestSchema, req, 'AgentRegisterRequest')
-    this.registry.register(parsed)
+    const current = this.registry.get(parsed.agent_id)
+    if (current !== undefined && current.target_id !== parsed.target_id) {
+      throw new FleetServerError(409, 'agent_target_conflict', 'agent id is already bound to a different target', false)
+    }
+    await this.observeTarget(parsed, targetToken)
+    // Kernel authentication yields. Another Target may have registered this
+    // Agent meanwhile; recheck the binding before publishing any local state.
+    const verifiedCurrent = this.registry.get(parsed.agent_id)
+    if (verifiedCurrent !== undefined && verifiedCurrent.target_id !== parsed.target_id) {
+      throw new FleetServerError(409, 'agent_target_conflict', 'agent id is already bound to a different target', false)
+    }
+    this.registry.register({ ...parsed, health: { ...parsed.health, last_seen: new Date(this.now()).toISOString() } })
+    this.agentIdentities.set(parsed.agent_id, createHash('sha256').update(targetToken).digest('hex'))
     return {
       schema_version: 1,
       acknowledged: true,
@@ -334,29 +373,48 @@ export class RemoteFleetServer {
   }
 
   /** POST /v1/agents/{agent_id}/heartbeat —— 未注册 agent → 404（fail closed）。 */
-  handleHeartbeat(agentId: string, req: AgentHeartbeatRequest): AgentHeartbeatResponse {
+  async handleHeartbeat(agentId: string, req: AgentHeartbeatRequest, targetToken = ''): Promise<AgentHeartbeatResponse> {
     const parsed = validateWire<AgentHeartbeatRequest>(AgentHeartbeatRequestSchema, req, 'AgentHeartbeatRequest')
     const current = this.registry.get(agentId)
     if (current === undefined) {
       throw new FleetServerError(404, 'agent_not_registered', `agent ${agentId} is not registered — register first`, true)
     }
-    let registration = this.registry.heartbeat(agentId, parsed.status, this.now()) ?? current
-    if (parsed.capabilities !== undefined || parsed.labels !== undefined) {
-      const next: RemoteAgentRegistration = {
-        ...registration,
-        capabilities: parsed.capabilities ?? registration.capabilities,
-        labels: parsed.labels ?? registration.labels,
-        health: { ...registration.health, last_seen: new Date(this.now()).toISOString() },
-      }
-      this.registry.register(next)
-      registration = next
+    const registration: RemoteAgentRegistration = {
+      ...current,
+      capabilities: parsed.capabilities ?? current.capabilities,
+      labels: parsed.labels ?? current.labels,
+      health: { status: parsed.status ?? current.health.status, last_seen: new Date(this.now()).toISOString() },
     }
+    await this.observeTarget(registration, targetToken)
+    this.registry.register(registration)
     return {
       schema_version: 1,
       acknowledged: true,
       accepted: true,
       target_id: registration.target_id,
       offline_after_ms: this.offlineAfterMs,
+    }
+  }
+
+  private async observeTarget(registration: RemoteAgentRegistration, token: string): Promise<void> {
+    try {
+      const target = await this.client.getRunnerTarget?.(registration.target_id)
+      if (target === undefined || target.kind !== 'remote-ssh') {
+        throw new FleetServerError(409, 'runner_target_kind_mismatch', 'remote agent requires a registered remote-ssh target', false)
+      }
+      await this.client.heartbeatRunnerTarget(target.target_id, {
+        expected_revision: target.revision,
+        health: registration.health.status === 'online' ? 'online' : 'offline',
+      }, token)
+    } catch (error) { throw mapKernelError(error) }
+  }
+
+  /** HTTP identity binding is established only after Kernel verifies the
+   * target credential. A shared fleet service token cannot impersonate it. */
+  authorizeAgent(agentId: string, targetToken: string): void {
+    const identity = this.agentIdentities.get(agentId)
+    if (identity !== undefined && identity !== createHash('sha256').update(targetToken).digest('hex')) {
+      throw new FleetServerError(403, 'runner_target_identity_required', 'agent route requires its registered target identity', false)
     }
   }
 
@@ -370,6 +428,7 @@ export class RemoteFleetServer {
    * 无匹配 → 空 claims（正常轮询）；任务留在 pending（retryable，不静默改派）。
    */
   async handleClaims(agentId: string, req: AgentClaimRequest): Promise<AgentClaimResponse> {
+    this.pruneExpiredState()
     const parsed = validateWire<AgentClaimRequest>(AgentClaimRequestSchema, req, 'AgentClaimRequest')
     const registration = this.registry.get(agentId)
     if (registration === undefined) {
@@ -434,6 +493,8 @@ export class RemoteFleetServer {
             reason = `runner target ${plan.target_id} changed after claim; remote dispatch pin is stale`
           }
         } catch (error) {
+          const mapped = mapKernelError(error)
+          if (mapped.status >= 500 || mapped.status === 429) throw mapped
           reason = `runner target ${plan.target_id} could not be revalidated before remote dispatch: ${(error as Error).message ?? String(error)}`
         }
       }
@@ -455,7 +516,8 @@ export class RemoteFleetServer {
         this.settle(outstanding, 'runner_target_stale')
       } catch (error) {
         const mapped = mapKernelError(error)
-        this.settle(outstanding, mapped.code)
+        if (mapped.status === 409) this.settle(outstanding, mapped.code)
+        else throw mapped
       }
     }
     return accepted
@@ -482,6 +544,7 @@ export class RemoteFleetServer {
           claimed_at: candidate.claimed_at,
           settled: false,
           settled_code: null,
+          lease_expires_at: candidate.plan.lease.expires_at,
         }
         matched.push(claim)
         this.assign(claim)
@@ -497,8 +560,13 @@ export class RemoteFleetServer {
    * ExecutionPlan，进入 pending（有界）。返回新增数量。
    */
   async pump(limit = 4): Promise<number> {
-    if (this.pending.length >= this.maxPendingJobs) return 0
-    this.pruneExpiredPending()
+    if (this.pumping !== null) return this.pumping
+    this.pumping = this.pumpOnce(limit)
+    try { return await this.pumping } finally { this.pumping = null }
+  }
+
+  private async pumpOnce(limit: number): Promise<number> {
+    this.pruneExpiredState()
     const room = Math.min(limit, this.maxPendingJobs - this.pending.length)
     if (room <= 0) return 0
     let jobs: JobRecord[]
@@ -515,7 +583,7 @@ export class RemoteFleetServer {
     }
     let added = 0
     for (const job of jobs) {
-      if (this.claimedJobIds.has(job.job_id) || this.pending.some(p => p.job.job_id === job.job_id)) continue
+      if (this.claimedAttempts.has(this.attemptKey(job))) continue
       let plan: ExecutionPlan
       try {
         plan = this.buildPlan(job)
@@ -536,7 +604,7 @@ export class RemoteFleetServer {
         }
         continue
       }
-      this.claimedJobIds.add(job.job_id)
+      this.claimedAttempts.add(this.attemptKey(job))
       this.pending.push({
         claim_id: `clm_${randomUUID().replaceAll('-', '').slice(0, 12)}`,
         job,
@@ -550,6 +618,48 @@ export class RemoteFleetServer {
   }
 
   // ── frames（复用 kernel terminal frame 语义）─────────────────────────────
+
+  async handleRunHeartbeat(agentId: string, runId: string, req: RemoteRunHeartbeatRequest): Promise<RemoteRunHeartbeatResponse> {
+    const parsed = validateWire<RemoteRunHeartbeatRequest>(RemoteRunHeartbeatRequestSchema, req, 'RemoteRunHeartbeatRequest')
+    const claim = this.requireOutstanding(agentId, runId)
+    this.assertClaimFence(claim, parsed)
+    if (claim.settled) {
+      if (claim.settled_code === 'job_cancelled') return { schema_version: 1, run_id: runId, status: 'cancelled', lease_expires_at: null }
+      throw new FleetServerError(409, 'lease_stale', 'run is no longer active', false)
+    }
+    try {
+      const current = await this.client.getJob(claim.job.job_id)
+      if (current.status === 'cancelled' && current.lease_generation === claim.plan.lease.generation) {
+        this.settle(claim, 'job_cancelled')
+        return { schema_version: 1, run_id: runId, status: 'cancelled', lease_expires_at: null }
+      }
+      this.assertCurrentAttempt(claim, current)
+      const renewed = await this.client.heartbeatJob(claim.job.job_id, parsed.lease.owner, parsed.lease.generation, parsed.lease.token)
+      this.assertCurrentAttempt(claim, renewed)
+      claim.lease_expires_at = renewed.lease_expires_at
+      return { schema_version: 1, run_id: runId, status: 'running', lease_expires_at: renewed.lease_expires_at }
+    } catch (error) {
+      const mapped = mapKernelError(error)
+      if (mapped.status === 409) this.settle(claim, 'lease_stale')
+      throw mapped
+    }
+  }
+
+  private assertClaimFence(claim: OutstandingClaim, request: RemoteRunHeartbeatRequest): void {
+    if (request.claim_id !== claim.claim_id || request.job_id !== claim.job.job_id
+      || request.lease.owner !== claim.plan.lease.owner || request.lease.generation !== claim.plan.lease.generation
+      || request.lease.token !== claim.plan.lease.token) {
+      throw new FleetServerError(409, 'lease_stale', 'request does not match the claimed attempt', false)
+    }
+  }
+
+  private assertCurrentAttempt(claim: OutstandingClaim, job: JobRecord & { run_id?: string | null }): void {
+    if (job.status !== 'running' || job.run_id !== claim.plan.run_id
+      || job.lease_owner !== claim.plan.lease.owner || job.lease_generation !== claim.plan.lease.generation
+      || job.lease_expires_at === null || Date.parse(job.lease_expires_at) <= this.now()) {
+      throw new FleetServerError(409, 'lease_stale', 'Kernel no longer owns this active attempt', false)
+    }
+  }
 
   /** POST /v1/agents/{agent_id}/runs/{run_id}/frames */
   async handleFrames(agentId: string, runId: string, req: RemoteFramesRequest): Promise<RemoteFramesResponse> {
@@ -596,11 +706,8 @@ export class RemoteFleetServer {
       throw new FleetServerError(409, claim.settled_code ?? 'lease_stale',
         `run ${runId} was settled — artifact staging from a stale agent is rejected`, true)
     }
-    if (this.stages.size >= this.maxStages) {
-      throw new FleetServerError(409, 'stage_capacity', `stage table is full (${this.maxStages}) — finalize pending stages first`, true)
-    }
     const stageId = parsed.stage_id ?? `stg_${randomUUID().replaceAll('-', '').slice(0, 12)}`
-    this.stages.set(stageId, {
+    const next: PendingStage = {
       stage_id: stageId,
       run_id: runId,
       project_id: claim.job.project_id,
@@ -611,7 +718,19 @@ export class RemoteFleetServer {
       file_name: parsed.file_name ?? null,
       metadata: parsed.metadata ?? {},
       created_at: new Date(this.now()).toISOString(),
-    })
+    }
+    const previous = this.stages.get(stageId) ?? this.finalizedStages.get(stageId)?.stage
+    if (previous !== undefined) {
+      const declaration = ({ created_at: _created, finalizing: _finalizing, ...value }: PendingStage) => canonicalJson(value)
+      if (declaration(previous) !== declaration(next)) {
+        throw new FleetServerError(409, 'stage_conflict', 'stage id is already bound to a different artifact declaration', false)
+      }
+      return { schema_version: 1, stage_id: stageId }
+    }
+    if (this.stages.size >= this.maxStages) {
+      throw new FleetServerError(409, 'stage_capacity', `stage table is full (${this.maxStages}) — finalize pending stages first`, true)
+    }
+    this.stages.set(stageId, next)
     return { schema_version: 1, stage_id: stageId }
   }
 
@@ -627,7 +746,8 @@ export class RemoteFleetServer {
       throw new FleetServerError(409, claim.settled_code ?? 'lease_stale',
         `run ${runId} was settled — artifact finalize from a stale agent is rejected`, true)
     }
-    const stage = this.stages.get(parsed.stage_id)
+    const receipt = this.finalizedStages.get(parsed.stage_id)
+    const stage = this.stages.get(parsed.stage_id) ?? receipt?.stage
     if (stage === undefined || stage.run_id !== runId) {
       throw new FleetServerError(404, 'stage_unknown', `stage ${parsed.stage_id} is unknown for run ${runId}`, false)
     }
@@ -648,20 +768,39 @@ export class RemoteFleetServer {
       throw new FleetServerError(409, 'cas_size_mismatch',
         `finalize size mismatch for stage ${parsed.stage_id}: got ${buf.length}, stage declared ${stage.size}`, false)
     }
-    this.stages.delete(parsed.stage_id)
-    try {
-      const record = await this.client.registerArtifact({
-        project_id: claim.job.project_id,
-        kind: stage.kind,
-        content_base64: parsed.content_base64,
-        metadata: { ...stage.metadata, run_id: runId, job_id: claim.job.job_id, source: 'remote-agent' },
-        ...stage.media_type !== null ? { media_type: stage.media_type } : {},
-        ...stage.file_name !== null ? { file_name: stage.file_name } : {},
-      })
-      return { schema_version: 1, artifact_id: record.artifact_id, sha256: record.sha256 ?? actual, reused: false }
-    } catch (error) {
-      throw mapKernelError(error)
-    }
+    if (receipt !== undefined) return { ...receipt.response, reused: true }
+    if (stage.finalizing !== undefined) return stage.finalizing
+    // Keep the declaration on upstream failure. Coalesce simultaneous retries
+    // and retain a bounded receipt if the successful HTTP response is lost.
+    stage.finalizing = (async (): Promise<RemoteArtifactFinalizeResponse> => {
+      try {
+        const record = await this.client.registerJobArtifact(claim.job.job_id, {
+          project_id: claim.job.project_id,
+          run_id: runId,
+          owner: claim.plan.lease.owner,
+          lease_generation: claim.plan.lease.generation,
+          lease_token: claim.plan.lease.token,
+          kind: stage.kind,
+          content_base64: parsed.content_base64,
+          metadata: { ...stage.metadata, run_id: runId, job_id: claim.job.job_id, source: 'remote-agent' },
+          ...stage.media_type !== null ? { media_type: stage.media_type } : {},
+          ...stage.file_name !== null ? { file_name: stage.file_name } : {},
+        })
+        const response: RemoteArtifactFinalizeResponse = {
+          schema_version: 1, artifact_id: record.artifact_id, sha256: record.sha256 ?? actual, reused: false,
+        }
+        this.stages.delete(parsed.stage_id)
+        const { finalizing: _finalizing, ...declaration } = stage
+        this.finalizedStages.set(parsed.stage_id, { stage: declaration, response, at: this.now() })
+        this.pruneReceipts()
+        return response
+      } catch (error) {
+        throw mapKernelError(error)
+      } finally {
+        delete stage.finalizing
+      }
+    })()
+    return stage.finalizing
   }
 
   // ── complete（manifest 签名 + fencing）───────────────────────────────────
@@ -681,10 +820,6 @@ export class RemoteFleetServer {
   async handleComplete(agentId: string, runId: string, req: RemoteCompleteRequest): Promise<RemoteCompleteResponse> {
     const parsed = validateWire<RemoteCompleteRequest>(RemoteCompleteRequestSchema, req, 'RemoteCompleteRequest')
     const claim = this.requireOutstanding(agentId, runId)
-    if (claim.settled) {
-      throw new FleetServerError(409, claim.settled_code ?? 'lease_stale',
-        `run ${runId} was settled (${claim.settled_code ?? 'lease_stale'}) — a stale agent cannot complete the job`, true)
-    }
     if (parsed.run_id !== claim.plan.run_id) {
       throw new FleetServerError(422, 'run_id_mismatch',
         `complete run_id ${parsed.run_id} does not match the claim's run_id ${claim.plan.run_id} — job/run/manifest run_id chain broken`, false)
@@ -694,11 +829,11 @@ export class RemoteFleetServer {
       throw new FleetServerError(422, 'run_id_mismatch',
         `run manifest run_id ${String(manifestRunId)} does not match the claim's run_id ${claim.plan.run_id} — job/run/manifest run_id chain broken`, false)
     }
-    if (parsed.lease.owner !== claim.plan.lease.owner
-      || parsed.lease.generation !== claim.plan.lease.generation
-      || parsed.lease.token !== claim.plan.lease.token) {
-      throw new FleetServerError(409, 'lease_stale',
-        `run ${runId} complete lease mismatch: expected ${claim.plan.lease.owner}/${claim.plan.lease.generation}/${claim.plan.lease.token}, got ${req.lease.owner}/${req.lease.generation}/${req.lease.token}`, true)
+    this.assertClaimFence(claim, parsed)
+    const requestHash = createHash('sha256').update(canonicalJson(parsed)).digest('hex')
+    if (claim.settled) {
+      if (claim.completion?.request_hash === requestHash) return claim.completion.response
+      throw new FleetServerError(409, claim.settled_code ?? 'lease_stale', 'run is already settled', false)
     }
     try {
       const completed = await this.client.completeJob({
@@ -711,12 +846,14 @@ export class RemoteFleetServer {
         lease_generation: parsed.lease.generation,
         lease_token: parsed.lease.token,
       })
-      this.settle(claim, null)
       const finalStatus: 'succeeded' | 'failed' | 'cancelled' =
         completed.status === 'succeeded' || completed.status === 'failed' || completed.status === 'cancelled'
           ? completed.status
           : 'failed'
-      return { schema_version: 1, accepted: true, job_id: completed.job_id, status: finalStatus, code: null }
+      const response: RemoteCompleteResponse = { schema_version: 1, accepted: true, job_id: completed.job_id, status: finalStatus, code: null }
+      claim.completion = { request_hash: requestHash, response }
+      this.settle(claim, null)
+      return response
     } catch (error) {
       const mapped = mapKernelError(error)
       if (mapped.code === 'lease_stale' || mapped.status === 409) this.settle(claim, mapped.code)
@@ -839,7 +976,7 @@ export class RemoteFleetServer {
         owner: claim.plan.lease.owner,
         generation: claim.plan.lease.generation,
         token: claim.plan.lease.token,
-        expires_at: claim.plan.lease.expires_at,
+        expires_at: claim.lease_expires_at,
       },
       claimed_at: claim.claimed_at,
     }
@@ -855,20 +992,46 @@ export class RemoteFleetServer {
   }
 
   private requireOutstanding(agentId: string, runId: string): OutstandingClaim {
-    const claim = this.outstanding.get(agentId)?.get(runId)
-    if (claim === undefined) {
+    this.pruneExpiredState()
+    const claim = this.outstanding.get(agentId)?.get(runId) ?? this.settledClaims.get(runId)
+    if (claim === undefined || claim.agent_id !== agentId) {
       throw new FleetServerError(404, 'claim_unknown', `no outstanding claim for agent ${agentId} run ${runId}`, true)
     }
     return claim
   }
 
   private settle(claim: OutstandingClaim, code: string | null): void {
+    if (claim.settled) return
     claim.settled = true
     claim.settled_code = code
+    claim.settled_at = this.now()
+    const mine = this.outstanding.get(claim.agent_id)
+    mine?.delete(claim.plan.run_id)
+    if (mine?.size === 0) this.outstanding.delete(claim.agent_id)
+    this.claimedAttempts.delete(this.attemptKey(claim.job))
+    this.settledClaims.set(claim.plan.run_id, claim)
+    for (const [id, stage] of this.stages) {
+      if (stage.run_id === claim.plan.run_id) this.stages.delete(id)
+    }
+    this.pruneReceipts()
   }
 
-  /** pending 中 lease 已过期的任务移除（kernel 侧已 recoverExpiredLeases → retryable）。 */
-  private pruneExpiredPending(): void {
+  private attemptKey(job: JobRecord & { run_id?: string | null }): string {
+    return JSON.stringify([job.job_id, job.run_id, job.lease_generation])
+  }
+
+  private pruneReceipts(): void {
+    const cutoff = this.now() - this.receiptTtlMs
+    for (const [id, claim] of this.settledClaims) {
+      if ((claim.settled_at ?? 0) <= cutoff || this.settledClaims.size > this.maxReceipts) this.settledClaims.delete(id)
+    }
+    for (const [id, receipt] of this.finalizedStages) {
+      if (receipt.at <= cutoff || this.finalizedStages.size > this.maxReceipts) this.finalizedStages.delete(id)
+    }
+  }
+
+  /** Expired attempts must release capacity before checking queue limits. */
+  private pruneExpiredState(): void {
     const now = this.now()
     for (let i = this.pending.length - 1; i >= 0; i--) {
       const entry = this.pending[i]
@@ -876,8 +1039,15 @@ export class RemoteFleetServer {
       const expiresAt = entry.plan.lease.expires_at
       if (expiresAt !== null && expiresAt !== '' && Date.parse(expiresAt) <= now) {
         this.pending.splice(i, 1)
+        this.claimedAttempts.delete(this.attemptKey(entry.job))
       }
     }
+    for (const mine of this.outstanding.values()) {
+      for (const claim of mine.values()) {
+        if (claim.lease_expires_at !== null && Date.parse(claim.lease_expires_at) <= now) this.settle(claim, 'lease_stale')
+      }
+    }
+    this.pruneReceipts()
   }
 }
 
@@ -964,6 +1134,7 @@ function parseWireSchema(body: unknown, message: string): unknown {
     RemoteArtifactStageRequest: RemoteArtifactStageRequestSchema,
     RemoteArtifactFinalizeRequest: RemoteArtifactFinalizeRequestSchema,
     RemoteCompleteRequest: RemoteCompleteRequestSchema,
+    RemoteRunHeartbeatRequest: RemoteRunHeartbeatRequestSchema,
     CasShaParam: {
       parse: (value: unknown) => {
         const record = value as Record<string, unknown>
@@ -1044,17 +1215,21 @@ export function attachRemoteFleetRoutes(
         if (method === 'POST' && parts.length === 3 && parts[1] === 'agents' && parts[2] === 'register') {
           const body = await readJsonBody(req, maxBodyBytes)
           const parsed = parseWireSchema(body, 'AgentRegisterRequest') as AgentRegisterRequest
-          sendJson(res, 200, fleet.handleRegister(parsed))
+          const targetToken = req.headers['x-runner-target-token']
+          sendJson(res, 200, await fleet.handleRegister(parsed, typeof targetToken === 'string' ? targetToken : ''))
           return
         }
         const agentId = parts[2]
         if (agentId === undefined) throw new FleetServerError(404, 'not_found', 'unknown fleet route', false)
+        const targetToken = req.headers['x-runner-target-token']
+        const identity = typeof targetToken === 'string' ? targetToken : ''
+        fleet.authorizeAgent(agentId, identity)
         // /v1/agents/{id}/heartbeat | claims
         if (method === 'POST' && parts.length === 4) {
           if (parts[3] === 'heartbeat') {
             const body = await readJsonBody(req, maxBodyBytes)
             const parsed = parseWireSchema(body, 'AgentHeartbeatRequest') as AgentHeartbeatRequest
-            sendJson(res, 200, fleet.handleHeartbeat(agentId, parsed))
+            sendJson(res, 200, await fleet.handleHeartbeat(agentId, parsed, identity))
             return
           }
           if (parts[3] === 'claims') {
@@ -1075,6 +1250,12 @@ export function attachRemoteFleetRoutes(
         if (method === 'POST' && parts.length === 6 && parts[3] === 'runs') {
           const runId = parts[4]!
           const sub = parts[5]
+          if (sub === 'heartbeat') {
+            const body = await readJsonBody(req, maxBodyBytes)
+            const parsed = parseWireSchema(body, 'RemoteRunHeartbeatRequest') as RemoteRunHeartbeatRequest
+            sendJson(res, 200, await fleet.handleRunHeartbeat(agentId, runId, parsed))
+            return
+          }
           if (sub === 'frames') {
             const body = await readJsonBody(req, maxBodyBytes)
             const parsed = parseWireSchema(body, 'RemoteFramesRequest') as RemoteFramesRequest

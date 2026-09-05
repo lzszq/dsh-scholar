@@ -19,6 +19,7 @@ export interface MinerUExtractInput {
   request: OcrRequest
   /** Exact source bytes verified against the persisted source SHA-256. */
   source: OcrSourceBytes
+  signal?: AbortSignal
 }
 
 export interface MinerUExtractResult {
@@ -34,8 +35,8 @@ export interface MinerUTransportBinding {
   provider_config_sha256: string
 }
 
-/** A production adapter may implement MinerU's signed-upload/poll protocol;
- * tests inject a deterministic transport at this exact boundary. */
+/** The production adapter implements signed upload and polling; tests can
+ * inject a deterministic transport at this same boundary. */
 export interface MinerUOcrTransport {
   /** Exact configuration used by this adapter; secrets remain inside it. */
   binding: MinerUTransportBinding
@@ -80,15 +81,19 @@ function safeError(error: unknown): OcrSafeError {
 }
 
 export class MinerUOcrWorker {
-  constructor(private readonly kernel: OcrWorkerKernelPort, private readonly transport: MinerUOcrTransport) {}
+  constructor(private readonly kernel: OcrWorkerKernelPort,
+    private readonly transport: MinerUOcrTransport | ((request: OcrRequest) => MinerUOcrTransport | Promise<MinerUOcrTransport>)) {}
 
   /** Run at most one queued request. No other provider/model is selected. */
-  async runOnce(): Promise<OcrRequest | null> {
+  async runOnce(signal?: AbortSignal): Promise<OcrRequest | null> {
+    if (signal?.aborted) return null
     const request = this.kernel.claimNextOcrRequest()
     if (request === null) return null
     try {
       if (request.provider_id !== 'mineru') throw new MinerUTransportError('provider_unavailable')
-      const pin = this.transport.binding
+      const transport = typeof this.transport === 'function' ? await this.transport(request) : this.transport
+      if (signal?.aborted) return null
+      const pin = transport.binding
       if (
         pin.provider_id !== request.provider_id
         || pin.model_id !== request.model_id
@@ -96,11 +101,15 @@ export class MinerUOcrWorker {
         || pin.provider_config_sha256 !== request.provider_config_sha256
       ) throw new MinerUTransportError('provider_unavailable')
       const source = this.kernel.loadOcrSource(request)
-      const output = await this.transport.extract({ request, source })
+      const output = await transport.extract({ request, source, ...(signal === undefined ? {} : { signal }) })
+      if (signal?.aborted) return null
       if (typeof output.markdown !== 'string') throw Object.assign(new Error('invalid OCR markdown'), { name: 'ZodError' })
       const observations = output.observations.map(item => OcrNormalizedObservation.parse(item))
       return this.kernel.completeOcrRequest(request.request_id, output.markdown, observations)
     } catch (error) {
+      // Shutdown/cancellation owns durable state. An aborted transport must
+      // not write after Kernel.close or overwrite a requeued/cancelled row.
+      if (signal?.aborted) return null
       try {
         return this.kernel.failOcrRequest(request.request_id, safeError(error).code)
       } catch (stateError) {
