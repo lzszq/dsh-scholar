@@ -3,6 +3,7 @@
  * shortcuts, about, global labels and tab chrome.
  */
 export const zh = {
+  'shell.settings.runnerProfile.unconfigured': '尚未配置运行方式',
   'shell.settings.title': '⚙ 设置',
   'shell.settings.connection': '连接',
   'shell.settings.access': '访问',
@@ -711,6 +712,7 @@ export const zh = {
 export type ShellKey = keyof typeof zh
 
 export const en: Record<ShellKey, string> = {
+  'shell.settings.runnerProfile.unconfigured': 'Execution profile not configured',
   'shell.settings.title': '⚙ Settings',
   'shell.settings.connection': 'Connection',
   'shell.settings.access': 'Access',

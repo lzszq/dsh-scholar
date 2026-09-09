@@ -138,6 +138,7 @@ export interface NextActionCardModel {
   /** Safe, editable slash-command draft for whitelisted Chat interactions.
    * Never auto-submitted by the card click. */
   commandDraft: string | null
+  jobId: string | null
 }
 
 export interface NextActionCardContext {
@@ -215,7 +216,16 @@ export function nextActionCardModel(
     intakeProjectId,
     requiredBy,
     commandDraft,
+    jobId: code === 'job_retry' ? refs.find(ref => ref?.kind === 'job' && typeof ref.id === 'string')?.id ?? null : null,
   }
+}
+
+/** Preserve authority order within a priority; never invent or drop actions. */
+export function prioritizeNextActions(actions: NextActionV2[]): NextActionV2[] {
+  const rank = (action: NextActionV2): number => action.state === 'done' ? 4
+    : action.blocking === true && action.state === 'ready' ? 0
+      : action.blocking === true ? 1 : action.state === 'ready' ? 2 : 3
+  return [...actions].sort((a, b) => rank(a) - rank(b))
 }
 
 /** Resolve only the structured authority. Missing or malformed wire data is

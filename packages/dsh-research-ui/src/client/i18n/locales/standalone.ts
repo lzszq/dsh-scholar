@@ -14,9 +14,10 @@ export const zh = {
   'standalone.accessToken': '访问令牌',
   'standalone.openWorkspace': '打开工作区',
   'standalone.invalidToken': '无效令牌',
+  'standalone.tokenRequired': '请输入访问令牌。',
   'standalone.serverUnreachable': '服务器不可达',
   'standalone.bundleFailed': '客户端加载失败',
-  'standalone.tokenHint': '令牌在本地服务器启动时生成,仅保留在本机。',
+  'standalone.tokenHint': '请从本机服务器数据目录中的 standalone-token 文件获取令牌。',
   'standalone.theme.dark': '深色',
   'standalone.theme.light': '浅色',
 } as const
@@ -34,9 +35,10 @@ export const en: Record<StandaloneKey, string> = {
   'standalone.accessToken': 'Access token',
   'standalone.openWorkspace': 'Open workspace',
   'standalone.invalidToken': 'Invalid token',
+  'standalone.tokenRequired': 'Enter an access token.',
   'standalone.serverUnreachable': 'Server unreachable',
   'standalone.bundleFailed': 'Client bundle failed to load',
-  'standalone.tokenHint': 'Your token is generated when the local server starts and remains on this machine.',
+  'standalone.tokenHint': 'Find your token in the standalone-token file in the local server data directory.',
   'standalone.theme.dark': 'Dark',
   'standalone.theme.light': 'Light',
 }

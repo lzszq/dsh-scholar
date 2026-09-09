@@ -3,7 +3,7 @@ import { api, apiResult } from '../api'
 import { t } from '../i18n/index'
 import { openContractDetailModal, openIdeaDetailModal } from '../modals/detail'
 import { state, tabSave } from '../state'
-import { phasePipeline, copyText, el, fmtId, openContextMenu } from '../ui'
+import { phasePipeline, copyText, el, fmtId, openContextMenu, statusLabel } from '../ui'
 import { renderNextActionSection } from './overview'
 import { isTabVisible } from '../nav'
 import {
@@ -23,6 +23,9 @@ export async function renderPhase(
   const pipelineDefs = phasePipeline()
   const statusIdx = pipelineDefs.findIndex(([k]) => k === status)
   const pipeline = el('div', 'pipeline-wrap')
+  const current = el('div', 'section-label', t('overview', 'overview.currentPhase', { phase: statusLabel(status) }))
+  current.style.cssText = 'margin:0 0 8px;color:var(--text);white-space:normal'
+  pipeline.appendChild(current)
   const steps = el('div', 'pipeline')
   for (const [key, label] of pipelineDefs) {
     const step = el('div', 'pstep')
@@ -57,11 +60,10 @@ export async function renderPhase(
     body.appendChild(sum)
   }
 
-  if (projectId !== undefined) body.appendChild(methodologySummaryNode(methodology, 'overview'))
-
   // GUIDE-01: only structured v2 cards are accepted. Missing or malformed
   // projections stay a safe empty state; labels never reconstruct a CTA.
   renderNextActionSection(body, p)
+  if (projectId !== undefined) body.appendChild(methodologySummaryNode(methodology, 'overview'))
 
   // history (audit ledger: transitions, gate decisions, renames, archives)
   const history = (p.project?.history ?? [])

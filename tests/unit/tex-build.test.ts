@@ -55,6 +55,44 @@ function sha256(text: string): string {
 const TEXLIVE_IMAGE_DIGEST = 'texlive/texlive@sha256:8957c916b8160049f89c24d362a6d86c09d8a04095acde37e88404c4afed85b4'
 
 describe('latex-compile chain (TEX-02)', () => {
+  it('replays one compile request without creating an orphan queued build', async () => {
+    const kernel = freshKernel()
+    const project = kernel.createProject({ name: 'compile-replay', workspace: '/w', brief: makeBrief() })
+    const doc = kernel.texEnsure(project.project_id)
+    kernel.texWriteFile(doc.document_id, 'paper.tex', '\\documentclass{article}\n\\begin{document}hi\\end{document}\n')
+    const revision = kernel.texTree(doc.document_id).document.revision
+    const { server, url } = await startKernelServer({ kernel, host: '127.0.0.1', port: 0 })
+    try {
+      const profilesResponse = await fetch(`${url}/v1/runner-profiles`)
+      expect(profilesResponse.status).toBe(200)
+      expect(await profilesResponse.json()).toContainEqual(expect.objectContaining({
+        profile_id: 'profile_local_docker_cpu_v1', runner_mode: 'local-docker', enabled: true,
+      }))
+      const submit = async (idempotencyKey: string) => {
+        const response = await fetch(`${url}/v1/documents/${doc.document_id}/builds`, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ expected_document_revision: revision, idempotency_key: idempotencyKey }),
+        })
+        expect(response.status).toBe(201)
+        return await response.json() as { build: { build_id: string; status: string }; job: { job_id: string } }
+      }
+      const first = await submit('one-user-compile')
+      kernel.texUpdateBuild(first.build.build_id, { status: 'failed', diagnostics: '[{"level":"error","message":"test failure"}]' })
+      const replay = await submit('one-user-compile')
+      expect(replay.job.job_id).toBe(first.job.job_id)
+      expect(replay.build.build_id).toBe(first.build.build_id)
+      expect(replay.build.status).toBe('failed')
+      expect(kernel.texListBuilds(doc.document_id)).toHaveLength(1)
+      const retry = await submit('new-user-compile')
+      expect(retry.job.job_id).not.toBe(first.job.job_id)
+      expect(retry.build.status).toBe('queued')
+      expect(kernel.texListBuilds(doc.document_id)).toHaveLength(2)
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      kernel.close()
+    }
+  })
+
   it('submitJob carries the frozen snapshot manifest for latex-compile', () => {
     const kernel = freshKernel()
     const project = kernel.createProject({ name: 't', workspace: '/w', brief: makeBrief() })

@@ -3,6 +3,11 @@
  * filter chips, selection affordances. Job status values stay raw.
  */
 export const zh = {
+  'runs.recovery.timeout': "运行超过 {seconds} 秒时间限制。请核对日志、运行参数与超时配置。",
+  'runs.recovery.open': "排查与恢复",
+  'runs.recovery.chat': "交给助手排查",
+  'runs.recovery.checkEvidence': "是否需要重跑，请结合当前证据及后续成功运行核对。",
+  'runs.recovery.draft': "请排查项目 {project} 的任务 {job}。错误：{error}。请查看该任务日志与运行参数，核对是否已有替代成功运行及证据，再提出参数或超时调整与重试建议。",
   'runs.section': '运行 ({count})',
   'runs.select': '☑ 选择',
   'runs.selecting': '☑ 选择中…',
@@ -61,6 +66,11 @@ export const zh = {
 
 
 export const en: Record<keyof typeof zh, string> = {
+  'runs.recovery.timeout': "The run exceeded its {seconds}-second time limit. Review the logs, run parameters, and timeout configuration.",
+  'runs.recovery.open': "Investigate and recover",
+  'runs.recovery.chat': "Investigate in Chat",
+  'runs.recovery.checkEvidence': "Check current evidence and later successful runs to decide whether this job still needs a rerun.",
+  'runs.recovery.draft': "Investigate job {job} in project {project}. Error: {error}. Review its logs and run parameters, check for a successful replacement and supporting evidence, then propose parameter or timeout changes and a retry plan.",
   'runs.section': 'Runs ({count})',
   'runs.select': '☑ Select',
   'runs.selecting': '☑ Selecting…',

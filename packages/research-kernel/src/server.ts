@@ -10,6 +10,7 @@ import { performance } from 'node:perf_hooks'
 import { z } from 'zod'
 import { ResearchKernel, KernelError, TEX_ENGINES, validateUploadFileName } from './kernel.js'
 import { dshOperatorPrincipal } from './dsh-principal.js'
+import { BUILTIN_RUNNER_PROFILES } from '@dsh-scholar/research-schemas'
 import { TexError } from './tex-workspace.js'
 import { PtyError } from './pty-session.js'
 import { PtyContextError, type PtyResolvedContext } from './pty-context.js'
@@ -1782,6 +1783,17 @@ function route(req: IncomingMessage, res: ServerResponse, kernel: ResearchKernel
           }
           send(res, 404, { error: { code: 'not_found', message: 'unknown provider route' } })
           return
+        }
+        case 'runner-profiles': {
+          if (method === 'GET' && id === undefined && parts.length === 2) {
+            ok(res, BUILTIN_RUNNER_PROFILES.map(profile => ({
+              profile_id: profile.profile_id, display_name: profile.display_name,
+              runner_mode: profile.runner_mode, enabled: profile.enabled,
+              capabilities: profile.capabilities,
+            })))
+            return
+          }
+          break
         }
         case 'runner-targets': {
           // EXEC-ENV-02: global target registry. Connection fields are

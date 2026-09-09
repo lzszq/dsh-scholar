@@ -12,7 +12,8 @@ import { t } from '../i18n/index'
 import { chromeTabs } from '../i18n/chrome'
 import { state, tabSave } from '../state'
 import { DEEP_LINK_TAB_PREFIX, isTabVisible } from '../nav'
-import { nextActionCardModel, resolveNextActionInput, type NextActionCardModel } from '../next-action-cards'
+import { nextActionCardModel, prioritizeNextActions, resolveNextActionInput, type NextActionCardModel } from '../next-action-cards'
+import { openJobDetailModal } from './runs'
 import { openIntakeModal } from '../modals/intake'
 import { runChatLine } from '../modals/commands'
 
@@ -20,6 +21,11 @@ import { runChatLine } from '../modals/commands'
  *  switch (immediate) + the stable deep link (survives reload/back-forward).
  *  Intake actions (route 'intake') open the intake wizard modal instead. */
 function navigateTo(model: NextActionCardModel): void {
+  if (model.jobId !== null) {
+    const root = rootHost()
+    if (root !== null) void openJobDetailModal(root, model.jobId)
+    return
+  }
   if (model.commandDraft !== null) {
     runChatLine(model.commandDraft)
     return
@@ -122,10 +128,13 @@ export function renderNextActionSection(body: HTMLElement, p: Projection): void 
     body.appendChild(el('div', 'empty', t('overview', 'overview.nextActions.none')))
     return
   }
-  for (const action of input.actions) {
-    body.appendChild(nextActionCardNode(nextActionCardModel(action, undefined, {
+  for (const [index, action] of prioritizeNextActions(input.actions).entries()) {
+    if (index === 1) body.appendChild(el('div', 'section-label', t('overview', 'overview.nextActions.other')))
+    const card = nextActionCardNode(nextActionCardModel(action, undefined, {
       briefProblem: p.project?.brief?.problem,
-    })))
+    }))
+    if (index === 0 && action.state !== 'done') card.style.borderColor = 'var(--accent)'
+    body.appendChild(card)
   }
 }
 

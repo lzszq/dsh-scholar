@@ -1,12 +1,18 @@
-import type { ContextMenuItem, GateRow } from '../types'
+import type { ContextMenuItem, GateRow, Projection } from '../types'
+import type { CompactMethodologyProjection } from '../methodology-projection'
+import { renderReleaseReview } from './release-review'
 import { api, apiResult, type ApiResult } from '../api'
 import { gateDecisionErrorKey, gateDecisionRequest } from '../gate-decision'
+import { gateDrafts } from '../gate-drafts'
 import { t } from '../i18n/index'
 import { state } from '../state'
 import { copyText, el, fmtId, openContextMenu, pill, rootHost, shortType, showToast } from '../ui'
 /** Gates multi-select (dsh-web bulk decisions). */
 export let gatesSelecting = false
 export let gatesSelected = new Set<string>()
+const gateSubmissions = new Set<string>()
+let gatesProjectId: string | null = null
+export function gateMutationPending(): boolean { return gateSubmissions.size > 0 }
 
 /** Gates filter (dsh-web search-as-you-type), persisted per render. */
 export let gatesQuery = ''
@@ -22,22 +28,30 @@ async function submitGateDecision(
   decision: 'approved' | 'rejected' | 'revised',
   reason?: string,
 ): Promise<ApiResult<Record<string, unknown>>> {
+  if (gateSubmissions.has(gateId)) return { ok: false, status: 409, error: { code: 'gate_decision_pending' } }
+  gateSubmissions.add(gateId)
   const request = gateDecisionRequest(gateId, decision, reason)
-  return apiResult<Record<string, unknown>>(request.path, request.init)
+  try { return await apiResult<Record<string, unknown>>(request.path, request.init) }
+  finally { gateSubmissions.delete(gateId) }
 }
 
 
-export async function renderGates(body: HTMLElement, projectId: string): Promise<void> {
+export async function renderGates(body: HTMLElement, projectId: string, projection: Projection = {}, methodology?: CompactMethodologyProjection | null): Promise<void> {
+  if (gatesProjectId !== projectId) {
+    gatesProjectId = projectId; gatesQuery = ''; gatesSelecting = false; gatesSelected.clear()
+  }
   const gates = (await api<GateRow[]>(`/v1/projects/${encodeURIComponent(projectId)}/gates`)) ?? []
   // dsh-web decision provenance: who decided each gate, when, and why.
   const decisions = (await api<Array<Record<string, unknown>>>(`/v1/projects/${encodeURIComponent(projectId)}/decisions`)) ?? []
   const pending = gates.filter(g => g.status === 'pending')
   const decided = gates.filter(g => g.status !== 'pending')
+  if (pending.some(gate => gate.type?.toLowerCase().includes('release'))) await renderReleaseReview(body, projectId, projection, methodology)
   // dsh-web search-as-you-type: filters both sections; only the list
   // container is rebuilt so the input keeps focus.
   const searchInput = document.createElement('input')
   searchInput.type = 'text'
   searchInput.placeholder = t('overview', 'overview.gatesFilterPlaceholder')
+  searchInput.setAttribute('aria-label', t('overview', 'overview.gatesFilterPlaceholder'))
   searchInput.value = gatesQuery
   searchInput.style.cssText = 'flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px;font:11px/1.4 system-ui,sans-serif;outline:none;margin:2px 0 6px'
   searchInput.onfocus = () => { searchInput.style.borderColor = 'var(--accent)' }
@@ -88,9 +102,11 @@ export async function renderGates(body: HTMLElement, projectId: string): Promise
     const approveSel = el('button', 'btn approve', t('overview', 'overview.gatesApproveSelected'))
     approveSel.disabled = gatesSelected.size === 0
     approveSel.onclick = async () => {
+      approveSel.disabled = rejectSel.disabled = true
       let firstFailure: Extract<ApiResult<Record<string, unknown>>, { ok: false }> | null = null
-      for (const id of gatesSelected) {
-        const result = await submitGateDecision(id, 'approved', 'bulk approved from dsh Scholar panel')
+      for (const id of [...gatesSelected]) {
+        const result = await submitGateDecision(id, 'approved', gateDrafts.get(projectId, id).reason.trim() || 'bulk approved from dsh Scholar panel')
+        if (result.ok) gateDrafts.clear(projectId, id)
         if (!result.ok && firstFailure === null) firstFailure = result
       }
       if (firstFailure !== null) {
@@ -106,9 +122,11 @@ export async function renderGates(body: HTMLElement, projectId: string): Promise
     const rejectSel = el('button', 'btn reject', t('overview', 'overview.gatesRejectSelected'))
     rejectSel.disabled = gatesSelected.size === 0
     rejectSel.onclick = async () => {
+      approveSel.disabled = rejectSel.disabled = true
       let firstFailure: Extract<ApiResult<Record<string, unknown>>, { ok: false }> | null = null
-      for (const id of gatesSelected) {
-        const result = await submitGateDecision(id, 'rejected', 'bulk rejected from dsh Scholar panel')
+      for (const id of [...gatesSelected]) {
+        const result = await submitGateDecision(id, 'rejected', gateDrafts.get(projectId, id).reason.trim() || 'bulk rejected from dsh Scholar panel')
+        if (result.ok) gateDrafts.clear(projectId, id)
         if (!result.ok && firstFailure === null) firstFailure = result
       }
       if (firstFailure !== null) {
@@ -185,23 +203,37 @@ export async function renderGates(body: HTMLElement, projectId: string): Promise
     const reasonRow = el('div')
     reasonRow.style.cssText = 'display:none;margin-top:8px;gap:6px;align-items:center'
     const reasonInput = document.createElement('input')
+    const draft = gateDrafts.get(projectId, gate.gate_id ?? '')
+    reasonRow.style.display = draft.open ? 'flex' : 'none'
+    reasonInput.value = draft.reason
     reasonInput.type = 'text'
     reasonInput.placeholder = t('overview', 'overview.gatesReasonPlaceholder')
+    reasonInput.setAttribute('aria-label', t('overview', 'overview.gatesReasonPlaceholder'))
+    reasonInput.oninput = () => { gateDrafts.update(projectId, gate.gate_id ?? '', { reason: reasonInput.value }) }
     reasonInput.maxLength = 200
-    reasonInput.style.cssText = 'flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px;font:11px/1.4 system-ui,sans-serif;outline:none'
+    reasonInput.style.cssText = 'flex:1;min-width:0;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px;font:11px/1.4 system-ui,sans-serif;outline:none'
     reasonInput.onfocus = () => { reasonInput.style.borderColor = 'var(--accent)' }
     reasonInput.onblur = () => { reasonInput.style.borderColor = 'var(--border)' }
     reasonRow.appendChild(reasonInput)
+    const clearDraft = el('button', 'hbtn', t('overview', 'overview.gateDraftClear'))
+    clearDraft.onclick = () => { gateDrafts.clear(projectId, gate.gate_id ?? ''); reasonInput.value = ''; gateDrafts.update(projectId, gate.gate_id ?? '', { open: true }) }
+    reasonRow.appendChild(clearDraft)
     const reasonToggle = el('button', 'hbtn', t('overview', 'overview.gatesReason'))
     reasonToggle.title = t('overview', 'overview.gatesReasonTitle')
+    reasonToggle.setAttribute('aria-expanded', String(draft.open))
     reasonToggle.style.cssText = 'padding:0 8px;font-size:10px'
+    approve.disabled = reject.disabled = reasonInput.disabled = clearDraft.disabled = gateSubmissions.has(gate.gate_id ?? '')
     reasonToggle.onclick = () => {
       const open = reasonRow.style.display === 'none'
       reasonRow.style.display = open ? 'flex' : 'none'
+      reasonToggle.setAttribute('aria-expanded', String(open))
+      gateDrafts.update(projectId, gate.gate_id ?? '', { open })
       if (open) reasonInput.focus()
     }
     const act = async (decision: 'approved' | 'rejected', label: string): Promise<void> => {
+      if (approve.disabled) return
       const reason = reasonInput.value.trim()
+      approve.disabled = reject.disabled = reasonInput.disabled = clearDraft.disabled = true
       const result = await submitGateDecision(
         gate.gate_id ?? '',
         decision,
@@ -210,6 +242,7 @@ export async function renderGates(body: HTMLElement, projectId: string): Promise
       if (!result.ok) {
         state.lastError = gateDecisionErrorText(result.error, result.status)
       } else {
+        gateDrafts.clear(projectId, gate.gate_id ?? '')
         state.lastError = undefined
         // dsh-web confirmation: toast the decision outcome.
         const icon = decision === 'approved' ? '✓' : '✕'
@@ -281,6 +314,14 @@ export async function renderGates(body: HTMLElement, projectId: string): Promise
           info.appendChild(meta)
         }
         row.appendChild(info)
+        const draft = gateDrafts.get(projectId, gate.gate_id ?? '')
+        if (draft.reason !== '') {
+          const saved = el('div', 'muted', t('overview', 'overview.gateDraftDecided', { reason: draft.reason }))
+          saved.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin-top:6px'
+          const clear = el('button', 'hbtn', t('overview', 'overview.gateDraftClear'))
+          clear.onclick = () => { gateDrafts.clear(projectId, gate.gate_id ?? ''); renderList() }
+          info.append(saved, clear)
+        }
         row.appendChild(pill(gate.status))
         card.appendChild(row)
       }

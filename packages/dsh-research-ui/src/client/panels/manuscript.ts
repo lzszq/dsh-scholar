@@ -1,11 +1,12 @@
 import type { ManuscriptBuild, ManuscriptFile, Projection } from '../types'
-import { api, apiResult, authHeaders, base } from '../api'
+import { api, apiResult, authHeaders, base, type ApiErrorEnvelope } from '../api'
 import { t } from '../i18n/index'
-import { el } from '../ui'
+import { el, rootHost } from '../ui'
+import { openSettingsModal } from '../modals/settings'
 import { state, tabSave } from '../state'
 import { terminalLoadSeq } from '../terminal'
 import { isEditorDirty } from '../manuscript-dirty'
-import { displayedManuscriptPdfIsStale, latestSucceededManuscriptBuild, previewPanelModel, triggerPreviewAfterSave } from '../manuscript-flow'
+import { displayedManuscriptPdfIsStale, latestSucceededManuscriptBuild, manuscriptFailureModel, previewPanelModel, triggerPreviewAfterSave } from '../manuscript-flow'
 import {
   methodologySummaryNode,
   type CompactMethodologyProjection,
@@ -28,6 +29,26 @@ export let msSavedVersion = 0
 export let msSavedContent = ''
 export let msDirty = false
 export let msConflict: string | null = null
+let msErrorRecovery: 'reload' | 'settings' | 'retry' = 'reload'
+let msErrorDetails = ''
+let msSettingsKey: string | undefined
+const msCompiling = new Set<string>()
+const msSaving = new Set<string>()
+const msReloading = new Set<string>()
+let msMutationEpoch = 0
+const msCompileRequests = new Map<string, { revision: number; key: string }>()
+let msFailedOperation: 'save' | 'compile' | 'reload' = 'compile'
+export function msMutationPending(): boolean { return msCompiling.size > 0 || msSaving.size > 0 || msReloading.size > 0 }
+function msRecordFailure(error: ApiErrorEnvelope, status: number, operation: typeof msFailedOperation): void {
+  const model = manuscriptFailureModel(error, status)
+  msConflict = t('manuscript', model.key, { code: error.code ?? `HTTP ${status}` })
+  msErrorRecovery = model.recovery
+  msSettingsKey = model.key === 'manuscript.failure.runner'
+    ? error.code?.startsWith('runner_target_') ? 'execution.runner_target_id' : 'execution.runner_profile_id'
+    : undefined
+  msFailedOperation = operation
+  msErrorDetails = [error.message, error.code, status > 0 ? `HTTP ${status}` : '', error.request_id].filter(Boolean).join(' · ')
+}
 export let msBuilds: ManuscriptBuild[] = []
 export let msBuildPoll: number | undefined
 export let msPdfUrl: string | null = null
@@ -115,18 +136,22 @@ export async function msLoadDocument(projectId: string, signal?: AbortSignal): P
   })) ?? { document_id: '' }
 }
 
-export async function msLoadTree(): Promise<void> {
-  if (msDocId === null) return
+export async function msLoadTree(): Promise<boolean> {
+  if (msDocId === null) return false
   const documentId = msDocId
   const generation = msGeneration
   const projectId = msProjectId
   const controller = msTrackController()
-  const tree = await api<{ document: { revision: number }; files: ManuscriptFile[] }>(`/v1/documents/${encodeURIComponent(documentId)}/tree`, { signal: controller.signal })
+  const result = await apiResult<{ document: { revision: number }; files: ManuscriptFile[] }>(`/v1/documents/${encodeURIComponent(documentId)}/tree`, { signal: controller.signal })
   msReleaseController(controller)
-  if (tree !== null && msContextIsCurrent(generation, documentId, projectId)) {
-    msRevision = tree.document.revision
-    msFiles = tree.files
+  if (!msContextIsCurrent(generation, documentId, projectId)) return false
+  if (!result.ok) {
+    msRecordFailure(result.error, result.status, 'reload')
+    return false
   }
+  msRevision = result.data.document.revision
+  msFiles = result.data.files
+  return true
 }
 
 export async function msOpenFile(path: string): Promise<void> {
@@ -151,110 +176,149 @@ export async function msOpenFile(path: string): Promise<void> {
   msDirty = false
 }
 
-export async function msSaveFile(): Promise<void> {
-  if (msDocId === null || msOpenPath === null) return
+export async function msSaveFile(rerender = true): Promise<boolean> {
+  if (msDocId === null || msOpenPath === null) return false
   const documentId = msDocId
+  if (msSaving.has(documentId) || msReloading.has(documentId) || (rerender && msCompiling.has(documentId))) return false
+  msSaving.add(documentId)
+  msMutationEpoch += 1
   const openPath = msOpenPath
   const generation = msGeneration
   const projectId = msProjectId
   const savedContent = msContent
-  const controller = msTrackController()
-  const result = await api<{ version: number; content_hash: string }>(`/v1/documents/${encodeURIComponent(documentId)}/file`, {
-    method: 'PUT',
-    signal: controller.signal,
-    body: JSON.stringify({ path: openPath, content: savedContent, expected_version: msSavedVersion }),
-  })
-  msReleaseController(controller)
-  if (!msContextIsCurrent(generation, documentId, projectId) || msOpenPath !== openPath) return
-  if (result === null) {
-    // 409 conflict (or transport error): surface the conflict banner.
-    msConflict = t('manuscript', 'manuscript.conflict.text', { path: msOpenPath })
-    state.rerender()
-    return
-  }
-  msSavedVersion = result.version
-  // The server stored exactly the content we sent: that is the new baseline
-  // (revert-to-saved must read clean, including a revert to '').
-  msSavedContent = savedContent
-  msDirty = msContent !== savedContent
-  msConflict = null
-  await msLoadTree()
-  // P0-3 (TEX-03): save success triggers the live-preview hook ONCE. The
-  // kernel owns the debounce (default 800ms) and coalesces rapid saves —
-  // the client never schedules its own timer. Best-effort: a failed hook
-  // call never fails the already-committed save.
-  if (!msContextIsCurrent(generation, documentId, projectId)) return
-  const previewController = msTrackController()
   try {
-    await triggerPreviewAfterSave(documentId, id => api(`/v1/documents/${encodeURIComponent(id)}/preview-builds`, {
-      method: 'POST',
-      signal: previewController.signal,
-      body: JSON.stringify({}),
-    }))
+    const controller = msTrackController()
+    const result = await apiResult<{ version: number; content_hash: string }>(`/v1/documents/${encodeURIComponent(documentId)}/file`, {
+      method: 'PUT',
+      signal: controller.signal,
+      body: JSON.stringify({ path: openPath, content: savedContent, expected_version: msSavedVersion }),
+    })
+    msReleaseController(controller)
+    if (!msContextIsCurrent(generation, documentId, projectId) || msOpenPath !== openPath) return false
+    if (!result.ok) {
+      msRecordFailure(result.error, result.status, 'save')
+      return false
+    }
+    msSavedVersion = result.data.version
+    // The server stored exactly the content we sent: that is the new baseline
+    // (revert-to-saved must read clean, including a revert to '').
+    msSavedContent = savedContent
+    msDirty = msContent !== savedContent
+    msConflict = null
+    if (!await msLoadTree()) return false
+    // P0-3 (TEX-03): save success triggers the live-preview hook ONCE. The
+    // kernel owns the debounce (default 800ms) and coalesces rapid saves —
+    // the client never schedules its own timer. Best-effort: a failed hook
+    // call never fails the already-committed save.
+    if (!msContextIsCurrent(generation, documentId, projectId)) return false
+    // An explicit compile immediately follows this save; do not also queue a
+    // preview or rerender away the in-flight compile context.
+    if (!rerender) return true
+    const previewController = msTrackController()
+    try {
+      await triggerPreviewAfterSave(documentId, id => api(`/v1/documents/${encodeURIComponent(id)}/preview-builds`, {
+        method: 'POST',
+        signal: previewController.signal,
+        body: JSON.stringify({}),
+      }))
+    } finally {
+      msReleaseController(previewController)
+    }
+    if (!msContextIsCurrent(generation, documentId, projectId) || msOpenPath !== openPath) return false
+    await msPollPreviews()
+    return msContextIsCurrent(generation, documentId, projectId)
   } finally {
-    msReleaseController(previewController)
+    msSaving.delete(documentId)
+    if (rerender && msContextIsCurrent(generation, documentId, projectId)) state.rerender()
   }
-  if (!msContextIsCurrent(generation, documentId, projectId) || msOpenPath !== openPath) return
-  await msPollPreviews()
-  if (!msContextIsCurrent(generation, documentId, projectId)) return
-  state.rerender()
 }
 
 export async function msReloadFile(): Promise<void> {
-  if (msDocId === null || msOpenPath === null) return
+  if (msDocId === null || msOpenPath === null || msMutationPending()) return
   const documentId = msDocId
+  msReloading.add(documentId)
+  msMutationEpoch += 1
   const openPath = msOpenPath
   const generation = msGeneration
   const projectId = msProjectId
-  const controller = msTrackController()
-  const file = await api<{ path: string; version: number; content: string }>(`/v1/documents/${encodeURIComponent(documentId)}/file?path=${encodeURIComponent(openPath)}`, { signal: controller.signal })
-  msReleaseController(controller)
-  if (file !== null && msContextIsCurrent(generation, documentId, projectId) && msOpenPath === openPath) {
-    msContent = file.content
-    msSavedVersion = file.version
-    msSavedContent = file.content
-    msDirty = false
-    msConflict = null
-    state.rerender()
+  try {
+    const controller = msTrackController()
+    const file = await apiResult<{ path: string; version: number; content: string }>(`/v1/documents/${encodeURIComponent(documentId)}/file?path=${encodeURIComponent(openPath)}`, { signal: controller.signal })
+    msReleaseController(controller)
+    if (!msContextIsCurrent(generation, documentId, projectId) || msOpenPath !== openPath) return
+    if (!file.ok) {
+      msRecordFailure(file.error, file.status, 'reload')
+      return
+    }
+    const treeLoaded = await msLoadTree()
+    if (!msContextIsCurrent(generation, documentId, projectId) || msOpenPath !== openPath) return
+    if (treeLoaded && msFiles.find(f => f.path === openPath)?.version === file.data.version) {
+      msContent = file.data.content
+      msSavedVersion = file.data.version
+      msSavedContent = file.data.content
+      msDirty = false
+      msConflict = null
+      msErrorDetails = ''
+    } else if (treeLoaded) {
+      msRecordFailure({ code: 'document_version_conflict' }, 409, 'reload')
+    }
+  } finally {
+    msReloading.delete(documentId)
+    if (msContextIsCurrent(generation, documentId, projectId)) state.rerender()
   }
 }
 
 export async function msCompile(): Promise<void> {
   if (msDocId === null) return
   const documentId = msDocId
+  if (msMutationPending() || msBuilds.some(build => build.preview !== true && ['queued', 'running'].includes(build.status))) return
+  msCompiling.add(documentId)
+  msMutationEpoch += 1
   const generation = msGeneration
   const projectId = msProjectId
-  // §4 row 95 (TEX-01): a failed save (409 conflict) must TERMINATE the
-  // compile — the workspace revision moved under us and the frozen manifest
-  // would not match what the editor holds. Save first, abort on conflict.
-  if (msDirty) {
-    await msSaveFile()
-    if (msConflict !== null || !msContextIsCurrent(generation, documentId, projectId)) return
+  try {
+    // §4 row 95 (TEX-01): a failed save (409 conflict) must TERMINATE the
+    // compile — the workspace revision moved under us and the frozen manifest
+    // would not match what the editor holds. Save first, abort on conflict.
+    if (msDirty) {
+      const saved = await msSaveFile(false)
+      if (!saved || msConflict !== null || !msContextIsCurrent(generation, documentId, projectId)) return
+      if (msDirty) {
+        msRecordFailure({ code: 'editor_changed_during_save', message: t('manuscript', 'manuscript.failure.changed') }, 409, 'compile')
+        return
+      }
+    }
+    if (!msContextIsCurrent(generation, documentId, projectId)) return
+    let request = msCompileRequests.get(documentId)
+    if (request === undefined || request.revision !== msRevision) {
+      request = { revision: msRevision, key: `latex-ui:${documentId}:${msRevision}:${crypto.randomUUID()}` }
+      msCompileRequests.set(documentId, request)
+    }
+    const controller = msTrackController()
+    const result = await apiResult<{ build: ManuscriptBuild }>(`/v1/documents/${encodeURIComponent(documentId)}/builds`, {
+      method: 'POST',
+      signal: controller.signal,
+      body: JSON.stringify({ expected_document_revision: msRevision, root_file: 'paper.tex', idempotency_key: request.key }),
+    })
+    msReleaseController(controller)
+    if (!msContextIsCurrent(generation, documentId, projectId)) return
+    if (!result.ok) {
+      msRecordFailure(result.error, result.status, 'compile')
+      return
+    }
+    msConflict = null
+    msErrorDetails = ''
+    msCompileRequests.delete(documentId)
+    msBuilds = [result.data.build, ...msBuilds.filter(build => build.build_id !== result.data.build.build_id)]
+  } finally {
+    msCompiling.delete(documentId)
+    if (msContextIsCurrent(generation, documentId, projectId)) state.rerender()
   }
-  if (!msContextIsCurrent(generation, documentId, projectId)) return
-  const controller = msTrackController()
-  const result = await api<{ build: ManuscriptBuild }>(`/v1/documents/${encodeURIComponent(documentId)}/builds`, {
-    method: 'POST',
-    signal: controller.signal,
-    body: JSON.stringify({ expected_document_revision: msRevision, root_file: 'paper.tex' }),
-  })
-  msReleaseController(controller)
-  if (!msContextIsCurrent(generation, documentId, projectId)) return
-  if (result === null) {
-    // The kernel rejects a stale-revision compile with 409
-    // document_version_conflict (no job, no build row) — surface it instead
-    // of silently continuing.
-    msConflict = t('manuscript', 'manuscript.compile.rejected')
-    state.rerender()
-    return
-  }
-  msBuilds = [result.build, ...msBuilds]
-  void msPollBuilds()
-  state.rerender()
 }
 
 export async function msPollBuilds(): Promise<void> {
   if (msBuildPollToken !== null) return
+  if (msMutationPending()) return
   const token = Symbol('manuscript-build-poll')
   msBuildPollToken = token
   try {
@@ -270,10 +334,11 @@ async function msPollBuildsOnce(): Promise<void> {
   const generation = msGeneration
   const projectId = msProjectId
   const before = JSON.stringify(msBuilds)
+  const mutationEpoch = msMutationEpoch
   const controller = msTrackController()
   const builds = await api<ManuscriptBuild[]>(`/v1/documents/${encodeURIComponent(documentId)}/builds`, { signal: controller.signal })
   msReleaseController(controller)
-  if (!msContextIsCurrent(generation, documentId, projectId)) return
+  if (!msContextIsCurrent(generation, documentId, projectId) || mutationEpoch !== msMutationEpoch || msMutationPending()) return
   if (builds !== null) msBuilds = builds
   const running = msBuilds.some(b => b.preview !== true && (b.status === 'queued' || b.status === 'running'))
   if (running) {
@@ -326,7 +391,7 @@ async function msPollBuildsOnce(): Promise<void> {
   // state.rerender here plus renderManuscript()'s trailing msPollBuilds() call
   // would form a hot loop: render → poll → state.rerender → render → … at
   // ~5 requests/cycle, exhausting the loopback rate limit in seconds.
-  if (before !== JSON.stringify(msBuilds) || pdfNow) state.rerender()
+  if (!msMutationPending() && !msDirty && (before !== JSON.stringify(msBuilds) || pdfNow)) state.rerender()
 }
 
 /** TEX-03 (P0-3): poll the live-preview projection (pending debounce +
@@ -335,6 +400,7 @@ async function msPollBuildsOnce(): Promise<void> {
  * as msPollBuilds: rerender only on visible change. */
 export async function msPollPreviews(): Promise<void> {
   if (msPreviewPollToken !== null) return
+  if (msMutationPending()) return
   const token = Symbol('manuscript-preview-poll')
   msPreviewPollToken = token
   try {
@@ -350,10 +416,11 @@ async function msPollPreviewsOnce(): Promise<void> {
   const generation = msGeneration
   const projectId = msProjectId
   const before = JSON.stringify({ p: msPreviewPending, b: msPreviews })
+  const mutationEpoch = msMutationEpoch
   const controller = msTrackController()
   const status = await api<{ pending: { document_id: string; revision: number; debounce_ms: number } | null; builds: ManuscriptBuild[] }>(`/v1/documents/${encodeURIComponent(documentId)}/preview-builds`, { signal: controller.signal })
   msReleaseController(controller)
-  if (!msContextIsCurrent(generation, documentId, projectId)) return
+  if (!msContextIsCurrent(generation, documentId, projectId) || mutationEpoch !== msMutationEpoch || msMutationPending()) return
   if (status !== null) {
     msPreviewPending = status.pending
     msPreviews = status.builds
@@ -401,7 +468,7 @@ async function msPollPreviewsOnce(): Promise<void> {
       msReleaseController(pdfController)
     }
   }
-  if (before !== JSON.stringify({ p: msPreviewPending, b: msPreviews }) || pdfNow) state.rerender()
+  if (!msMutationPending() && !msDirty && (before !== JSON.stringify({ p: msPreviewPending, b: msPreviews }) || pdfNow)) state.rerender()
 }
 
 /** P0-3 (TEX-01): explicit regeneration — confirmed by the user, never
@@ -475,6 +542,7 @@ export async function renderManuscript(
     msSavedContent = ''
     msDirty = false
     msConflict = null
+    msErrorDetails = ''
     msBuilds = []
     msPreviews = []
     msPreviewPending = null
@@ -485,6 +553,10 @@ export async function renderManuscript(
   if (firstLoad) {
     const root = msFiles.find(f => f.path === 'paper.tex') ?? msFiles[0]
     if (root !== undefined) await msOpenFile(root.path)
+  } else if (!msDirty && msOpenPath !== null && msFiles.find(file => file.path === msOpenPath)?.version !== msSavedVersion) {
+    // A background tree refresh must not pair a new document revision with
+    // old clean editor bytes. Dirty content still uses its original CAS base.
+    await msOpenFile(msOpenPath)
   }
   if (!msContextIsCurrent(generation, doc.document_id, projectId)) return
   const docId = msDocId
@@ -496,17 +568,22 @@ export async function renderManuscript(
   title.style.cssText = 'font-size:12px'
   header.appendChild(title)
   const actions = el('div', 'row')
-  actions.style.cssText = 'gap:6px'
+  actions.style.cssText = 'gap:6px;flex-wrap:wrap'
   const saveBtn = el('button', 'hbtn', t('manuscript', 'manuscript.action.save'))
-  saveBtn.disabled = !msDirty
-  saveBtn.onclick = () => { void msSaveFile() }
+  saveBtn.disabled = !msDirty || msMutationPending()
+  saveBtn.onclick = () => { saveBtn.disabled = true; void msSaveFile() }
   const compileBtn = el('button', 'btn approve', t('manuscript', 'manuscript.action.compile'))
   compileBtn.style.cssText = 'padding:4px 14px'
   // §4 row 95: prevent duplicate submits while a build is queued/running.
-  compileBtn.disabled = msBuilds.some(b => b.preview !== true && (b.status === 'queued' || b.status === 'running'))
-  compileBtn.onclick = () => { void msCompile() }
+  compileBtn.disabled = msMutationPending() || msBuilds.some(b => b.preview !== true && (b.status === 'queued' || b.status === 'running'))
+  compileBtn.onclick = () => {
+    compileBtn.disabled = true
+    compileBtn.textContent = t('manuscript', 'manuscript.action.submitting')
+    void msCompile()
+  }
   const refreshBtn = el('button', 'hbtn', '⟳')
   refreshBtn.title = t('manuscript', 'manuscript.action.refresh')
+  refreshBtn.setAttribute('aria-label', refreshBtn.title)
   refreshBtn.onclick = () => { void msLoadTree().then(() => state.rerender()) }
   // P0-3 (TEX-01): regeneration is EXPLICIT and confirmed — rendering,
   // saving and polling never rewrite the workspace.
@@ -521,20 +598,42 @@ export async function renderManuscript(
 
   if (msConflict !== null) {
     const banner = el('div', 'card border-red')
-    banner.style.cssText = 'display:flex;align-items:center;gap:10px;margin-bottom:8px'
+    banner.style.cssText = 'display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap'
+    banner.setAttribute('role', 'alert')
     banner.appendChild(el('span', 'grow', `⚠ ${msConflict}`))
-    const reloadBtn = el('button', 'hbtn', t('manuscript', 'manuscript.action.reload'))
-    reloadBtn.onclick = () => { void msReloadFile() }
+    const recoveryKey = msErrorRecovery === 'reload' ? 'manuscript.action.reload' : msErrorRecovery === 'settings' ? 'manuscript.action.settings' : 'manuscript.action.retry'
+    const reloadBtn = el('button', 'hbtn', t('manuscript', recoveryKey))
+    reloadBtn.onclick = () => {
+      if (msErrorRecovery === 'reload') {
+        if (msDirty && !window.confirm(t('manuscript', 'manuscript.editor.discard', { path: msOpenPath ?? '' }))) return
+        void msReloadFile()
+      } else if (msErrorRecovery === 'settings') {
+        void openSettingsModal(rootHost(), msSettingsKey)
+      } else {
+        reloadBtn.disabled = true
+        if (msFailedOperation === 'save') void msSaveFile()
+        else if (msFailedOperation === 'reload') void msReloadFile()
+        else void msCompile()
+      }
+    }
     banner.appendChild(reloadBtn)
+    if (msErrorDetails !== '') {
+      const details = el('details')
+      details.style.cssText = 'width:100%;font-size:11px;overflow-wrap:anywhere'
+      details.append(el('summary', '', t('manuscript', 'manuscript.failure.details')), el('div', 'muted', msErrorDetails))
+      banner.appendChild(details)
+    }
     body.appendChild(banner)
   }
 
-  const shell = el('div')
-  shell.style.cssText = 'display:flex;gap:10px;align-items:stretch;min-height:480px'
+  const layout = el('div', 'manuscript-layout')
+  const columns = el('div', 'manuscript-layout-grid')
+  layout.appendChild(columns)
+  body.appendChild(layout)
 
-  // File tree (220px).
+  // File tree.
   const treeCol = el('div')
-  treeCol.style.cssText = 'width:220px;flex-shrink:0;border:1px solid var(--border);border-radius:10px;padding:8px;overflow-y:auto;max-height:640px'
+  treeCol.style.cssText = 'min-width:0;border:1px solid var(--border);border-radius:10px;padding:8px;overflow-y:auto;max-height:640px'
   treeCol.appendChild(el('div', 'section-label', t('manuscript', 'manuscript.files')))
   for (const f of msFiles) {
     const row = el('button')
@@ -559,7 +658,7 @@ export async function renderManuscript(
     }).then(() => msLoadTree()).then(() => state.rerender())
   }
   treeCol.appendChild(newFileBtn)
-  body.appendChild(treeCol)
+  columns.appendChild(treeCol)
 
   // Editor.
   const editorCol = el('div')
@@ -569,12 +668,17 @@ export async function renderManuscript(
   editorHead.appendChild(el('span', 'muted', msOpenPath !== null ? `${msOpenPath} · v${msSavedVersion}` : t('manuscript', 'manuscript.editor.noFile')))
   const closeEdit = el('button', 'hbtn ghost', '×')
   closeEdit.title = t('manuscript', 'manuscript.editor.close')
-  closeEdit.onclick = () => { msOpenPath = null; msContent = ''; state.rerender() }
+  closeEdit.setAttribute('aria-label', closeEdit.title)
+  closeEdit.onclick = () => {
+    if (msDirty && !window.confirm(t('manuscript', 'manuscript.editor.discard', { path: msOpenPath ?? '' }))) return
+    msOpenPath = null; msContent = ''; msSavedContent = ''; msDirty = false; state.rerender()
+  }
   editorHead.appendChild(closeEdit)
   editorCol.appendChild(editorHead)
   if (msOpenPath !== null) {
     const ta = el('textarea')
     ta.value = msContent
+    ta.setAttribute('aria-label', msOpenPath)
     ta.spellcheck = false
     ta.style.cssText = 'flex:1;resize:none;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font:11.5px/1.6 ui-monospace,Menlo,monospace;outline:none;min-height:420px;white-space:pre'
     ta.oninput = () => {
@@ -583,8 +687,8 @@ export async function renderManuscript(
       // a non-empty file ('' !== saved) must read dirty; reverting to the
       // saved bytes (including '') must read clean.
       msDirty = isEditorDirty(ta.value, msSavedContent)
-      const save = [...(editorCol.querySelectorAll('button') ?? [])].find(b => b.textContent === t('manuscript', 'manuscript.action.save'))
-      if (save !== undefined) save.disabled = !msDirty
+      saveBtn.disabled = !msDirty || msMutationPending()
+      title.textContent = t('manuscript', 'manuscript.header.doc', { id: docId.slice(0, 16), rev: String(msRevision) }) + (msDirty ? t('manuscript', 'manuscript.header.unsaved') : '')
       // Mark the PDF stale in place. Re-rendering here would replace the
       // textarea and break focus, selection and IME composition.
       const stale = body.querySelector<HTMLElement>('[data-manuscript-main-pdf-stale]')
@@ -602,11 +706,11 @@ export async function renderManuscript(
   } else {
     editorCol.appendChild(el('div', 'empty', t('manuscript', 'manuscript.editor.empty')))
   }
-  body.appendChild(editorCol)
+  columns.appendChild(editorCol)
 
   // Diagnostics + PDF preview.
   const rightCol = el('div')
-  rightCol.style.cssText = 'width:360px;flex-shrink:0;border:1px solid var(--border);border-radius:10px;padding:8px;overflow-y:auto;max-height:640px'
+  rightCol.style.cssText = 'min-width:0;border:1px solid var(--border);border-radius:10px;padding:8px;overflow-y:auto;max-height:640px'
   // TEX-03 (P0-3): live preview — save success triggers the debounced
   // preview-builds hook; this section shows the projected status
   // (pending/queued/running/succeeded/failed/cancelled/superseded + stale)
@@ -678,6 +782,7 @@ export async function renderManuscript(
       // Runs/Terminal tab).
       const termBtn = el('button', 'hbtn', '🖥')
       termBtn.title = t('manuscript', 'manuscript.builds.openTerminal')
+      termBtn.setAttribute('aria-label', termBtn.title)
       termBtn.style.cssText = 'padding:0 6px;font-size:9px;flex-shrink:0'
       termBtn.onclick = () => {
         state.terminalRunId = b.job_id!
@@ -735,7 +840,7 @@ export async function renderManuscript(
     }
     rightCol.appendChild(dl)
   }
-  body.appendChild(rightCol)
+  columns.appendChild(rightCol)
 
   void msPollBuilds()
   void msPollPreviews()

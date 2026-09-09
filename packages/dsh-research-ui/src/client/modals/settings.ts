@@ -56,7 +56,7 @@ import { budgetPageVisible, writeBudgetPageVisible } from '../navigation-prefere
  * (kernel health, selects, toggles). All copy goes through t()/settingsKey()
  * — no hardcoded chrome (i18n §8).
  */
-export async function openSettingsModal(root: ShadowRoot | null | undefined): Promise<void> {
+export async function openSettingsModal(root: ShadowRoot | null | undefined, focusConfigKey?: string): Promise<void> {
   if (root == null) return
   const overlay = el('div', 'overlay')
   overlay.onclick = (event) => { if (event.target === overlay) overlay.remove() }
@@ -89,7 +89,7 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
   const activeProjectId = state.projectId
   const effectiveQuery = new URLSearchParams()
   if (activeProjectId !== undefined) effectiveQuery.set('project_id', activeProjectId)
-  const [health, schema, effective, runnerTargets, providerRead, activeProjectRead, modelBindingRead] = await Promise.all([
+  const [health, schema, effective, runnerTargets, providerRead, activeProjectRead, modelBindingRead, runnerProfiles] = await Promise.all([
     api<{ ok?: boolean; instance?: string }>('/v1/health'),
     api<SettingsSchemaWire>('/v1/config/schema'),
     api<SettingsEffectiveWire>(`/v1/config/effective?${effectiveQuery.toString()}`),
@@ -101,6 +101,7 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
     activeProjectId === undefined
       ? Promise.resolve(null)
       : apiResult<ProjectModelBindingLite | null>(`/v1/projects/${encodeURIComponent(activeProjectId)}/model-binding`),
+    api<Array<{ profile_id: string; display_name: string; enabled: boolean }>>('/v1/runner-profiles'),
   ])
   const providers = providerRead.ok ? providerRead.data : null
   const activeProject = activeProjectRead === null ? null : activeProjectRead.ok ? activeProjectRead.data : null
@@ -112,6 +113,10 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
   const dynamicSections = hasConfig && schema !== null && effective !== null
     ? settingsConfigModel(schema, effective)
     : []
+  if (focusConfigKey !== undefined) {
+    const section = dynamicSections.find(section => section.fields.some(field => field.key === focusConfigKey))
+    if (section !== undefined) openSections.add(section.id)
+  }
 
   /** One Accordion section (head + collapsible body, expand memory). */
   const makeAccordion = (id: string, title: string, summary: string, defaultCollapsed: boolean):
@@ -777,7 +782,26 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
       )
       if (editable) {
         let control: HTMLInputElement | HTMLSelectElement
-        if (field.kind === 'enum') {
+        if (field.key === 'execution.runner_profile_id' && runnerProfiles !== null) {
+          control = document.createElement('select')
+          const empty = document.createElement('option')
+          empty.value = 'null'
+          empty.textContent = t('shell', 'shell.settings.runnerProfile.unconfigured')
+          empty.selected = field.value === null
+          control.appendChild(empty)
+          const profiles = [...runnerProfiles]
+          if (typeof field.value === 'string' && !profiles.some(profile => profile.profile_id === field.value)) {
+            profiles.push({ profile_id: field.value, display_name: field.value, enabled: false })
+          }
+          for (const profile of profiles) {
+            const option = document.createElement('option')
+            option.value = profile.profile_id
+            option.textContent = profile.display_name
+            option.selected = profile.profile_id === field.value
+            option.disabled = !profile.enabled
+            control.appendChild(option)
+          }
+        } else if (field.kind === 'enum') {
           control = document.createElement('select')
           for (const member of field.enumValues) {
             const option = document.createElement('option')
@@ -1210,8 +1234,13 @@ export async function openSettingsModal(root: ShadowRoot | null | undefined): Pr
   root.appendChild(overlay)
   // dsh-web i18n §13.4: locale switch re-opens the settings modal in the
   // new locale (setLocale → relocalizeOpenOverlays).
-  registerOverlayRebuild(overlay, () => { overlay.remove(); void openSettingsModal(root) })
+  registerOverlayRebuild(overlay, () => { overlay.remove(); void openSettingsModal(root, focusConfigKey) })
   trapFocus(overlay, null)
+  if (focusConfigKey !== undefined) {
+    const control = [...modal.querySelectorAll<HTMLElement>('[data-config-key]')].find(control => control.dataset.configKey === focusConfigKey)
+    control?.scrollIntoView({ block: 'center' })
+    control?.focus({ preventScroll: true })
+  }
 }
 
 

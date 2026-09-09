@@ -2,6 +2,8 @@
 
 > 信息性文档，校准于 2026-08-11，最新审阅基线 `main@fda346b`。本文件描述当前仓库，不覆盖规范性文档。状态必须由源码、当前提交的本地验证，以及后续 CI 或结构化人工验收证据共同决定；历史测试计数、旧 README、零散截图和未绑定提交的日志不能继承为当前证据。
 
+2026-09-09 CNN 流程修复：审批草稿持久性、编译恢复与幂等性、完整产物筛选、待发布阶段提示、失败运行恢复、图表摘要、证据关联和发布审批材料已实现，详见 §34。新增执行配置只读目录；单项目设置校验不再被无关旧项目阻断。修复后的原生浏览器复验仍为 `NOT_RUN_MANUAL_PENDING`。
+
 2026-08-31 CONFIG 写入收口（取代下表 2026-08-11 的只读快照）：Settings 已有唯一 `POST /v1/settings/transactions` 写入口，Config、MinerU Provider/项目 binding 与 RunnerTarget 共用一笔 SQLite transaction、revision CAS 和 BFF/Kernel 双层权限；旧 direct mutation routes 已删除。可写性只由 schema `x-dsh-write-scopes` 声明，Project 字段 hot apply；consumer-backed runtime 字段包括 restart 生效的 `kernel.require_signed_manifest`，以及只影响新会话、hot 生效的 `kernel.pty_idle_ttl_s`、`kernel.pty_retention_bytes`、`kernel.pty_lease_ttl_s`。其余 global/kernel/runner/orchestrator/standalone 启动字段继续经 CLI/env/file 配置并在 Settings 只读，直到各 owner 有真实 bootstrap/SecretRef/applied-pin 验收。生效 verdict 来自 registry，不再从 sources 推断。当前规范与验收以 `config-registry.md` §6.1 和 `acceptance-tests.md` 的 `config-write-*` / `config-runtime-*` / `pty-runtime-policy-*` 为准。
 
 2026-08-31 PTY 当前契约（supersedes 下表 PTY-01 的历史 wire/剩余项描述）：轮询与 SSE frames 都强制 exact `expected_generation` 和 `x-pty-lease`，不存在 lease 可选或 plaintext-token fallback；浏览器 open body 不能提交 policy。idle TTL、bounded retention 与 lease TTL 已进入 canonical Config Registry，并作为 hot runtime settings 只固定到后续新会话，已有 PTY 保持原钉定值。自动证据覆盖 schema/生成物/zh-en Settings 标签、范围拒绝、同进程新旧会话边界、runtime layer 重启恢复与 next-open pin；最终整仓 152 files / 1753 tests、全包 build、docs 23/23、security 20 scripts / 0 failed、DSH baseline `0.1.1-rc.2` 均通过。Remote PTY 与真实浏览器 TUI 仍按对应人工验收项如实保留，不能由本轮配置接线升级为已验收。
@@ -585,3 +587,23 @@ SELFMOD-01 的当前边界保持不变：Cordis self-referential 工具已经以
 日志：`/tmp/dsh-scholar-fix-build-final-20260906.log`、`/tmp/dsh-scholar-fix-tests-final-20260906.log`、`/tmp/dsh-scholar-fix-security-20260906.log`、`/tmp/dsh-scholar-fix-identity-final-20260906.log`、`/tmp/dsh-scholar-fix-fencing-final-20260906.log`。本轮没有执行完整 `test:all`；真实 SSH/GPU/mTLS、浏览器与外部 MinerU 服务均保持 `NOT_RUN_MANUAL_PENDING`。OCR 正常停止可重排队，崩溃遗留 running 请求的处理限制见 OCR 规范；不以本地 fixture 宣称真实 Provider 兼容。
 
 2026-09-06 追加 review 修复：上述响应体、终端帧、产物事务三个问题均先在隔离真实 Kernel/HTTP 下复现；修复后的 focused suite 为 **4 files / 61 tests**。重新执行 `pnpm run test:ci` 得到 **7 PASS / 0 FAIL / 0 SKIP**（6m11s），包含生产构建、**157 files / 1798 tests**、UI/root typecheck、23 documents 与 origin/main 文档差异校验、DSH baseline、diff check 及 **20/20** 安全脚本；新增 13 项回归全部通过。日志：`/tmp/dsh-scholar-fix-ci.log`、`/tmp/dsh-scholar-fix-targeted.log`。真实 SSH/GPU/mTLS 与外部 MinerU 验收范围保持不变。
+
+## 34. 2026-09-09 CNN 研究任务交互修复
+
+状态：**已实现未验收**。本轮从现有 CNN 任务的真实浏览器走查定位问题；修复后的控制器和 HTTP 回归不能替代原生浏览器验收。
+
+| ID | 实现与约束 |
+|---|---|
+| CNN-UX-F01 | 审批草稿按 project/gate 保存文本和展开状态，跨刷新与项目切换保留；仅明确清空或决策成功时清除。外部决策仍保留未提交文本，提交期间禁止重复操作。 |
+| CNN-UX-F02 | Manuscript 使用真实错误分类、文件与文档 revision 恢复、未保存编辑保护、请求 single-flight 和旧轮询结果失效；幂等重放复用同一 Job/build。缺少执行环境直接进入对应设置；布局依据容器宽度排列。 |
+| CNN-UX-F03 | 完整 Artifact 集合先检索再分页，类型计数与结果一致，可加载更多并按文件名、ID 和元数据查找旧产物。 |
+| CNN-UX-F04 | `RELEASE_READY` 显示“待发布审批”；窄容器显示当前阶段，概览突出当前主要行动并解释其他待检查材料；没有写作诊断时显示尚未检查。 |
+| CNN-UX-F05 | Runs 与概览使用同一可重试定义；失败任务可直接打开详情并将错误、任务与日志带入助手草稿。历史失败是否被替代不使用别名或 seed 猜测。 |
+| CNN-UX-F06 | 图表通过关联分析文件展示基线、候选值、差值、差值 CI 和样本数；使用项目域、有界 JSON 读取并仅渲染文本节点，SVG/HTML 不作为主动内容内联。新产物登记准确 MIME/文件名。 |
+| CNN-UX-F07 | 结论、证据与产物提供直接导航，分析中的确切运行引用可跳转对应 Job；无法映射的旧别名明确说明。 |
+| CNN-UX-F08 | 发布门禁前展示当前版本、论文/PDF 构建状态、发布包、结论与证据入口，以及缺协议和失败运行提示。 |
+| CNN-UX-CONFIG | `GET /v1/runner-profiles` 提供内置只读目录，选择通过原有 Settings transaction 保存。单项目 Config patch 只校验受影响项目；global/runtime patch 仍校验全部项目，权限、CAS、安全约束与事务回滚保持有效。 |
+
+本地自动证据：`pnpm test` **159 files / 1832 tests** 与 UI 两项 TypeScript 检查通过，Kernel/UI 构建和 `git diff --check` 通过。[控制器回归](../tests/unit/research-panel-controller.test.ts) 覆盖两次刷新、项目切换、保存失败、编译重试与迟到结果；[模型回归](../tests/unit/research-ux-regressions.test.ts) 覆盖全量筛选、真实错误、可重试定义、证据映射和构建版本；[TeX HTTP 回归](../tests/unit/tex-build.test.ts) 与 [Config 隔离回归](../tests/unit/config-write.test.ts) 均先复现失败再验证修复。
+
+额外使用隔离数据库与论文副本执行固定摘要 TeX Docker 编译，成功生成 PDF，但仍存在稿件引用与排版警告。这不是原项目发布验收。当前修复后的真实浏览器、键盘、焦点和窄屏复验继续记 `NOT_RUN_MANUAL_PENDING`；现有研究内容、原项目 PDF 与审批结果不由这些自动证据替代。

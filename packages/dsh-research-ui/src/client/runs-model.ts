@@ -1,4 +1,25 @@
 import { t } from './i18n/index'
+import type { Projection } from './types'
+
+/** Retry availability comes from the same authority as Overview actions. */
+export function retryableJobIds(p: Pick<Projection, 'jobs' | 'next_actions_v2'>): Set<string> {
+  const ids = new Set((p.jobs ?? []).filter(job => job.status === 'retryable').flatMap(job => job.job_id ? [job.job_id] : []))
+  for (const action of p.next_actions_v2 ?? []) {
+    if (action.code !== 'job_retry' || action.state !== 'ready' || (Array.isArray(action.required) && action.required.length > 0)) continue
+    for (const ref of action.refs ?? []) if (ref?.kind === 'job' && ref.id) ids.add(ref.id)
+  }
+  return ids
+}
+
+export function runMatchesFilter(job: NonNullable<Projection['jobs']>[number], filter: string, retryable: ReadonlySet<string>): boolean {
+  return filter === 'all' || (filter === 'retryable' ? retryable.has(job.job_id ?? '') : job.status === filter)
+}
+
+export function runTimeoutSeconds(error: unknown): number | null {
+  if (typeof error !== 'string') return null
+  const match = /(?:timeout|timed out)[^\d]{0,30}(\d+)\s*ms/i.exec(error)
+  return match === null ? null : Number(match[1]) / 1000
+}
 
 export type RunsEmptyStateKind = 'survey-ready' | 'baseline-setup' | 'empty' | 'no-match'
 

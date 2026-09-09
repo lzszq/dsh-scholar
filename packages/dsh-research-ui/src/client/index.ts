@@ -35,12 +35,12 @@ import { renderSidebar, sidebarSortLoad } from './sidebar'
 import { disposeChatAttachments, renderChat } from './chat'
 import { terminalDisconnect, renderTerminal } from './terminal'
 import { renderPhase } from './panels/phase'
-import { renderGates } from './panels/gates'
+import { gateMutationPending, renderGates } from './panels/gates'
 import { renderRuns } from './panels/runs'
 import { closeArtifactPreview, renderArtifacts, retainArtifactPreviewForProject } from './panels/artifacts'
 import { renderEvidence } from './panels/evidence'
 import { renderBudget } from './panels/budget'
-import { msCleanup, renderManuscript } from './panels/manuscript'
+import { msCleanup, msMutationPending, renderManuscript } from './panels/manuscript'
 import { renderTrajectory, stopTrajectoryStream } from './panels/trajectory'
 import { renderTopology } from './panels/topology'
 import { renderWorkspace, stopWorkspaceWatch } from './panels/workspace'
@@ -419,6 +419,11 @@ export function apply(options: ApplyOptions = {}): void {
 .btn.reject:hover { background:var(--tone-red-bg); }
 .pipeline-wrap { overflow-x:auto; overflow-y:hidden; border-color:var(--border-2); border-radius:12px; padding:16px 12px 10px; background:var(--bg-2); box-shadow:none; scrollbar-width:thin; scrollbar-color:var(--border) transparent; scrollbar-gutter:stable; }
 .pipeline { min-width:780px; }
+.manuscript-layout { container-type:inline-size; min-width:0; }
+.manuscript-layout-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:12px; align-items:start; }
+@container (min-width:900px) {
+  .manuscript-layout-grid { grid-template-columns:160px minmax(250px,1fr) minmax(280px,1fr); }
+}
 .pstep { gap:7px; }
 .pstep .dot { width:10px; height:10px; background:var(--bg-2); }
 .pstep .lbl { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; font-size:9px; line-height:12px; letter-spacing:0; }
@@ -1179,7 +1184,7 @@ export function apply(options: ApplyOptions = {}): void {
         syncModelSelectDisabled,
       ); break
       case 'phase': await renderPhase(targetBody, projection, projectId, methodology); break
-      case 'gates': await renderGates(targetBody, projectId); break
+      case 'gates': await renderGates(targetBody, projectId, projection, methodology); break
       case 'runs': renderRuns(targetBody, projection); break
       case 'terminal': renderTerminal(targetBody, projection, projectId); break
       case 'artifacts': await renderArtifacts(targetBody, projectId); break
@@ -1415,6 +1420,7 @@ export function apply(options: ApplyOptions = {}): void {
   }
 
   const renderCoordinator = new RenderCoordinator(renderOnce, () => {
+    if (msMutationPending() || gateMutationPending()) return true
     const active = root.activeElement
     return active instanceof HTMLElement
       && shouldDeferBackgroundRefresh(active.tagName, active.isContentEditable)
