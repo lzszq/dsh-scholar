@@ -510,6 +510,17 @@ export class TexWorkspaceStore {
   }
 
   createBuild(documentId: string, revision: number, rootFile: string, jobId: string | null, preview = false): TexBuild {
+    // A replayed HTTP submission returns the same durable job. Reuse its
+    // build as well; another queued row would never receive a completion.
+    if (jobId !== null && jobId !== '') {
+      const existing = this.db.prepare('SELECT * FROM tex_builds WHERE job_id = ? ORDER BY created_at ASC LIMIT 1').get(jobId) as TexBuildRow | undefined
+      if (existing !== undefined) {
+        if (existing.document_id !== documentId || existing.revision !== revision || existing.root_file !== rootFile || (existing.preview === 1) !== preview) {
+          throw new TexError('build_idempotency_conflict', 'this job is already associated with different build inputs')
+        }
+        return this.buildFromRow(existing)
+      }
+    }
     const build: TexBuild = {
       build_id: `build_${randomUUID().slice(0, 12)}`,
       document_id: documentId,

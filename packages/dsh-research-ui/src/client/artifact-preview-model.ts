@@ -132,10 +132,12 @@ export function artifactPreviewPlan(artifact: ArtifactRow, servedContentType?: s
   const mediaType = servedMediaType === '' ? registeredMediaType : servedMediaType
   const extension = artifactFileExtension(artifact.file_name)
   const kind = artifact.kind?.toLowerCase() ?? ''
+  const jsonReleaseBundle = kind === 'bundle' && artifact.metadata?.kind === 'release-bundle'
+    && ['', 'application/octet-stream', 'application/json'].includes(mediaType)
 
   if (ACTIVE_EXTENSIONS.has(extension) || ACTIVE_MEDIA.has(mediaType) || ACTIVE_MEDIA.has(registeredMediaType)) return downloadPlan(mediaType, extension, extension === 'svg' || mediaType === 'image/svg+xml' || registeredMediaType === 'image/svg+xml' ? 'SVG' : 'HTML/XML', 'active')
   if (OFFICE_EXTENSIONS.has(extension) || OFFICE_MEDIA.has(mediaType) || OFFICE_MEDIA.has(registeredMediaType)) return downloadPlan(mediaType, extension, 'Office/ODF', 'office')
-  if (ARCHIVE_EXTENSIONS.has(extension) || ARCHIVE_MEDIA.has(mediaType) || ARCHIVE_MEDIA.has(registeredMediaType) || kind === 'bundle') return downloadPlan(mediaType, extension, 'Archive', 'archive')
+  if (ARCHIVE_EXTENSIONS.has(extension) || ARCHIVE_MEDIA.has(mediaType) || ARCHIVE_MEDIA.has(registeredMediaType) || (kind === 'bundle' && !jsonReleaseBundle)) return downloadPlan(mediaType, extension, 'Archive', 'archive')
   if (MODEL_EXTENSIONS.has(extension) || kind === 'model') return downloadPlan(mediaType, extension, 'Model', 'model')
   if (SCIENTIFIC_EXTENSIONS.has(extension) || SCIENTIFIC_MEDIA.has(mediaType) || SCIENTIFIC_MEDIA.has(registeredMediaType)) return downloadPlan(mediaType, extension, 'Scientific data', 'scientific')
 
@@ -157,6 +159,10 @@ export function artifactPreviewPlan(artifact: ArtifactRow, servedContentType?: s
   }
 
   if (mediaType === '' || mediaType === 'application/octet-stream') {
+    if ((artifact.kind === 'analysis' && artifact.metadata?.generated_by === 'research-kernel.computeAnalysis')
+      || (artifact.kind === 'bundle' && artifact.metadata?.kind === 'release-bundle')) {
+      return { mode: 'json', format: 'JSON', mediaType, extension, readsText: true, opensInTab: false, ndjson: false }
+    }
     const inferred = extensionPlan(extension, mediaType, kind)
     if (inferred !== null) return inferred
   }

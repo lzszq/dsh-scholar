@@ -335,7 +335,11 @@ export class ConfigWriteStore {
     const globalLayers = this.rawLayers('global')
     const runtimeLayers = this.rawLayers('runtime')
     const projectLayers = new Map<string, Record<string, unknown>>()
-    if (this.projectAuthority !== undefined) {
+    // A project-only patch affects that project's merged configuration.
+    // Global/runtime changes still need every project's security projection;
+    // an unrelated legacy project must not block a scoped project repair.
+    const affectsAllProjects = [...next.values()].some(item => item.operation.scope !== 'project')
+    if (this.projectAuthority !== undefined && affectsAllProjects) {
       for (const project of this.projectAuthority.list()) {
         if (projectLayers.has(project.project_id)) {
           throw new ConfigWriteStoreError(500, 'project_config_authority_invalid',
@@ -343,8 +347,8 @@ export class ConfigWriteStore {
         }
         projectLayers.set(project.project_id, this.canonicalProjectConfig(project.project_id))
       }
-    } else if (this.rawLayers('project').size > 0
-      || [...next.values()].some(item => item.operation.scope === 'project')) {
+    } else if (this.projectAuthority === undefined && (this.rawLayers('project').size > 0
+      || [...next.values()].some(item => item.operation.scope === 'project'))) {
       throw new ConfigWriteStoreError(503, 'project_config_authority_unavailable',
         'canonical project configuration authority is unavailable')
     }

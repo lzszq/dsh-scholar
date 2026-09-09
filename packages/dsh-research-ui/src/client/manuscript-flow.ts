@@ -12,6 +12,23 @@
  *    whether the newest succeeded preview has a downloadable PDF.
  */
 import type { ManuscriptBuild } from './types'
+import type { ApiErrorEnvelope } from './api'
+
+export function manuscriptFailureModel(error: ApiErrorEnvelope, status: number): {
+  key: string; recovery: 'reload' | 'settings' | 'retry'
+} {
+  if (error.code === 'document_version_conflict' || error.code === 'workspace_version_conflict') {
+    return { key: 'manuscript.failure.conflict', recovery: 'reload' }
+  }
+  if (error.code === 'editor_changed_during_save') return { key: 'manuscript.failure.changed', recovery: 'retry' }
+  if (error.code === 'network_error' || status === 0) return { key: 'manuscript.failure.network', recovery: 'retry' }
+  if (status === 401 || status === 403) return { key: 'manuscript.failure.access', recovery: 'settings' }
+  if (error.code?.startsWith('runner_') === true || error.code === 'container_execution_required'
+    || error.code === 'image_digest_required' || error.code === 'tex_image_required') {
+    return { key: 'manuscript.failure.runner', recovery: 'settings' }
+  }
+  return { key: 'manuscript.failure.other', recovery: 'retry' }
+}
 
 export interface OpenDocumentResult { document_id: string }
 

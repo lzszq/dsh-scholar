@@ -314,6 +314,8 @@ Build 请求：
 
 Build 提交（POST builds）在冻结与提交两处执行 document-revision CAS：expected_document_revision 过期或提交时 document revision 已前进 → 409 document_version_conflict，不创建 Job、不创建 build 行（保存冲突立即终止编译）。201 响应为 `{ build, job }`，其中 build.job_id、build.revision（输入 revision）与 job 供 UI 接入同一 Job 的 live Terminal（SSE GET /v1/jobs/{job_id}/terminal）与 stale PDF 判定（build.revision < document.revision）。
 
+同一编译请求的幂等重放复用已绑定 Job 的 build，避免创建永远不能接收完成回调的额外 queued 行。同一 Job 若被用于不同 document、revision、root_file 或 preview 类型，返回 `build_idempotency_conflict`。客户端在失败重试时保留请求幂等键，在一次成功提交后为下一次主动 Compile 创建新键；错误恢复按真实 code/status 区分版本、权限、执行环境与网络问题。
+
 构建字节是冻结 revision 的可物化字节（TEX-01）：POST snapshots / POST builds 冻结时把每文件 content+hash 存入 snapshot store；Runner 通过 GET snapshot-files?revision=&path= 取该 revision 的字节并逐文件校验 manifest hash，绝不后取当前文件。snapshot-files 对未知 revision/path 返回 404、参数缺失/非法返回 422；Runner 对不可读或 hash 不匹配一律硬失败，不降级为当前文件。
 
 构建日志通过同一 Terminal SSE 读取。Build 完成返回结构化 diagnostics、PDF、完整 log、aux/bbl/blg/fls 和输入 manifest。Artifact PDF 必须为 application/pdf。
@@ -428,7 +430,7 @@ Run Terminal `/jobs/{id}/terminal` 保持只读且永远不接受 input。PTY �
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/v1/runner-targets`、`/bff/research/runner-targets` | 可见 target kind/health/capability/config hash 与 SecretRef availability，不返回 endpoint/credential 值 |
-| GET/POST/PATCH | `/bff/research/runner-profiles` | profile、资源/网络/image policy；revision CAS |
+| GET | `/v1/runner-profiles` | 内置执行配置的只读目录；返回 `profile_id`、`display_name`、`runner_mode`、`enabled`、`capabilities`，不包含连接或凭据 |
 | GET | `/bff/research/config/schema` | canonical schema/UI metadata |
 | GET | `/v1/config/effective?project_id={id}` | scope filters + value/source/revision/hash；Project 读取要求 membership |
 | GET | `/v1/config/layers/{scope}/{scope_id}` | redacted layer 与 revision CAS 当前值 |
@@ -436,6 +438,8 @@ Run Terminal `/jobs/{id}/terminal` 保持只读且永远不接受 input。PTY �
 | POST | `/v1/settings/transactions` | 唯一 Settings mutation；最多 64 个 Config/OCR/Runner operations，统一 CAS、权限和 SQLite transaction，任一失败全部回滚 |
 | GET | `/v1/providers`、`/v1/providers/{id}` | Provider safe view；SecretRef metadata only |
 | GET | `/v1/projects/{id}/model-binding` | 项目 OCR binding safe view；要求 membership |
+
+Settings 从执行配置目录显示可读选项，通过 project-scope `execution.runner_profile_id` 写入统一 transaction；目录不提供创建或修改 Profile 的独立入口。单项目 Config transaction 只校验受影响项目与全局/runtime overlay 合成后的安全约束，不因无关旧项目的无效设置阻止当前项目保存；包含 global/runtime Config patch 的 transaction 仍校验所有项目。原有权限、revision CAS、canonical project authority 和事务回滚规则保持有效。
 
 OCR-CONFIG-01 的首个内置 descriptor 为 `provider_id=mineru`、`kind=mineru`、默认 `base_url=https://mineru.net/api/v4`，模型目录固定为 `flash/pipeline/vlm`；credential 可省略（MinerU Flash）或为严格 SecretRef（精准模式），任何明文 token/value/password 继续拒绝。Provider create/update 与可选 Project binding 必须放在同一个 `ocr-mineru` Settings operation 中。`/v2/intakes/{id}/ocr-requests` 只接受与当前 binding 完全一致的 provider/model，并把 provider revision/config hash、source hash、页和语言固定进持久请求；配置成功或请求入队都不能被解释为 OCR 已执行，只有带结果 provenance 的 `succeeded` 状态表示 worker 已完成。
 

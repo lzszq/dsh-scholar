@@ -724,9 +724,10 @@ const BOOTSTRAP_HTML = `<!doctype html>
       'standalone.accessToken': '访问令牌',
       'standalone.openWorkspace': '打开工作区',
       'standalone.invalidToken': '令牌无效',
+      'standalone.tokenRequired': '请输入访问令牌。',
       'standalone.serverUnreachable': '服务器不可达',
       'standalone.bundleFailed': '客户端加载失败',
-      'standalone.tokenHint': '你的令牌在本地服务器启动时生成,只保留在本机。',
+      'standalone.tokenHint': '请从本机服务器数据目录中的 standalone-token 文件获取令牌。',
       'standalone.theme.dark': '深色',
       'standalone.theme.light': '浅色',
     };
@@ -740,9 +741,10 @@ const BOOTSTRAP_HTML = `<!doctype html>
       'standalone.accessToken': 'Access token',
       'standalone.openWorkspace': 'Open workspace',
       'standalone.invalidToken': 'Invalid token',
+      'standalone.tokenRequired': 'Enter an access token.',
       'standalone.serverUnreachable': 'Server unreachable',
       'standalone.bundleFailed': 'Client bundle failed to load',
-      'standalone.tokenHint': 'Your token is generated when the local server starts and remains on this machine.',
+      'standalone.tokenHint': 'Find your token in the standalone-token file in the local server data directory.',
       'standalone.theme.dark': 'Dark',
       'standalone.theme.light': 'Light',
     };
@@ -807,7 +809,7 @@ const BOOTSTRAP_HTML = `<!doctype html>
       <label class="field-label" for="token-input" data-i18n="standalone.accessToken">Access token</label>
       <input id="token-input" type="password" placeholder="Access token" autocomplete="off">
       <button id="token-submit" type="submit" data-i18n="standalone.openWorkspace">Open workspace</button>
-      <div class="err" id="token-err"></div>
+      <div class="err" id="token-err" role="alert"></div>
     </form>
     <div class="hint"><span class="hint-dot"></span><span data-i18n="standalone.tokenHint">Your token is generated when the local server starts and remains on this machine.</span></div>
   </div>
@@ -852,6 +854,7 @@ const BOOTSTRAP_HTML = `<!doctype html>
     var saved = null;
     try { saved = localStorage.getItem(TOKEN_KEY); } catch (e) {}
     function unlock(token) {
+      if (token === '') { err.textContent = window.__BOOT_MSG__('standalone.tokenRequired'); input.focus(); return; }
       fetch('/api/token-check', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: token }) })
         .then(function (r) { return r.json(); })
         .then(function (j) {

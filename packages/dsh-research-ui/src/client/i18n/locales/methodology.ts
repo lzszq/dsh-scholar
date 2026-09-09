@@ -1,5 +1,7 @@
 /** Compact methodology projection chrome. Wire ids and reason codes remain verbatim. */
 export const zh = {
+  'methodology.protocol.review': "在对话中核对协议",
+  'methodology.protocol.draft': "请核对当前项目的研究协议、已有审批和研究材料，说明是否为历史项目缺少协议记录，并提出补齐和冻结协议的方案。",
   'methodology.title': '研究方法摘要',
   'methodology.label.assurance': '保证审查',
   'methodology.label.protocol': '研究协议',
@@ -7,7 +9,7 @@ export const zh = {
   'methodology.label.knowledge': '知识激活',
   'methodology.label.writing': 'Reverse Outline / Review Finding',
   'methodology.label.topology': '审查拓扑',
-  'methodology.label.next': '下一步',
+  'methodology.label.next': '材料完善建议',
   'methodology.value.unavailable': '不可用',
   'methodology.value.ready': '已就绪',
   'methodology.value.notReady': '未就绪',
@@ -25,7 +27,7 @@ export const zh = {
   'methodology.value.knowledgeDeliveryReady': '当前会话可投递',
   'methodology.value.knowledgeSuppressed': '{count} 个已停用或过期',
   'methodology.value.knowledgeInactive': '未激活',
-  'methodology.value.writingNone': '没有写作诊断',
+  'methodology.value.writingNone': '尚未进行写作检查',
   'methodology.value.blockingCount': '{count} 个阻断项',
   'methodology.value.topologyNone': '没有审查拓扑',
   'methodology.value.auditCount': '{count} 个审查',
@@ -95,6 +97,8 @@ export const zh = {
 export type MethodologyKey = keyof typeof zh
 
 export const en: Record<MethodologyKey, string> = {
+  'methodology.protocol.review': "Review protocol in Chat",
+  'methodology.protocol.draft': "Review the current project’s research protocol, existing approvals, and research materials. Check whether a legacy protocol record is missing, then propose how to complete and freeze it.",
   'methodology.title': 'Research methodology',
   'methodology.label.assurance': 'Assurance',
   'methodology.label.protocol': 'Protocol',
@@ -102,7 +106,7 @@ export const en: Record<MethodologyKey, string> = {
   'methodology.label.knowledge': 'Knowledge activation',
   'methodology.label.writing': 'Reverse Outline / Review Findings',
   'methodology.label.topology': 'Assurance topology',
-  'methodology.label.next': 'Next step',
+  'methodology.label.next': 'Materials to review',
   'methodology.value.unavailable': 'Unavailable',
   'methodology.value.ready': 'Ready',
   'methodology.value.notReady': 'Not ready',
@@ -120,7 +124,7 @@ export const en: Record<MethodologyKey, string> = {
   'methodology.value.knowledgeDeliveryReady': 'ready for this session',
   'methodology.value.knowledgeSuppressed': '{count} deactivated or stale',
   'methodology.value.knowledgeInactive': 'inactive',
-  'methodology.value.writingNone': 'No writing diagnostics',
+  'methodology.value.writingNone': 'Writing has not been checked yet',
   'methodology.value.blockingCount': '{count} blocking',
   'methodology.value.topologyNone': 'No assurance topology',
   'methodology.value.auditCount': '{count} audits',

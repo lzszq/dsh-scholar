@@ -209,6 +209,36 @@ describe('REVIEW-CONFIG-WRITE-03 durable config write transaction', () => {
     expect(store.readLayer('project', 'rsp_config').revision).toBe(1)
   })
 
+  it('isolates a project update from unrelated invalid legacy config while retaining checks for shared changes', () => {
+    const db = configDatabase()
+    try {
+      const authority = projectAuthority(['rsp_healthy', 'rsp_legacy'])
+      authority.configs.get('rsp_legacy')!['execution.network_policy'] = 'obsolete-policy'
+      const store = configStore(db, authority)
+      store.transact({ operations: [{
+        kind: 'config', scope: 'project', scope_id: 'rsp_healthy', expected_revision: 0,
+        changes: { 'execution.runner_profile_id': 'profile_local_docker_cpu_v1' },
+      }] }, 'principal_pi')
+      expect(store.effective({ projectId: 'rsp_healthy' })).toMatchObject({
+        revisions: { project: 1 },
+        config: { 'execution.runner_profile_id': 'profile_local_docker_cpu_v1' },
+      })
+      expect(authority.configs.get('rsp_legacy')!['execution.network_policy']).toBe('obsolete-policy')
+
+      for (const operation of [
+        { kind: 'config', scope: 'project', scope_id: 'rsp_legacy', expected_revision: 0,
+          changes: { 'execution.runner_profile_id': 'profile_local_docker_cpu_v1' } },
+        { kind: 'config', scope: 'runtime', scope_id: 'kernel', expected_revision: 0,
+          changes: { 'kernel.require_signed_manifest': true } },
+      ]) {
+        expect(() => store.transact({ operations: [operation] }, 'principal_pi'))
+          .toThrowError(expect.objectContaining({ code: 'project_config_authority_invalid' }))
+      }
+      expect(store.readLayer('runtime', 'kernel').revision).toBe(0)
+      expect(store.readLayer('project', 'rsp_healthy').revision).toBe(1)
+    } finally { db.close() }
+  })
+
   it('rejects an unknown key, a wrong layer, invalid values and security-floor relaxation before any write', () => {
     const db = configDatabase()
     const store = configStore(db)

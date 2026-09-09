@@ -4,6 +4,12 @@
  * and wire content stay raw.
  */
 export const zh = {
+  'evidence.includedRuns': '统计分析纳入的实际运行',
+  'evidence.includedRun': '种子 {seed} · {run}',
+  'evidence.comparison': '基线 {baseline} → 候选模型 {candidate}（按原始指标单位）',
+  'evidence.detailRun': "运行",
+  'evidence.referenceUnavailable': "无法读取关联材料，请刷新或检查访问权限。",
+  'evidence.runUnresolved': "旧运行引用 {reference} 没有记录到具体任务的映射。请在运行列表核对原始日志；不会仅凭名称或种子猜测对应关系。",
   'evidence.filterPlaceholder': '🔍 过滤主张与证据…',
   'evidence.claims': '主张 ({count})',
   'evidence.claims.empty': '暂无主张。',
@@ -54,6 +60,12 @@ export const zh = {
 
 
 export const en: Record<keyof typeof zh, string> = {
+  'evidence.includedRuns': 'Actual runs included in the analysis',
+  'evidence.includedRun': 'Seed {seed} · {run}',
+  'evidence.comparison': 'Baseline {baseline} → candidate {candidate} (original metric units)',
+  'evidence.detailRun': "Run",
+  'evidence.referenceUnavailable': "The linked material could not be loaded. Refresh or check access permissions.",
+  'evidence.runUnresolved': "Legacy run reference {reference} has no recorded job mapping. Review the original logs in Runs; names or seeds alone do not establish provenance.",
   'evidence.filterPlaceholder': '🔍 Filter claims & evidence…',
   'evidence.claims': 'Claims ({count})',
   'evidence.claims.empty': 'No claims yet.',
@@ -101,4 +113,3 @@ export const en: Record<keyof typeof zh, string> = {
   'evidence.detailArtifacts': 'Artifacts',
   'evidence.copyClaimId': 'Copy claim ID',
 }
-

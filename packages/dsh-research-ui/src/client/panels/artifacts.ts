@@ -1,6 +1,9 @@
 import type { ArtifactRow } from '../types'
 import { api, authHeaders, base, overlayRoot } from '../api'
 import { artifactContentPath, artifactDownloadName } from '../artifact-transfer'
+import { artifactListPage } from '../artifact-list-model'
+import { analysisSummary, type AnalysisSummary } from '../research-links'
+import { readResearchArtifact } from '../research-artifact-read'
 import {
   artifactPreviewPlan,
   ARTIFACT_TEXT_MAX_BYTES,
@@ -19,6 +22,8 @@ import { state } from '../state'
 export let artifactsQuery = ''
 /** Artifact kind filter (dsh-web filter chips). */
 export let artifactsKind = 'all'
+let artifactsVisibleLimit = 15
+let artifactsProjectId: string | null = null
 
 
 /** Artifacts multi-select (dsh-web bulk download). */
@@ -63,6 +68,12 @@ export function closeArtifactPreview(): void {
 
 
 export async function renderArtifacts(body: HTMLElement, projectId: string): Promise<void> {
+  if (artifactsProjectId !== projectId) {
+    artifactsProjectId = projectId
+    artifactsVisibleLimit = 15
+    artifactsQuery = ''
+    artifactsKind = 'all'
+  }
   const artifacts = (await api<ArtifactRow[]>(`/v1/projects/${encodeURIComponent(projectId)}/artifacts`)) ?? []
   const labelRow = el('div', 'row')
   labelRow.style.cssText = 'justify-content:space-between;align-items:center'
@@ -89,6 +100,7 @@ export async function renderArtifacts(body: HTMLElement, projectId: string): Pro
   const searchInput = document.createElement('input')
   searchInput.type = 'text'
   searchInput.placeholder = t('artifacts', 'artifacts.filterPlaceholder')
+  searchInput.setAttribute('aria-label', t('artifacts', 'artifacts.filterPlaceholder'))
   searchInput.value = artifactsQuery
   searchInput.style.cssText = 'flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px;font:11px/1.4 system-ui,sans-serif;outline:none;margin:2px 0 4px'
   searchInput.onfocus = () => { searchInput.style.borderColor = 'var(--accent)' }
@@ -103,7 +115,7 @@ export async function renderArtifacts(body: HTMLElement, projectId: string): Pro
   }
   const kindChips = el('div')
   kindChips.style.cssText = 'display:flex;gap:4px;margin:2px 0 6px;flex-wrap:wrap'
-  const kindDefs: Array<[string, string]> = [['all', t('artifacts', 'artifacts.kindAll', { count: String(artifacts.length) })], ...[...kindCounts.entries()].slice(0, 8).map(([k, n]) => [k, `${k} (${n})`] as [string, string])]
+  const kindDefs: Array<[string, string]> = [['all', t('artifacts', 'artifacts.kindAll', { count: String(artifacts.length) })], ...[...kindCounts.entries()].map(([k, n]) => [k, `${k} (${n})`] as [string, string])]
   const paintKindChips = (): void => {
     for (let i = 0; i < kindDefs.length; i++) {
       const b = kindChips.children[i] as HTMLElement | undefined
@@ -117,6 +129,7 @@ export async function renderArtifacts(body: HTMLElement, projectId: string): Pro
     const chip = el('button', 'hbtn', label)
     chip.onclick = () => {
       artifactsKind = key
+      artifactsVisibleLimit = 15
       paintKindChips()
       renderList()
     }
@@ -199,21 +212,13 @@ export async function renderArtifacts(body: HTMLElement, projectId: string): Pro
       bar.append(count, allBtn, downloadSel, doneSel)
       listEl.appendChild(bar)
     }
-    // dsh-web virtualized feel: window artifacts to the newest 15.
-    const shownArtifacts = artifacts.slice(-15).reverse()
-    if (artifacts.length > 15) {
-      const notice = el('div', 'muted', t('artifacts', 'artifacts.showingNewest', { count: String(artifacts.length) }))
+    const page = artifactListPage(artifacts, artifactsKind, artifactsQuery, artifactsVisibleLimit)
+    const filtered = page.rows
+    if (page.total > 0) {
+      const notice = el('div', 'muted', t('artifacts', 'artifacts.showingMatches', { shown: String(filtered.length), total: String(page.total) }))
       notice.style.cssText = 'font-size:10px;padding:2px;text-align:center'
       listEl.appendChild(notice)
     }
-    const kindFiltered = artifactsKind === 'all' ? shownArtifacts : shownArtifacts.filter(a => (a.kind ?? '?') === artifactsKind)
-    const q = artifactsQuery.trim().toLowerCase()
-    const filtered = q === '' ? kindFiltered : kindFiltered.filter(a =>
-      (a.kind ?? '').toLowerCase().includes(q) ||
-      (a.artifact_id ?? '').toLowerCase().includes(q) ||
-      String(a.metadata?.kind ?? '').toLowerCase().includes(q) ||
-      String(a.metadata?.name ?? '').toLowerCase().includes(q),
-    )
     if (filtered.length === 0) {
       listEl.appendChild(el('div', 'empty', t('artifacts', 'artifacts.noMatch', { query: artifactsQuery.trim(), kind: artifactsKind !== 'all' ? ` (kind: ${artifactsKind})` : '' })))
       return
@@ -240,7 +245,9 @@ export async function renderArtifacts(body: HTMLElement, projectId: string): Pro
         nameChip.style.cssText += ';color:var(--text-3)'
         row.appendChild(nameChip)
       }
-      const name = el('span', 'grow mono', fmtId(artifact.artifact_id, 22))
+      const name = el('span', 'grow', artifact.file_name || (typeof artifact.metadata?.file_name === 'string' ? artifact.metadata.file_name : '') || fmtId(artifact.artifact_id, 22))
+      name.style.cssText = 'overflow-wrap:anywhere;min-width:0'
+      name.title = artifact.artifact_id ?? ''
       row.appendChild(name)
       // dsh-web metadata: show the artifact kind detail (e.g. code-snapshot-archive).
       const metaKind = typeof artifact.metadata?.kind === 'string' && artifact.metadata.kind !== artifact.kind ? artifact.metadata.kind : ''
@@ -280,8 +287,13 @@ export async function renderArtifacts(body: HTMLElement, projectId: string): Pro
       }
       listEl.appendChild(row)
     }
+    if (page.hasMore) {
+      const more = el('button', 'hbtn', t('artifacts', 'artifacts.loadMore', { count: String(page.total - filtered.length) }))
+      more.onclick = () => { artifactsVisibleLimit += 15; renderList() }
+      listEl.appendChild(more)
+    }
   }
-  searchInput.oninput = () => { artifactsQuery = searchInput.value; renderList() }
+  searchInput.oninput = () => { artifactsQuery = searchInput.value; artifactsVisibleLimit = 15; renderList() }
   renderList()
 }
 
@@ -616,6 +628,12 @@ export async function previewArtifact(
     const rawLength = response.headers.get('content-length')
     const parsedLength = rawLength === null ? Number.NaN : Number.parseInt(rawLength, 10)
     const responseSize = Number.isFinite(parsedLength) && parsedLength >= 0 ? parsedLength : (artifact.size_bytes ?? 0)
+    let chartSummary: AnalysisSummary | null = null
+    const analysisId = artifact.metadata?.analysis_artifact
+    if (artifact.kind === 'chart' && typeof analysisId === 'string' && /^sha256:[a-f0-9]{64}$/.test(analysisId)) {
+      chartSummary = analysisSummary(await readResearchArtifact(projectId, analysisId, controller.signal), projectId)
+      if (controller.signal.aborted) return
+    }
     const deferBody = plan.mode === 'download' || (plan.readsText && responseSize > ARTIFACT_TEXT_MAX_BYTES)
     let blob: Blob | null = null
     let textPreview: ArtifactTextPreview | null = null
@@ -672,9 +690,22 @@ export async function previewArtifact(
     header.appendChild(closeBtn)
     modal.appendChild(header)
     modal.appendChild(artifactPreviewMetadata(plan.format, contentType, blob?.size ?? responseSize))
+    if (chartSummary !== null) {
+      modal.appendChild(el('div', 'section-label', t('artifacts', 'artifacts.chart.summary', { metric: chartSummary.metric })))
+      modal.appendChild(renderArtifactTable([
+        [t('artifacts', 'artifacts.chart.baseline'), String(chartSummary.baseline)],
+        [t('artifacts', 'artifacts.chart.candidate'), String(chartSummary.candidate)],
+        [t('artifacts', 'artifacts.chart.effect'), String(chartSummary.effect)],
+        [t('artifacts', 'artifacts.chart.interval'), `[${chartSummary.low}, ${chartSummary.high}]`],
+        [t('artifacts', 'artifacts.chart.seeds'), String(chartSummary.n)],
+      ]))
+      const source = el('button', 'hbtn', t('artifacts', 'artifacts.chart.source'))
+      source.onclick = () => { close(); void openResearchArtifact(projectId, String(analysisId)) }
+      modal.appendChild(source)
+    }
 
     if (plan.mode === 'download' || (plan.readsText && (deferBody || textPreview?.tooLarge === true))) {
-      modal.appendChild(artifactPreviewAlert(
+      if (chartSummary === null) modal.appendChild(artifactPreviewAlert(
         plan.mode === 'download'
           ? downloadReasonMessage(plan.downloadReason)
           : t('artifacts', 'artifacts.preview.tooLarge'),
@@ -783,4 +814,16 @@ export async function previewArtifact(
     for (const url of ownedBlobUrls) URL.revokeObjectURL(url)
     showArtifactPreviewFailure(root, projectId, artifactId, trigger)
   }
+}
+
+/** Resolve metadata before previewing so scoped links retain media safety rules. */
+export async function openResearchArtifact(projectId: string, artifactId: string): Promise<void> {
+  const artifacts = await api<ArtifactRow[]>(`/v1/projects/${encodeURIComponent(projectId)}/artifacts`)
+  if (state.projectId !== projectId) return
+  const artifact = artifacts?.find(candidate => candidate.artifact_id === artifactId)
+  if (artifact === undefined) {
+    showToast(rootHost(), t('artifacts', 'artifacts.referenceUnavailable'))
+    return
+  }
+  await previewArtifact(projectId, artifact)
 }

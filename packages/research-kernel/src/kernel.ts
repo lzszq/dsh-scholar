@@ -9357,6 +9357,8 @@ export class ResearchKernel {
       project_id: projectId,
       kind: 'analysis',
       content: JSON.stringify({ analysis: result, method: 'percentile-bootstrap-95', n_resamples: ANALYSIS_RESAMPLES, project_id: projectId }, null, 2),
+      media_type: 'application/json',
+      file_name: 'analysis.json',
       metadata: { kind: 'analysis', metric: result.metric, n: result.n, generated_by: 'research-kernel.computeAnalysis' },
     })
     this.emit(projectId, 'artifact.registered', { artifact_id: artifact.artifact_id, kind: 'analysis' })
@@ -9410,6 +9412,8 @@ export class ResearchKernel {
       project_id: projectId,
       kind: 'chart',
       content: svg,
+      media_type: 'image/svg+xml',
+      file_name: 'analysis-chart.svg',
       metadata: { kind: 'chart', metric: analysis.metric, analysis_artifact: analysis.artifact_id },
     })
     return { chart_artifact: record.artifact_id, svg }
@@ -9897,6 +9901,8 @@ export class ResearchKernel {
       project_id: projectId,
       kind: 'bundle',
       content: JSON.stringify(bundle, null, 2),
+      media_type: 'application/json',
+      file_name: 'release-bundle.json',
       metadata: { kind: 'release-bundle' },
     })
     return {

@@ -1,10 +1,10 @@
-import type { ContextMenuItem, ProjectRow, Projection } from '../types'
+import type { ContextMenuItem, Projection } from '../types'
 import { api } from '../api'
 import { t } from '../i18n/index'
 import { state, tabSave } from '../state'
 import { copyText, el, fmtId, openContextMenu, pill, rootHost, showToast } from '../ui'
 import { terminalLoadSeq } from '../terminal'
-import { runsEmptyStateModel, runsFilterDefinitions } from '../runs-model'
+import { retryableJobIds, runMatchesFilter, runTimeoutSeconds, runsEmptyStateModel, runsFilterDefinitions } from '../runs-model'
 import { nextActionCardModel } from '../next-action-cards'
 import { runChatLine } from '../modals/commands'
 import { openSettingsModal } from '../modals/settings'
@@ -14,7 +14,8 @@ export let runsSelected = new Set<string>()
 export let runsFilter = 'all'
 export function renderRuns(body: HTMLElement, p: Projection): void {
   const allJobs = p.jobs ?? []
-  const jobs = (runsFilter === 'all' ? allJobs : allJobs.filter(j => j.status === runsFilter)).slice(-12).reverse()
+  const retryable = retryableJobIds(p)
+  const jobs = allJobs.filter(job => runMatchesFilter(job, runsFilter, retryable)).slice().reverse()
   const cancellable = new Set(['queued', 'running', 'retryable'])
   const labelRow = el('div', 'row')
   labelRow.style.cssText = 'justify-content:space-between;align-items:center'
@@ -36,7 +37,7 @@ export function renderRuns(body: HTMLElement, p: Projection): void {
   const chipsRow = el('div')
   chipsRow.style.cssText = 'display:flex;gap:4px;padding:2px 0 6px;flex-wrap:wrap'
   for (const [key, label] of runsFilterDefinitions()) {
-    const count = key === 'all' ? allJobs.length : allJobs.filter(j => j.status === key).length
+    const count = allJobs.filter(job => runMatchesFilter(job, key, retryable)).length
     const chip = el('button', 'hbtn', `${label} (${count})`)
     chip.style.cssText = 'padding:2px 8px;font-size:10px'
     if (runsFilter === key) chip.style.cssText += ';border-color:var(--accent);color:var(--accent-text);background:var(--accent-soft)'
@@ -112,11 +113,6 @@ export function renderRuns(body: HTMLElement, p: Projection): void {
         : t('runs', 'runs.noMatch', { status: runsFilter })))
     }
     return
-  }
-  if (allJobs.length > 12) {
-    const notice = el('div', 'muted', t('runs', 'runs.showingNewest', { count: String(allJobs.length) }))
-    notice.style.cssText = 'font-size:10px;padding:2px;text-align:center'
-    body.appendChild(notice)
   }
   // Bulk cancel bar when selecting.
   if (runsSelecting) {
@@ -195,6 +191,7 @@ export function renderRuns(body: HTMLElement, p: Projection): void {
     if (job.job_id !== undefined) {
       const detailsBtn = el('button', 'hbtn', '⧉')
       detailsBtn.title = t('runs', 'runs.jobDetails')
+      detailsBtn.setAttribute('aria-label', detailsBtn.title)
       detailsBtn.style.cssText = 'padding:0 6px;font-size:9px;flex-shrink:0'
       detailsBtn.onclick = (event) => {
         event.stopPropagation()
@@ -205,6 +202,7 @@ export function renderRuns(body: HTMLElement, p: Projection): void {
       // dsh-web "open terminal": jump to the Terminal tab for this run.
       const termBtn = el('button', 'hbtn', '🖥')
       termBtn.title = t('runs', 'runs.openTerminalTitle')
+      termBtn.setAttribute('aria-label', termBtn.title)
       termBtn.style.cssText = 'padding:0 6px;font-size:9px;flex-shrink:0'
       termBtn.onclick = (event) => {
         event.stopPropagation()
@@ -265,9 +263,15 @@ export function renderRuns(body: HTMLElement, p: Projection): void {
       openContextMenu(root, event.clientX, event.clientY, items)
     }
     if (job.error !== undefined && job.error !== '') {
-      const err = el('div', 'muted', job.error)
+      const seconds = runTimeoutSeconds(job.error)
+      const err = el('div', 'muted', seconds === null ? job.error : t('runs', 'runs.recovery.timeout', { seconds: String(seconds) }))
       err.style.cssText = 'margin-top:4px;color:var(--tone-red);font-size:10.5px;word-break:break-all'
       card.appendChild(err)
+    }
+    if (job.job_id && (job.status === 'failed' || job.status === 'retryable')) {
+      const recover = el('button', 'hbtn', t('runs', 'runs.recovery.open'))
+      recover.onclick = () => { const root = rootHost(); if (root !== null) void openJobDetailModal(root, job.job_id!) }
+      card.appendChild(recover)
     }
     if (job.job_id !== undefined && cancellable.has(job.status ?? '') && !runsSelecting) {
       const cancel = el('button', 'btn cancel', `✕ ${t('common', 'common.action.cancel')}`)
@@ -300,13 +304,16 @@ export function renderRuns(body: HTMLElement, p: Projection): void {
  * dsh-web job drawer: full record of one run (kind, status, error,
  * contract, run manifest digest) plus a cancel action when cancellable.
  */
-export async function openJobDetailModal(root: ShadowRoot, jobId: string): Promise<void> {
+export async function openJobDetailModal(root: ShadowRoot, jobId: string, projectId = state.projectId): Promise<void> {
   const overlay = el('div', 'overlay')
   overlay.onclick = (event) => { if (event.target === overlay) overlay.remove() }
   const modal = el('div', 'modal')
   modal.style.cssText = 'width:560px;max-width:94vw'
+  modal.setAttribute('role', 'dialog')
+  modal.setAttribute('aria-label', t('runs', 'runs.jobDetails'))
   const header = el('div', 'modal-header', t('runs', 'runs.jobDetailsModal'))
   const closeBtn = el('button', 'hbtn ghost', '×')
+  closeBtn.setAttribute('aria-label', t('common', 'common.action.close'))
   closeBtn.onclick = () => overlay.remove()
   header.appendChild(closeBtn)
   modal.appendChild(header)
@@ -316,18 +323,9 @@ export async function openJobDetailModal(root: ShadowRoot, jobId: string): Promi
   overlay.appendChild(modal)
   root.appendChild(overlay)
 
-  const jobs = (await api<Array<Record<string, unknown>>>(`/v1/jobs?job_id=${encodeURIComponent(jobId)}`))
-  let job = Array.isArray(jobs) ? jobs.find(j => j.job_id === jobId) : undefined
-  if (job === undefined) {
-    // Fall back to scanning projects' job lists.
-    const projects = (await api<ProjectRow[]>('/v1/projects')) ?? []
-    for (const p of projects) {
-      if (p.project_id === undefined) continue
-      const list = (await api<Array<Record<string, unknown>>>(`/v1/projects/${encodeURIComponent(p.project_id)}/jobs`)) ?? []
-      job = list.find(j => j.job_id === jobId)
-      if (job !== undefined) break
-    }
-  }
+  const jobs = projectId === undefined ? [] : await api<Array<Record<string, unknown>>>(`/v1/projects/${encodeURIComponent(projectId)}/jobs`)
+  if (!overlay.isConnected || state.projectId !== projectId) return
+  const job = jobs?.find(j => j.job_id === jobId)
   if (job === undefined) {
     loading.textContent = t('runs', 'runs.jobNotFound')
     return
@@ -359,6 +357,26 @@ export async function openJobDetailModal(root: ShadowRoot, jobId: string): Promi
   if (typeof job.contract_id === 'string' && job.contract_id !== '') row(t('runs', 'runs.detailContract'), job.contract_id)
   if (typeof job.failure_class === 'string' && job.failure_class !== '') row(t('runs', 'runs.detailFailure'), job.failure_class)
   if (typeof job.error === 'string' && job.error !== '') row(t('runs', 'runs.detailError'), job.error)
+
+  const recovery = el('div', 'card')
+  recovery.style.cssText = 'margin-top:10px;display:flex;gap:8px;flex-wrap:wrap'
+  const seconds = runTimeoutSeconds(job.error)
+  if (seconds !== null) recovery.appendChild(el('div', 'muted', t('runs', 'runs.recovery.timeout', { seconds: String(seconds) })))
+  if (job.status === 'failed' || job.status === 'retryable') {
+    recovery.appendChild(el('div', 'muted', t('runs', 'runs.recovery.checkEvidence')))
+    const investigate = el('button', 'hbtn', t('runs', 'runs.recovery.chat'))
+    investigate.onclick = () => {
+      overlay.remove()
+      runChatLine(t('runs', 'runs.recovery.draft', { project: projectId ?? '', job: jobId, error: String(job.error ?? job.failure_class ?? '—') }))
+    }
+    const settings = el('button', 'hbtn', t('runs', 'runs.baselineSetup.settings'))
+    settings.onclick = () => { overlay.remove(); void openSettingsModal(root) }
+    recovery.append(investigate, settings)
+  }
+  const logs = el('button', 'hbtn', t('runs', 'runs.openTerminalTitle'))
+  logs.onclick = () => { overlay.remove(); openRunTerminal(jobId) }
+  recovery.appendChild(logs)
+  modal.appendChild(recovery)
 
   const manifest = job.run_manifest
   if (typeof manifest === 'object' && manifest !== null) {
@@ -399,4 +417,20 @@ export async function openJobDetailModal(root: ShadowRoot, jobId: string): Promi
     cancelRow.appendChild(cancel)
     modal.appendChild(cancelRow)
   }
+}
+
+export function openRunTerminal(jobId: string): void {
+  state.terminalRunId = jobId
+  state.terminalLines = []
+  state.terminalLastSeq = 0
+  state.terminalTotalBytes = 0
+  state.terminalDroppedBytes = 0
+  state.terminalTruncated = false
+  state.terminalExitCode = null
+  state.terminalExitSignal = null
+  state.terminalStatus = 'idle'
+  terminalLoadSeq()
+  state.activeTab = 'terminal'
+  tabSave()
+  state.rerender()
 }

@@ -3,6 +3,16 @@
  * chrome. Artifact kind labels, hashes and content stay raw.
  */
 export const zh = {
+  'artifacts.chart.summary': "{metric} · 图表数据",
+  'artifacts.chart.baseline': "基线均值",
+  'artifacts.chart.candidate': "候选模型均值",
+  'artifacts.chart.effect': "均值差",
+  'artifacts.chart.interval': "均值差的 95% 置信区间",
+  'artifacts.chart.seeds': "配对种子数",
+  'artifacts.chart.source': "查看统计分析源文件",
+  'artifacts.referenceUnavailable': "无法读取该产物。请刷新后重试，或检查当前项目的访问权限。",
+  'artifacts.showingMatches': '显示 {shown} 个，共 {total} 个匹配产物',
+  'artifacts.loadMore': '加载更多（还有 {count} 个）',
   'artifacts.section': '产物 ({count},点击预览)',
   'artifacts.select': '☑ 选择',
   'artifacts.selecting': '☑ 选择中…',
@@ -55,6 +65,16 @@ export const zh = {
 
 
 export const en: Record<keyof typeof zh, string> = {
+  'artifacts.chart.summary': "{metric} · chart data",
+  'artifacts.chart.baseline': "Baseline mean",
+  'artifacts.chart.candidate': "Candidate mean",
+  'artifacts.chart.effect': "Mean difference",
+  'artifacts.chart.interval': "95% CI of the mean difference",
+  'artifacts.chart.seeds': "Paired seeds",
+  'artifacts.chart.source': "Open source analysis",
+  'artifacts.referenceUnavailable': "This artifact could not be loaded. Refresh and retry, or check access to the current project.",
+  'artifacts.showingMatches': 'Showing {shown} of {total} matching artifacts',
+  'artifacts.loadMore': 'Load more ({count} remaining)',
   'artifacts.section': 'Artifacts ({count}, click to preview)',
   'artifacts.select': '☑ Select',
   'artifacts.selecting': '☑ Selecting…',

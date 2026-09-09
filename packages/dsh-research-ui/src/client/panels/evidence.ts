@@ -1,8 +1,12 @@
-import type { ClaimRow, EvidenceRow } from '../types'
+import type { ArtifactRow, ClaimRow, EvidenceRow } from '../types'
 import { api } from '../api'
 import { t } from '../i18n/index'
 import { copyText, el, fmtId, openContextMenu, pill, trapFocus } from '../ui'
-import { state } from '../state'
+import { state, tabSave } from '../state'
+import { analysisRunReferences, resolveResearchRun, type ResearchJobLink } from '../research-links'
+import { readResearchArtifact } from '../research-artifact-read'
+import { openJobDetailModal } from './runs'
+import { openResearchArtifact } from './artifacts'
 /** Claims & evidence filter on the Evidence tab (dsh-web search-as-you-type). */
 export let evidenceQuery = ''
 
@@ -15,6 +19,7 @@ export async function renderEvidence(body: HTMLElement, projectId: string): Prom
   const searchInput = document.createElement('input')
   searchInput.type = 'text'
   searchInput.placeholder = t('evidence', 'evidence.filterPlaceholder')
+  searchInput.setAttribute('aria-label', searchInput.placeholder)
   searchInput.value = evidenceQuery
   searchInput.style.cssText = 'flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 10px;font:11px/1.4 system-ui,sans-serif;outline:none;margin:2px 0 6px'
   searchInput.onfocus = () => { searchInput.style.borderColor = 'var(--accent)' }
@@ -57,6 +62,7 @@ export async function renderEvidence(body: HTMLElement, projectId: string): Prom
       // dsh-web drawer: one-click claim details (double-click too).
       const claimBtn = el('button', 'hbtn', '⧉')
       claimBtn.title = t('evidence', 'evidence.claimDetails')
+      claimBtn.setAttribute('aria-label', claimBtn.title)
       claimBtn.style.cssText = 'padding:0 6px;font-size:9px;flex-shrink:0'
       claimBtn.onclick = (event) => {
         event.stopPropagation()
@@ -126,6 +132,7 @@ export async function renderEvidence(body: HTMLElement, projectId: string): Prom
       // dsh-web drawer: one-click evidence details (double-click still works).
       const detailsBtn = el('button', 'hbtn', '⧉')
       detailsBtn.title = t('evidence', 'evidence.evidenceDetails')
+      detailsBtn.setAttribute('aria-label', detailsBtn.title)
       detailsBtn.style.cssText = 'padding:0 6px;font-size:9px;flex-shrink:0'
       detailsBtn.onclick = (event) => {
         event.stopPropagation()
@@ -134,6 +141,9 @@ export async function renderEvidence(body: HTMLElement, projectId: string): Prom
       }
       row.appendChild(detailsBtn)
       card.appendChild(row)
+      if (r?.baseline_value !== undefined) {
+        card.appendChild(el('div', 'muted', t('evidence', 'evidence.comparison', { baseline: String(r.baseline_value), candidate: String(r.value ?? '—') })))
+      }
       const refsCount = Array.isArray(item.artifact_refs) ? item.artifact_refs.length : 0
       const runsCount = Array.isArray(item.run_ids) ? item.run_ids.length : 0
       const meta = el('div', 'muted', t('evidence', 'evidence.ciLine', { lo: String(r?.ci_low ?? '?'), hi: String(r?.ci_high ?? '?'), n: String(r?.n_seeds ?? '?'), method: item.analysis_method ?? '?', runs: String(runsCount), refs: String(refsCount) }))
@@ -190,7 +200,7 @@ export async function renderEvidence(body: HTMLElement, projectId: string): Prom
 }
 
 /** dsh-web claim drawer: statement, scope, evidence links and history. */
-export function openClaimDetailModal(root: ShadowRoot, claim: ClaimRow): void {
+export function openClaimDetailModal(root: ShadowRoot, claim: ClaimRow, projectId = state.projectId): void {
   const overlay = el('div', 'overlay')
   overlay.onclick = (event) => { if (event.target === overlay) overlay.remove() }
   const modal = el('div', 'modal')
@@ -199,6 +209,7 @@ export function openClaimDetailModal(root: ShadowRoot, claim: ClaimRow): void {
   modal.setAttribute('aria-label', t('evidence', 'evidence.claimDetails'))
   const header = el('div', 'modal-header', `🧾 ${t('evidence', 'evidence.claimDetails')}`)
   const closeBtn = el('button', 'hbtn ghost', '×')
+  closeBtn.setAttribute('aria-label', t('common', 'common.action.close'))
   closeBtn.onclick = () => overlay.remove()
   header.appendChild(closeBtn)
   modal.appendChild(header)
@@ -235,8 +246,23 @@ export function openClaimDetailModal(root: ShadowRoot, claim: ClaimRow): void {
   const ev = claim.evidence
   if (ev !== undefined && (ev.evidence_ids ?? []).length > 0) {
     modal.appendChild(el('div', 'section-label', t('evidence', 'evidence.claim.supporting')))
-    for (const id of ev.evidence_ids ?? []) row(t('evidence', 'evidence.detailEvidence'), fmtId(id, 40))
-    if (typeof ev.analysis_artifact === 'string' && ev.analysis_artifact !== '') row(t('evidence', 'evidence.detailAnalysisArtifact'), fmtId(ev.analysis_artifact, 40))
+    for (const id of ev.evidence_ids ?? []) {
+      const link = el('button', 'hbtn', `${t('evidence', 'evidence.detailEvidence')} · ${fmtId(id, 28)}`)
+      link.onclick = async () => {
+        if (projectId === undefined) return
+        const evidence = await api<EvidenceRow[]>(`/v1/projects/${encodeURIComponent(projectId)}/evidence`)
+        if (state.projectId !== projectId || !overlay.isConnected) return
+        const item = evidence?.find(candidate => candidate.evidence_id === id)
+        if (item !== undefined) { overlay.remove(); openEvidenceDetailModal(root, item, projectId) }
+        else link.textContent = t('evidence', 'evidence.referenceUnavailable')
+      }
+      modal.appendChild(link)
+    }
+    if (typeof ev.analysis_artifact === 'string' && ev.analysis_artifact !== '' && projectId !== undefined) {
+      const link = el('button', 'hbtn', t('evidence', 'evidence.detailAnalysisArtifact'))
+      link.onclick = () => { overlay.remove(); void openResearchArtifact(projectId, ev.analysis_artifact!) }
+      modal.appendChild(link)
+    }
   }
   const limitations = claim.limitations ?? []
   if (limitations.length > 0) {
@@ -251,7 +277,7 @@ export function openClaimDetailModal(root: ShadowRoot, claim: ClaimRow): void {
       hrow.style.cssText = 'padding:2px 0;align-items:flex-start'
       hrow.appendChild(el('span', 'artifact-kind', String(h.status ?? '?')))
       const when = String(h.at ?? '').replace('T', ' ').slice(0, 16)
-      const meta = el('div', 'grow muted', `${when}${h.reason !== undefined && h.reason !== '' ? ` — ${h.reason}` : ''}`)
+      const meta = el('div', 'grow muted', [when, h.reason].filter(Boolean).join(' — '))
       hrow.appendChild(meta)
       modal.appendChild(hrow)
     }
@@ -262,7 +288,7 @@ export function openClaimDetailModal(root: ShadowRoot, claim: ClaimRow): void {
 }
 
 /** dsh-web evidence drawer: provenance + result of one evidence item. */
-export function openEvidenceDetailModal(root: ShadowRoot, item: EvidenceRow): void {
+export function openEvidenceDetailModal(root: ShadowRoot, item: EvidenceRow, projectId = state.projectId): void {
   const overlay = el('div', 'overlay')
   overlay.onclick = (event) => { if (event.target === overlay) overlay.remove() }
   const modal = el('div', 'modal')
@@ -271,6 +297,7 @@ export function openEvidenceDetailModal(root: ShadowRoot, item: EvidenceRow): vo
   modal.setAttribute('aria-label', t('evidence', 'evidence.evidenceDetails'))
   const header = el('div', 'modal-header', t('evidence', 'evidence.detailsModal'))
   const closeBtn = el('button', 'hbtn ghost', '×')
+  closeBtn.setAttribute('aria-label', t('common', 'common.action.close'))
   closeBtn.onclick = () => overlay.remove()
   header.appendChild(closeBtn)
   modal.appendChild(header)
@@ -289,14 +316,64 @@ export function openEvidenceDetailModal(root: ShadowRoot, item: EvidenceRow): vo
   modal.appendChild(el('div', 'section-label', t('evidence', 'evidence.detail.result')))
   row(t('evidence', 'evidence.detailMetric'), r?.primary_metric ?? '—')
   row(t('evidence', 'evidence.detailValue'), String(r?.value ?? '—'))
+  if (r?.baseline_value !== undefined) row(t('artifacts', 'artifacts.chart.baseline'), String(r.baseline_value))
   row(t('evidence', 'evidence.detailEffect'), r?.effect_size !== undefined ? `Δ${r.effect_size >= 0 ? '+' : ''}${r.effect_size}` : '—')
   row(t('evidence', 'evidence.detailCi'), `[${r?.ci_low ?? '—'}, ${r?.ci_high ?? '—'}]`)
   row(t('evidence', 'evidence.detailNSeeds'), String(r?.n_seeds ?? '—'))
   modal.appendChild(el('div', 'section-label', t('evidence', 'evidence.detail.provenance')))
   row(t('evidence', 'evidence.detailEvidence'), String(item.evidence_id ?? '—'))
   row(t('evidence', 'evidence.detailMethod'), item.analysis_method ?? '—')
-  row(t('evidence', 'evidence.detailRuns'), Array.isArray(item.run_ids) ? item.run_ids.join(', ') : '—')
-  row(t('evidence', 'evidence.detailArtifacts'), Array.isArray(item.artifact_refs) ? item.artifact_refs.map(a => fmtId(a, 18)).join(', ') : '—')
+  if (projectId !== undefined) {
+    const links = el('div', 'row')
+    links.style.cssText = 'gap:8px;flex-wrap:wrap;margin-top:10px'
+    const provenance = Promise.all([
+      api<ResearchJobLink[]>(`/v1/projects/${encodeURIComponent(projectId)}/jobs`),
+      api<ArtifactRow[]>(`/v1/projects/${encodeURIComponent(projectId)}/artifacts`),
+    ])
+    const included = el('div')
+    included.style.cssText = 'width:100%;display:flex;gap:8px;flex-wrap:wrap'
+    links.appendChild(included)
+    void provenance.then(async ([jobs, artifacts]) => {
+      if (jobs === null || artifacts === null || state.projectId !== projectId || !overlay.isConnected) return
+      const analysisIds = (item.artifact_refs ?? []).filter(id => artifacts.some(artifact => artifact.artifact_id === id && artifact.kind === 'analysis'))
+      const results = await Promise.all(analysisIds.slice(0, 8).map(id => readResearchArtifact(projectId, id)))
+      if (state.projectId !== projectId || !overlay.isConnected) return
+      const refs = new Map(results.flatMap(result => analysisRunReferences(result, projectId)).map(ref => [ref.runId, ref]))
+      if (refs.size > 0) included.appendChild(el('div', 'section-label', t('evidence', 'evidence.includedRuns')))
+      for (const ref of refs.values()) {
+        if (!jobs.some(job => job.job_id === ref.jobId)) continue
+        const link = el('button', 'hbtn', t('evidence', 'evidence.includedRun', { seed: ref.seed === null ? '—' : String(ref.seed), run: fmtId(ref.runId, 22) }))
+        link.title = `${ref.runId} · ${ref.jobId}`
+        link.onclick = () => { overlay.remove(); void openJobDetailModal(root, ref.jobId, projectId) }
+        included.appendChild(link)
+      }
+    })
+    for (const artifact of item.artifact_refs ?? []) {
+      const link = el('button', 'hbtn', `${t('evidence', 'evidence.detailArtifacts')} · ${fmtId(artifact, 22)}`)
+      link.title = artifact
+      link.onclick = () => { overlay.remove(); void openResearchArtifact(projectId, artifact) }
+      links.appendChild(link)
+    }
+    for (const reference of item.run_ids ?? []) {
+      const link = el('button', 'hbtn', `${t('evidence', 'evidence.detailRun')} · ${reference}`)
+      link.style.cssText = 'white-space:normal;overflow-wrap:anywhere;text-align:left'
+      link.onclick = async () => {
+        link.disabled = true
+        const [jobs, artifacts] = await provenance
+        if (state.projectId !== projectId || !overlay.isConnected) return
+        link.disabled = false
+        const jobId = resolveResearchRun(reference, jobs ?? [], artifacts ?? [])
+        if (jobId !== null) { overlay.remove(); void openJobDetailModal(root, jobId, projectId); return }
+        const notice = el('div', 'card', t('evidence', jobs === null || artifacts === null ? 'evidence.referenceUnavailable' : 'evidence.runUnresolved', { reference }))
+        const runs = el('button', 'hbtn', t('runs', 'runs.openRunsTab'))
+        runs.onclick = () => { overlay.remove(); state.activeTab = 'runs'; tabSave(); state.rerender() }
+        notice.appendChild(runs)
+        links.appendChild(notice)
+      }
+      links.appendChild(link)
+    }
+    modal.appendChild(links)
+  }
   overlay.appendChild(modal)
   root.appendChild(overlay)
   trapFocus(overlay, null)

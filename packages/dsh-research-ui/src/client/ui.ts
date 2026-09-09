@@ -23,7 +23,7 @@ export const STATUS_META: Record<string, { tone: string }> = {
   EVIDENCE_READY: { tone: 'cyan' },
   WRITING: { tone: 'violet' },
   REVIEWING: { tone: 'amber' },
-  RELEASE_READY: { tone: 'green' },
+  RELEASE_READY: { tone: 'amber' },
   RELEASED: { tone: 'green' },
   BLOCKED_GATE: { tone: 'red' },
   ARCHIVED: { tone: 'slate' },

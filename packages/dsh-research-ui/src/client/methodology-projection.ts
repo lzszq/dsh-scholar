@@ -8,6 +8,7 @@
 
 import { t } from './i18n/index'
 import { el } from './ui'
+import { runChatLine } from './modals/commands'
 
 export type MethodologySurface = 'overview' | 'manuscript' | 'topology'
 export type MethodologyTone = 'ok' | 'warning' | 'blocking' | 'neutral'
@@ -341,6 +342,12 @@ export function methodologySummaryNode(
     next.dataset.recommendation = model.recommendation.code
     next.style.cssText = 'margin-top:7px;padding-top:6px;border-top:1px dashed var(--border-2);font-size:10.5px;color:var(--text-2)'
     next.textContent = `${t('methodology', 'methodology.label.next')}: ${model.recommendation.label}`
+    if (model.recommendation.code === 'configure_protocol') {
+      const help = el('button', 'hbtn', t('methodology', 'methodology.protocol.review'))
+      help.style.cssText = 'margin-left:8px'
+      help.onclick = () => { runChatLine(t('methodology', 'methodology.protocol.draft')) }
+      next.appendChild(help)
+    }
     section.appendChild(next)
   }
   return section
